@@ -1,15 +1,16 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="flask-deck — Precision Enterprise Admin Panel and Operations Workbench for Flask and SQLAlchemy 2.0" width="100%" />
+  <img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/banner.svg" alt="flask-deck — Precision Enterprise Admin Panel and Operations Workbench for Flask and SQLAlchemy 2.0" width="100%" />
 </p>
 
 <p align="center">
   <a href="https://github.com/duhanguler/flask-deck/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/duhanguler/flask-deck/ci.yml?branch=main&style=flat-square&label=CI" alt="CI" /></a>
+  <a href="https://pypi.org/project/flask-deck/"><img src="https://img.shields.io/pypi/v/flask-deck?style=flat-square&color=0D7A52&logo=pypi&logoColor=white" alt="PyPI" /></a>
   <img src="https://img.shields.io/badge/Python-3.10%20--%203.13-18181b?style=flat-square&logo=python&logoColor=white" alt="Python 3.10-3.13" />
   <img src="https://img.shields.io/badge/Flask-2.3%2B%20%7C%203.x-18181b?style=flat-square&logo=flask&logoColor=white" alt="Flask" />
   <img src="https://img.shields.io/badge/SQLAlchemy-2.0%2B-18181b?style=flat-square&logo=sqlalchemy&logoColor=white" alt="SQLAlchemy 2.0+" />
   <img src="https://img.shields.io/badge/Assets-23.6%20KB%20gzip-18181b?style=flat-square" alt="23.6 KB gzip" />
   <img src="https://img.shields.io/badge/CSP-Strict%20Nonce-18181b?style=flat-square" alt="Strict Nonce CSP" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-18181b?style=flat-square" alt="MIT License" /></a>
+  <a href="https://github.com/duhanguler/flask-deck/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-18181b?style=flat-square" alt="MIT License" /></a>
 </p>
 
 # flask-deck
@@ -60,7 +61,7 @@ pip install "flask-deck[pydantic]"  # Pydantic v2 form validation adapter
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dashboard-dark.png" />
     <source media="(prefers-color-scheme: light)" srcset="docs/assets/dashboard-light.png" />
-    <img src="docs/assets/dashboard-dark.png" alt="flask-deck Carbon Dark & Swiss Light Dashboard Workbench" width="100%" />
+    <img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/dashboard-dark.png" alt="flask-deck Carbon Dark & Swiss Light Dashboard Workbench" width="100%" />
   </picture>
 </p>
 
@@ -68,41 +69,41 @@ pip install "flask-deck[pydantic]"  # Pydantic v2 form validation adapter
   <summary>Explore All 18 Workbench &amp; Enterprise Views (Media Lightbox, 3-Step Wizard, Keyset Cursor &amp; Trash, TOTP QR, Side-by-Side Diff, Background SSE Jobs, Arabic RTL, Kanban, Heatmap, ERD, SQL Console &amp; More)</summary>
   <br />
   <p align="center"><strong>Products Media Grid &amp; Click-to-Open Image Lightbox (RBAC-Guarded <code>/_media</code> Proxy)</strong></p>
-  <p align="center"><img src="docs/assets/v03-products-lightbox-dark.png" alt="flask-deck Products Media Lightbox" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/v03-products-lightbox-dark.png" alt="flask-deck Products Media Lightbox" width="100%" /></p>
   <p align="center"><strong>Multi-Step Form Wizard with Drag-and-Drop Image Upload &amp; Live DataURL Preview</strong></p>
-  <p align="center"><img src="docs/assets/v03-wizard-dropzone-dark.png" alt="flask-deck 3-Step Form Wizard and Dropzone" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/v03-wizard-dropzone-dark.png" alt="flask-deck 3-Step Form Wizard and Dropzone" width="100%" /></p>
   <p align="center"><strong>HMAC-Signed Keyset Cursor Pagination &amp; Soft-Delete Trash / One-Click Restore</strong></p>
-  <p align="center"><img src="docs/assets/v03-cursor-trash-dark.png" alt="flask-deck Keyset Cursor Pagination and Trash Restore" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/v03-cursor-trash-dark.png" alt="flask-deck Keyset Cursor Pagination and Trash Restore" width="100%" /></p>
   <p align="center"><strong>Built-In TOTP 2FA Enrollment with Pure-Python ISO/IEC 18004 SVG QR Code (Zero External Libs)</strong></p>
-  <p align="center"><img src="docs/assets/v03-mfa-qr-dark.png" alt="flask-deck TOTP 2FA Setup with Pure-Python SVG QR" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/v03-mfa-qr-dark.png" alt="flask-deck TOTP 2FA Setup with Pure-Python SVG QR" width="100%" /></p>
   <p align="center"><strong>Per-Record Side-by-Side Revision Diff History &amp; Safe Revert (<code>/&lt;slug&gt;/&lt;pk&gt;/history</code>)</strong></p>
-  <p align="center"><img src="docs/assets/v03-revision-diff-dark.png" alt="flask-deck Side-by-Side Revision Diff" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/v03-revision-diff-dark.png" alt="flask-deck Side-by-Side Revision Diff" width="100%" /></p>
   <p align="center"><strong>Background Jobs Console with Live SSE Progress, Logs &amp; Artifact Download (<code>/_jobs</code>)</strong></p>
-  <p align="center"><img src="docs/assets/v03-jobs-sse-dark.png" alt="flask-deck Background Jobs and SSE Logs" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/v03-jobs-sse-dark.png" alt="flask-deck Background Jobs and SSE Logs" width="100%" /></p>
   <p align="center"><strong>Native Arabic RTL (<code>dir="rtl"</code>) &amp; Per-User Timezone (<code>Europe/Istanbul</code>) via CSS Logical Properties</strong></p>
-  <p align="center"><img src="docs/assets/v03-rtl-arabic-dark.png" alt="flask-deck Arabic RTL Dashboard" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/v03-rtl-arabic-dark.png" alt="flask-deck Arabic RTL Dashboard" width="100%" /></p>
   <p align="center"><strong>Swiss Light Theme (Range Switcher + Callout + Pure SVG Area &amp; Donut Charts)</strong></p>
-  <p align="center"><img src="docs/assets/dashboard-light.png" alt="flask-deck Swiss Light Dashboard" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/dashboard-light.png" alt="flask-deck Swiss Light Dashboard" width="100%" /></p>
   <p align="center"><strong>91-Day Activity Heatmap &amp; Ranked Stat Progress Bars (100% Pure SSR SVG)</strong></p>
-  <p align="center"><img src="docs/assets/heatmap-dark.png" alt="flask-deck 91-Day Activity Heatmap and Stat Bars" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/heatmap-dark.png" alt="flask-deck 91-Day Activity Heatmap and Stat Bars" width="100%" /></p>
   <p align="center"><strong>Drag-and-Drop Kanban Board Mode (CSRF + RBAC + Audit Logged Transitions)</strong></p>
-  <p align="center"><img src="docs/assets/kanban-dark.png" alt="flask-deck Orders Kanban Board" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/kanban-dark.png" alt="flask-deck Orders Kanban Board" width="100%" /></p>
   <p align="center"><strong>Tabbed Forms &amp; Zero-Dependency Rich Widgets (Segmented Pills, Toggle Switch, Tag Input, Code Editor)</strong></p>
-  <p align="center"><img src="docs/assets/form-widgets-dark.png" alt="flask-deck Tabbed Form and Rich Widgets" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/form-widgets-dark.png" alt="flask-deck Tabbed Form and Rich Widgets" width="100%" /></p>
   <p align="center"><strong>Interactive SQLAlchemy Schema ERD Inspector (<code>/admin/_schema</code>)</strong></p>
-  <p align="center"><img src="docs/assets/schema-erd-dark.png" alt="flask-deck Pure SVG Schema ERD" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/schema-erd-dark.png" alt="flask-deck Pure SVG Schema ERD" width="100%" /></p>
   <p align="center"><strong>Hardened Read-Only SQL Console with Automatic <code>[REDACTED]</code> Secret Masking (<code>/admin/_sql</code>)</strong></p>
-  <p align="center"><img src="docs/assets/sql-console-dark.png" alt="flask-deck Read-Only SQL Console with Redaction" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/sql-console-dark.png" alt="flask-deck Read-Only SQL Console with Redaction" width="100%" /></p>
   <p align="center"><strong>Custom <code>@deck.page</code> Operations View (Radial SLA Gauge + Grouped Bar + Timeline)</strong></p>
-  <p align="center"><img src="docs/assets/sla-page-dark.png" alt="flask-deck Custom SLA and Capacity Page" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/sla-page-dark.png" alt="flask-deck Custom SLA and Capacity Page" width="100%" /></p>
   <p align="center"><strong>Global ⌘K Command Palette (RBAC-Scoped Cross-Model Live Search)</strong></p>
-  <p align="center"><img src="docs/assets/cmdk-dark.png" alt="flask-deck Command Palette" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/cmdk-dark.png" alt="flask-deck Command Palette" width="100%" /></p>
   <p align="center"><strong>Orders Grid + Quick Filter Tabs + 3-Tab Slide-Over Quick Peek Drawer</strong></p>
-  <p align="center"><img src="docs/assets/orders-drawer-dark.png" alt="flask-deck Slide-Over Quick Peek Drawer" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/orders-drawer-dark.png" alt="flask-deck Slide-Over Quick Peek Drawer" width="100%" /></p>
   <p align="center"><strong>SAVEPOINT-Verified Dry-Run CSV/JSON Diff Import</strong></p>
-  <p align="center"><img src="docs/assets/import-diff-dark.png" alt="flask-deck Dry-Run Import Diff Preview" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/import-diff-dark.png" alt="flask-deck Dry-Run Import Diff Preview" width="100%" /></p>
   <p align="center"><strong>Immutable Audit Ledger with Field-Level Diffs, Auto-Redaction &amp; Safe Revert</strong></p>
-  <p align="center"><img src="docs/assets/audit-dark.png" alt="flask-deck Audit Diff Ledger" width="100%" /></p>
+  <p align="center"><img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/audit-dark.png" alt="flask-deck Audit Diff Ledger" width="100%" /></p>
 </details>
 
 ---
@@ -129,7 +130,7 @@ deck = Deck(
 deck.register(Organization, User, Product, Order)
 ```
 
-Using **pure SQLAlchemy 2.0** without `Flask-SQLAlchemy`? Pass `session_factory=SessionLocal, engine=engine` (and optional multi-DB `binds={"analytics": analytics_engine}`) directly — see [examples/pure_sqlalchemy_app.py](examples/pure_sqlalchemy_app.py).
+Using **pure SQLAlchemy 2.0** without `Flask-SQLAlchemy`? Pass `session_factory=SessionLocal, engine=engine` (and optional multi-DB `binds={"analytics": analytics_engine}`) directly — see [examples/pure_sqlalchemy_app.py](https://github.com/duhanguler/flask-deck/blob/main/examples/pure_sqlalchemy_app.py).
 
 ---
 
@@ -312,7 +313,7 @@ Both `flask deck audit` and the live `/admin/_diagnostics` panel inspect `SECRET
 
 ## Migrating from `flask-admin`
 
-See the 1-to-1 migration guide in [docs/migration-from-flask-admin.md](docs/migration-from-flask-admin.md).
+See the 1-to-1 migration guide in [docs/migration-from-flask-admin.md](https://github.com/duhanguler/flask-deck/blob/main/docs/migration-from-flask-admin.md).
 
 ## Development
 
