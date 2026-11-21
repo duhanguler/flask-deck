@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="{{ active_locale }}" dir="{{ text_dir }}" data-theme="{{ config.default_theme if config.default_theme != 'system' else 'dark' }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="deck-csrf" content="{{ csrf_token }}">
+  <meta name="deck-search-url" content="{{ url_for(bp_name ~ '.api_search') }}">
+  <meta name="deck-notif-url" content="{{ url_for(bp_name ~ '.api_notifications') }}">
+  {% if brand.favicon_url %}
+  <link rel="icon" href="{{ brand.favicon_url }}">
+  {% else %}
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2318181b'/%3E%3Ctext x='12' y='17' text-anchor='middle' fill='%23fafafa' font-family='monospace' font-size='14' font-weight='700'%3ED%3C/text%3E%3C/svg%3E">
+  {% endif %}
+  <title>{% block title %}{{ page_title or config.title }} · {{ config.title }}{% endblock %}</title>
+  <script nonce="{{ csp_nonce }}">
+    (function(){try{var s=localStorage.getItem("flask_deck_theme");if(s==="light"||s==="dark"){document.documentElement.setAttribute("data-theme",s);}else if("{{ config.default_theme }}"==="system"&&window.matchMedia("(prefers-color-scheme: light)").matches){document.documentElement.setAttribute("data-theme","light");}var d=localStorage.getItem("flask_deck_density");if(d==="compact"){document.documentElement.setAttribute("data-density","compact");}}catch(_){}})();
+  </script>
+  <link rel="stylesheet" href="{{ asset_url('css/deck.css') }}">
+  {% if brand.has_custom_theme %}
+  <link rel="stylesheet" href="{{ url_for(bp_name ~ '.brand_theme_css', v=brand_css_hash) }}">
+  {% endif %}
+  {% for css_href in brand.extra_css %}
+  <link rel="stylesheet" href="{{ css_href }}">
+  {% endfor %}
+  <script defer src="{{ asset_url('js/deck.js') }}"></script>
+  {% for js_src in brand.extra_js %}
+  <script defer src="{{ js_src }}" nonce="{{ csp_nonce }}"></script>
+  {% endfor %}
+  {{ render_slot('head_extra') }}
+</head>
+<body>
+<div class="dk-shell" id="dk-shell">
+  <!-- 44px Topbar -->
+  <header class="dk-topbar">
+    <div class="dk-top-left">
+      <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-rail-toggle aria-label="Toggle sidebar">
+        {{ deck_icon("menu", 15) }}
+      </button>
+      <a href="{{ url_for(bp_name ~ '.index') }}" class="dk-brand">
+        {% if brand.logo_url and brand.logo_dark_url %}
+        <img src="{{ brand.logo_dark_url }}" alt="{{ config.title }}" class="dk-brand-logo dk-brand-logo-dark">
+        <img src="{{ brand.logo_url }}" alt="{{ config.title }}" class="dk-brand-logo dk-brand-logo-light">
+        {% elif brand.logo_url or brand.logo_dark_url %}
+        <img src="{{ brand.logo_url or brand.logo_dark_url }}" alt="{{ config.title }}" class="dk-brand-logo">
+        {% else %}
+        <span class="dk-brand-mark" aria-hidden="true">{{ (brand.logo_mark or config.title[:1]) | upper }}</span>
+        {% endif %}
+        <span>{{ config.title }}</span>
+      </a>
+      <span class="dk-ver dk-mono">v0.3</span>
+      {% block breadcrumbs %}
+      <span class="dk-crumb-sep">/</span>
+      <span class="dk-crumb dk-crumb-cur">{{ page_title or _("Dashboard") }}</span>
+      {% endblock %}
+    </div>
+
+    <button type="button" class="dk-cmdk-trigger" data-deck-cmdk-open aria-label="Open command palette">
+      <span class="dk-cmdk-trigger-left">
+        {{ deck_icon("search", 13) }}
+        <span class="dk-cmdk-trigger-text">{{ _("Jump to model, record, action…") }}</span>
+      </span>
+      <kbd class="dk-kbd">⌘K</kbd>
+    </button>
+
+    <div class="dk-top-right">
+      {{ render_slot('topbar_right') }}
+      {% if config.read_only %}
+      <span class="dk-badge dk-badge-warn dk-mono">READ-ONLY</span>
+      {% endif %}
+      {% if config.environment == 'production' %}
+      <span class="dk-badge dk-badge-danger dk-mono"><span class="dk-dot"></span>PROD</span>
+      {% elif config.environment == 'staging' %}
+      <span class="dk-badge dk-badge-warn dk-mono"><span class="dk-dot"></span>STAGING</span>
+      {% else %}
+      <span class="dk-badge dk-badge-ok dk-mono"><span class="dk-dot"></span>DEV</span>
+      {% endif %}
+
+      {% if config.enable_user_preferences %}
+      <div class="dk-popover-wrap dk-status-hide-sm">
+        <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-toggle="dk-prefs-pop" title="{{ _('Preferences') }} ({{ active_locale|upper }} · {{ active_timezone }})" aria-label="Locale and timezone preferences">
+          {{ deck_icon("globe", 15) }}
+        </button>
+        <div class="dk-popover dk-prefs-pop" id="dk-prefs-pop" hidden="hidden">
+          <div class="dk-notif-head">
+            <strong>{{ _("Preferences") }}</strong>
+            <span class="dk-subtle dk-mono">{{ active_locale | upper }}</span>
+          </div>
+          <form method="post" action="{{ url_for(bp_name ~ '.update_preferences') }}" class="dk-prefs-form">
+            <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+            <input type="hidden" name="next" value="{{ request.full_path.rstrip('?') }}">
+            <div class="dk-field">
+              <label for="dk-pref-locale">{{ _("Language") }}</label>
+              <select id="dk-pref-locale" name="locale" class="dk-select">
+                {% for code in available_locales %}
+                <option value="{{ code }}"{% if active_locale == code %} selected{% endif %}>{{ locale_labels.get(code, code | upper) }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="dk-field">
+              <label for="dk-pref-tz">{{ _("Timezone") }}</label>
+              <select id="dk-pref-tz" name="timezone" class="dk-select dk-mono">
+                {% for tz in curated_timezones %}
+                <option value="{{ tz }}"{% if active_timezone == tz %} selected{% endif %}>{{ tz }}</option>
+                {% endfor %}
+                {% if active_timezone not in curated_timezones %}
+                <option value="{{ active_timezone }}" selected>{{ active_timezone }}</option>
+                {% endif %}
+              </select>
+            </div>
+            <button type="submit" class="dk-btn dk-btn-primary dk-btn-sm">{{ _("Apply") }}</button>
+          </form>
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="dk-popover-wrap dk-status-hide-sm">
+        <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-notif-open title="{{ _('Recent Events') }}" aria-label="Recent activity">
+          {{ deck_icon("bell", 15) }}
+        </button>
+        <div class="dk-popover dk-notif-pop" id="dk-notif-pop" hidden="hidden">
+          <div class="dk-notif-head">
+            <strong>{{ _("Recent Events") }}</strong>
+            {% if can_view_audit %}<a href="{{ url_for(bp_name ~ '.audit_list') }}" class="dk-subtle dk-mono">{{ _("All →") }}</a>{% endif %}
+          </div>
+          <div id="dk-notif-list" class="dk-notif-list">
+            <div class="dk-chart-empty">Loading…</div>
+          </div>
+        </div>
+      </div>
+
+      <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon dk-status-hide-sm" data-deck-keys-open title="{{ _('Keyboard Shortcuts') }} (?)" aria-label="Keyboard shortcuts">
+        {{ deck_icon("keyboard", 15) }}
+      </button>
+
+      <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-theme-toggle title="Toggle Carbon Dark / Swiss Light (t)" aria-label="Toggle theme">
+        {{ deck_icon("sun", 15) }}
+      </button>
+    </div>
+  </header>
+
+  <!-- 228px Left Navigation Rail -->
+  <aside class="dk-rail" aria-label="Primary navigation">
+    <div class="dk-rail-scroll">
+      {{ render_slot('rail_top') }}
+      <div>
+        <div class="dk-rail-group-title">{{ _("Workspace") }}</div>
+        <nav class="dk-nav-list">
+          <a href="{{ url_for(bp_name ~ '.index') }}"
+             class="dk-nav-item{% if active_nav == 'dashboard' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Dashboard') }}" data-subtitle="Operational metrics overview" data-go-key="d">
+            <span class="dk-nav-left">{{ deck_icon("layout-dashboard", 14) }}<span class="dk-nav-label">{{ _("Dashboard") }}</span></span>
+          </a>
+        </nav>
+      </div>
+
+      {% if deck.views | length >= 4 %}
+      <div class="dk-rail-filter-wrap">
+        <input type="search" id="dk-rail-filter" class="dk-input dk-rail-filter" placeholder="{{ _('Filter models…') }}" autocomplete="off" aria-label="Filter navigation models">
+      </div>
+      {% endif %}
+
+      {% for group in sidebar_groups %}
+      <div data-rail-group>
+        <div class="dk-rail-group-title">{{ group.name }}</div>
+        <nav class="dk-nav-list">
+          {% for item in group.links %}
+          <a href="{{ item.url }}"
+             class="dk-nav-item{% if active_nav == item.slug %} is-active{% endif %}"
+             data-rail-item="{{ item.label | lower }}">
+            <span class="dk-nav-left">{{ deck_icon(item.icon, 14) }}<span class="dk-nav-label">{{ item.label }}</span></span>
+            {% if item.count is not none %}
+            <span class="dk-nav-count dk-mono dk-tabular">{{ "{:,}".format(item.count) }}</span>
+            {% endif %}
+          </a>
+          {% endfor %}
+        </nav>
+      </div>
+      {% endfor %}
+
+      {% if can_view_audit or can_view_rbac or can_view_schema or can_view_sql or can_view_diagnostics or can_view_jobs or can_manage_mfa %}
+      <div>
+        <div class="dk-rail-group-title">{{ _("Governance") }}</div>
+        <nav class="dk-nav-list">
+          {% if can_view_audit %}
+          <a href="{{ url_for(bp_name ~ '.audit_list') }}"
+             class="dk-nav-item{% if active_nav == '_audit' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Audit Ledger') }}" data-subtitle="Field-level mutation diffs &amp; revert" data-go-key="a">
+            <span class="dk-nav-left">{{ deck_icon("history", 14) }}<span class="dk-nav-label">{{ _("Audit Ledger") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_view_rbac %}
+          <a href="{{ url_for(bp_name ~ '.rbac_matrix') }}"
+             class="dk-nav-item{% if active_nav == '_rbac' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('RBAC Matrix') }}" data-subtitle="Inspect role permissions &amp; field masks" data-go-key="r">
+            <span class="dk-nav-left">{{ deck_icon("shield", 14) }}<span class="dk-nav-label">{{ _("RBAC Matrix") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_view_schema %}
+          <a href="{{ url_for(bp_name ~ '.schema_inspector') }}"
+             class="dk-nav-item{% if active_nav == '_schema' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Schema ERD') }}" data-subtitle="SQLAlchemy 2.0 tables, FKs &amp; indexes" data-go-key="s">
+            <span class="dk-nav-left">{{ deck_icon("git-branch", 14) }}<span class="dk-nav-label">{{ _("Schema ERD") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_view_sql %}
+          <a href="{{ url_for(bp_name ~ '.sql_console') }}"
+             class="dk-nav-item{% if active_nav == '_sql' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('SQL Console') }}" data-subtitle="Read-only SQL explorer with PII redaction" data-go-key="q">
+            <span class="dk-nav-left">{{ deck_icon("terminal", 14) }}<span class="dk-nav-label">{{ _("SQL Console") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_view_jobs %}
+          <a href="{{ url_for(bp_name ~ '.jobs_list') }}"
+             class="dk-nav-item{% if active_nav == '_jobs' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Background Jobs') }}" data-subtitle="Async bulk actions &amp; exports (SSE)" data-go-key="j">
+            <span class="dk-nav-left">{{ deck_icon("cpu", 14) }}<span class="dk-nav-label">{{ _("Background Jobs") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_manage_mfa %}
+          <a href="{{ url_for(bp_name ~ '.security_mfa') }}"
+             class="dk-nav-item{% if active_nav == '_mfa' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('2FA Security') }}" data-subtitle="TOTP authenticator &amp; recovery codes">
+            <span class="dk-nav-left">{{ deck_icon("shield-check", 14) }}<span class="dk-nav-label">{{ _("2FA Security") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_view_diagnostics %}
+          <a href="{{ url_for(bp_name ~ '.diagnostics') }}"
+             class="dk-nav-item{% if active_nav == '_diagnostics' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Diagnostics') }}" data-subtitle="Security posture &amp; index health">
+            <span class="dk-nav-left">{{ deck_icon("heart-pulse", 14) }}<span class="dk-nav-label">{{ _("Diagnostics") }}</span></span>
+          </a>
+          {% endif %}
+        </nav>
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="dk-rail-bottom">
+      {{ render_slot('rail_bottom') }}
+
+      {% if demo_accounts %}
+      <div class="dk-role-switcher">
+        <div class="dk-role-sw-head dk-mono">
+          <span>SESSION ROLE</span>
+          <span>ENFORCE</span>
+        </div>
+        {% for acc in demo_accounts %}
+        {% set is_cur = current_user and current_user.id == acc.id %}
+        <form method="post" action="{{ url_for(bp_name ~ '.demo_switch_role') }}">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <input type="hidden" name="account_id" value="{{ acc.id }}">
+          <input type="hidden" name="next" value="{{ request.path }}">
+          <button type="submit" class="dk-role-sw-btn dk-mono{% if is_cur %} is-active{% endif %}">
+            <span class="dk-role-sw-name"><span class="dk-dot"></span>{{ acc.roles[0] if acc.roles else acc.username }}</span>
+            <span class="dk-subtle">{{ "full" if acc.is_superuser else ("mask" if 'support' in acc.roles else "ro") }}</span>
+          </button>
+        </form>
+        {% endfor %}
+      </div>
+      {% elif impersonate_targets %}
+      <div class="dk-role-switcher">
+        <div class="dk-role-sw-head dk-mono">
+          <span>VIEW AS</span>
+          <span>AUDITED</span>
+        </div>
+        <form method="post" action="{{ url_for(bp_name ~ '.impersonate_start') }}" class="dk-imp-form">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <select name="target_user_id" class="dk-select dk-mono" aria-label="Impersonate user">
+            {% for tgt in impersonate_targets %}
+            <option value="{{ tgt.id }}">{{ tgt.username }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit" class="dk-btn dk-btn-sm">{{ deck_icon("user-check", 12) }}</button>
+        </form>
+      </div>
+      {% endif %}
+
+      {% if current_user %}
+      <div class="dk-rail-footer">
+        <div class="dk-user-block">
+          <div class="dk-user-name">{{ current_user.label }}</div>
+          <div class="dk-user-role dk-mono">{{ current_user.roles | join(", ") }}</div>
+        </div>
+        {% if supports_logout %}
+        <form method="post" action="{{ url_for(bp_name ~ '.logout') }}">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <button type="submit" class="dk-btn dk-btn-ghost dk-btn-icon" title="{{ _('Sign out') }}" aria-label="{{ _('Sign out') }}">
+            {{ deck_icon("log-out", 14) }}
+          </button>
+        </form>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+  </aside>
+
+  <!-- Main Workspace -->
+  <main class="dk-main">
+    {% if is_impersonating and impersonator %}
+    <div class="dk-banner-warn dk-banner-imp" role="status">
+      <div class="dk-top-left">
+        {{ deck_icon("user-check", 14) }}
+        <span>IMPERSONATING <strong>{{ current_user.label }}</strong> ({{ current_user.roles | join(", ") }}) · Real actor: <code class="dk-code">{{ impersonator.username }}</code>{% if impersonate_read_only %} · READ-ONLY{% endif %}</span>
+      </div>
+      <form method="post" action="{{ url_for(bp_name ~ '.impersonate_stop') }}">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+        <button type="submit" class="dk-btn dk-btn-sm">{{ _("Exit Impersonation") }}</button>
+      </form>
+    </div>
+    {% endif %}
+
+    {% if is_insecure_open %}
+    <div class="dk-banner-warn" role="status">
+      {{ deck_icon("alert-triangle", 14) }}
+      <span>OpenAuthProvider active (local development mode). Configure BasicAuthProvider, RBACAuthProvider, or FlaskLoginAuthProvider before production.</span>
+    </div>
+    {% endif %}
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <div class="dk-content">
+      {% for cat, msg in messages %}
+      <div class="dk-alert dk-alert-{{ cat if cat in ['ok','danger','warn'] else 'neutral' }}" role="status">{{ msg }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </main>
+
+  <!-- 28px Live Telemetry Status Bar -->
+  <footer class="dk-statusbar dk-mono dk-tabular">
+    <div class="dk-status-group">
+      <span class="dk-status-item">SQLAlchemy 2.0</span>
+      {% if telemetry %}
+      <span class="dk-status-item">{{ telemetry.query_count }} queries</span>
+      <span class="dk-status-item dk-status-hide-sm">{{ "%.1f"|format(telemetry.sql_ms) }} ms SQL</span>
+      <span class="dk-status-item">{{ "%.1f"|format(telemetry.total_ms) }} ms</span>
+      {% endif %}
+      {% if brand.footer_note %}
+      <span class="dk-status-item dk-status-hide-sm">{{ brand.footer_note }}</span>
+      {% endif %}
+    </div>
+    <div class="dk-status-group">
+      <span class="dk-status-item dk-status-hide-sm">tz: {{ active_timezone }} · {{ active_locale }}</span>
+      {% if current_user %}
+      <span class="dk-status-item dk-status-hide-sm">role: {{ current_user.roles | join(",") }}</span>
+      {% endif %}
+      <span class="dk-status-item dk-status-hide-sm">CSP: strict</span>
+      <span class="dk-status-item">env: {{ config.environment }}</span>
+    </div>
+  </footer>
+</div>
+
+<!-- ⌘K Command Palette Modal -->
+<div class="dk-backdrop" id="dk-cmdk-backdrop" hidden="hidden" role="dialog" aria-modal="true" aria-label="Command Palette">
+  <div class="dk-modal">
+    <div class="dk-cmdk-head">
+      {{ deck_icon("search", 15) }}
+      <input type="text" id="dk-cmdk-input" class="dk-cmdk-input" placeholder="{{ _('Jump to model, record, action…') }}" autocomplete="off">
+      <button type="button" class="dk-btn dk-btn-ghost dk-btn-sm" data-deck-cmdk-close>ESC</button>
+    </div>
+    <div class="dk-cmdk-list" id="dk-cmdk-list"></div>
+    <div class="dk-cmdk-foot dk-mono">
+      <span>↑↓ navigate · ↵ open · esc close</span>
+      <span>RBAC-scoped live search</span>
+    </div>
+  </div>
+</div>
+
+<!-- Slide-Over Quick Peek Drawer -->
+<div class="dk-drawer-backdrop" id="dk-drawer-backdrop" hidden="hidden" role="dialog" aria-modal="true" aria-label="Record Inspector">
+  <div class="dk-drawer">
+    <div class="dk-drawer-head">
+      <strong id="dk-drawer-title">Record Inspector</strong>
+      <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-drawer-close aria-label="Close drawer">
+        {{ deck_icon("x", 15) }}
+      </button>
+    </div>
+    <div class="dk-drawer-body" id="dk-drawer-body"></div>
+  </div>
+</div>
+
+<!-- Strict-CSP Image Lightbox Modal -->
+<div class="dk-backdrop" id="dk-lightbox-backdrop" hidden="hidden" role="dialog" aria-modal="true" aria-label="Image preview">
+  <div class="dk-modal dk-lightbox-modal">
+    <div class="dk-panel-head">
+      <strong id="dk-lightbox-title" class="dk-mono">Preview</strong>
+      <div class="dk-page-actions">
+        <a id="dk-lightbox-dl" href="#" download class="dk-btn dk-btn-sm">{{ deck_icon("download", 12) }} Download</a>
+        <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-lightbox-close aria-label="Close preview">{{ deck_icon("x", 14) }}</button>
+      </div>
+    </div>
+    <div class="dk-lightbox-body">
+      <img id="dk-lightbox-img" class="dk-lightbox-img" alt="Preview">
+    </div>
+  </div>
+</div>
+
+<!-- Confirmation, Parameterized Action & Type-to-Confirm Modal -->
+<div class="dk-backdrop" id="dk-confirm-backdrop" hidden="hidden" role="dialog" aria-modal="true" aria-label="Confirm action">
+  <div class="dk-modal">
+    <div class="dk-panel-head">
+      <strong id="dk-confirm-title">Confirm Action</strong>
+      <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-confirm-close aria-label="Cancel">
+        {{ deck_icon("x", 14) }}
+      </button>
+    </div>
+    <div class="dk-panel-body">
+      <p id="dk-confirm-msg" class="dk-muted"></p>
+      <div id="dk-confirm-fields" class="dk-diff-list" hidden="hidden"></div>
+      <div id="dk-confirm-phrase-wrap" class="dk-field" hidden="hidden">
+        <label for="dk-confirm-input" id="dk-confirm-phrase-label" class="dk-mono"></label>
+        <input type="text" id="dk-confirm-input" class="dk-input dk-mono" autocomplete="off">
+      </div>
+    </div>
+    <div class="dk-panel-head">
+      <span></span>
+      <div class="dk-page-actions">
+        <button type="button" class="dk-btn" data-deck-confirm-close>{{ _("Cancel") }}</button>
+        <button type="button" class="dk-btn dk-btn-danger" id="dk-confirm-go">{{ _("Confirm") }}</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Keyboard Shortcuts Cheat Sheet Modal (?) -->
+<div class="dk-backdrop" id="dk-keys-backdrop" hidden="hidden" role="dialog" aria-modal="true" aria-label="Keyboard Shortcuts">
+  <div class="dk-modal">
+    <div class="dk-panel-head">
+      <strong>{{ _("Keyboard Shortcuts") }}</strong>
+      <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-keys-close aria-label="Close">{{ deck_icon("x", 14) }}</button>
+    </div>
+    <div class="dk-panel-body">
+      <div class="dk-keys-grid">
+        <div class="dk-key-row"><span>Command Palette</span><kbd class="dk-kbd">⌘K</kbd></div>
+        <div class="dk-key-row"><span>Focus Table Search</span><kbd class="dk-kbd">/</kbd></div>
+        <div class="dk-key-row"><span>New Record</span><kbd class="dk-kbd">n</kbd></div>
+        <div class="dk-key-row"><span>Toggle Dark / Light</span><kbd class="dk-kbd">t</kbd></div>
+        <div class="dk-key-row"><span>Next / Prev Table Row</span><span><kbd class="dk-kbd">j</kbd> <kbd class="dk-kbd">k</kbd></span></div>
+        <div class="dk-key-row"><span>Quick Peek Focused Row</span><kbd class="dk-kbd">Space</kbd></div>
+        <div class="dk-key-row"><span>Toggle Row Selection</span><kbd class="dk-kbd">x</kbd></div>
+        <div class="dk-key-row"><span>Edit Focused Row</span><kbd class="dk-kbd">e</kbd></div>
+        <div class="dk-key-row"><span>Go to Dashboard</span><span><kbd class="dk-kbd">g</kbd> <kbd class="dk-kbd">d</kbd></span></div>
+        <div class="dk-key-row"><span>Go to Audit / RBAC / Schema / Jobs</span><span><kbd class="dk-kbd">g</kbd> <kbd class="dk-kbd">a/r/s/j</kbd></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="dk-toasts" id="dk-toasts" aria-live="polite"></div>
+</body>
+</html>

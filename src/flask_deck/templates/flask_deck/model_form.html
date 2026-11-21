@@ -1,0 +1,389 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-crumb">{{ view.plural_label }}</a>
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ "New " ~ view.label if mode == 'create' else "Edit #" ~ pk_str }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ "Create " ~ view.label if mode == 'create' else "Edit " ~ view.label }}</h1>
+    <p class="dk-page-sub">All mutations are CSRF-protected and recorded to the Audit Ledger.</p>
+  </div>
+  <div class="dk-page-actions">
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-btn">{{ deck_icon("arrow-left", 13) }} Back</a>
+  </div>
+</div>
+
+<form method="post" class="dk-content"{% if has_file_fields %} enctype="multipart/form-data"{% endif %} data-deck-form-root{% if view.form_layout == 'wizard' and fieldsets | length > 1 %} data-deck-wizard{% endif %}>
+  <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+
+  {% if errors.get('__all__') %}
+  <div class="dk-alert dk-alert-danger" role="alert">
+    {% for msg in errors['__all__'] %}<div>{{ msg }}</div>{% endfor %}
+  </div>
+  {% endif %}
+
+  {% set use_tabs = (view.form_layout == 'tabs' and fieldsets | length > 1) %}
+  {% set use_wizard = (view.form_layout == 'wizard' and fieldsets | length > 1) %}
+  {% if use_tabs %}
+  <div class="dk-panel">
+    <div class="dk-tabs" role="tablist">
+      {% for fs_title, fs_cols in fieldsets %}
+      {% set ns = namespace(err_cnt=0) %}
+      {% for c in fs_cols %}{% if errors.get(c) %}{% set ns.err_cnt = ns.err_cnt + 1 %}{% endif %}{% endfor %}
+      <button type="button"
+              class="dk-tab{% if loop.first %} is-active{% endif %}"
+              data-deck-form-tab="fs-{{ loop.index0 }}">
+        <span>{{ fs_title }}</span>
+        {% if ns.err_cnt %}
+        <span class="dk-badge dk-badge-danger dk-mono">{{ ns.err_cnt }}</span>
+        {% endif %}
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+  {% elif use_wizard %}
+  <div class="dk-panel">
+    <div class="dk-wizard-steps" role="tablist">
+      {% for fs_title, fs_cols in fieldsets %}
+      {% set ns = namespace(err_cnt=0) %}
+      {% for c in fs_cols %}{% if errors.get(c) %}{% set ns.err_cnt = ns.err_cnt + 1 %}{% endif %}{% endfor %}
+      <button type="button"
+              class="dk-wiz-step{% if loop.first %} is-active{% endif %}"
+              data-deck-form-tab="fs-{{ loop.index0 }}"
+              data-wiz-idx="{{ loop.index0 }}">
+        <span class="dk-wiz-num dk-mono">{{ loop.index }}</span>
+        <span>{{ fs_title }}</span>
+        {% if ns.err_cnt %}
+        <span class="dk-badge dk-badge-danger dk-mono">{{ ns.err_cnt }}</span>
+        {% endif %}
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% for fs_title, fs_cols in fieldsets %}
+  <section class="dk-panel"{% if use_tabs or use_wizard %} data-deck-form-panel="fs-{{ loop.index0 }}"{% if not loop.first %} hidden="hidden"{% endif %}{% endif %}>
+    {% if not use_tabs and not use_wizard %}
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">{{ fs_title }}</h2>
+    </div>
+    {% endif %}
+    <div class="dk-panel-body">
+      <div class="dk-form-grid">
+        {% for col in fs_cols %}
+        {% set spec = field_specs[col] %}
+        {% set wtype = spec.widget %}
+        <div class="dk-field{% if spec.kind in ['text', 'json', 'm2m', 'file', 'array'] or wtype in ['markdown', 'json_kv', 'segmented'] %} dk-field-full{% endif %}"
+             {% if spec.show_when_json %}data-show-when="{{ spec.show_when_json }}"{% endif %}>
+          <label for="fld_{{ spec.name }}">
+            <span>{{ spec.label }}</span>
+            {% if spec.required %}<span class="dk-req">*</span>{% endif %}
+            {% if spec.readonly %}<span class="dk-badge dk-badge-neutral dk-mono">read-only</span>{% endif %}
+            {% if spec.kind == 'datetime' %}<span class="dk-subtle dk-mono">({{ active_timezone }})</span>{% endif %}
+            {% if spec.kind == 'json' and wtype != 'json_kv' %}
+            <button type="button" class="dk-btn dk-btn-sm" data-deck-pretty-json="fld_{{ spec.name }}">Format JSON</button>
+            {% endif %}
+          </label>
+
+          {% if spec.kind == 'file' %}
+          <div class="dk-dropzone" data-deck-dropzone>
+            <div class="dk-dropzone-current">
+              {% if spec.media_url and spec.file_kind == 'image' %}
+              <button type="button" class="dk-thumb-btn" data-deck-lightbox="{{ spec.media_url }}" data-lightbox-title="{{ spec.label }}">
+                <img src="{{ spec.media_url }}" alt="{{ spec.label }}" class="dk-thumb dk-thumb-lg">
+              </button>
+              {% elif spec.media_url %}
+              <a href="{{ spec.media_url }}" class="dk-file-chip dk-mono">{{ deck_icon("paperclip", 12) }} {{ spec.value.rsplit('/', 1)[-1] }}</a>
+              {% endif %}
+              <img class="dk-thumb dk-thumb-lg" data-dz-preview alt="Selected image preview" hidden="hidden">
+              <span class="dk-mono dk-subtle" data-dz-name>{% if spec.value %}{{ spec.value.rsplit('/', 1)[-1] }}{% else %}Drop {{ spec.file_kind or 'file' }} here or browse…{% endif %}</span>
+            </div>
+            <div class="dk-dropzone-actions">
+              <label class="dk-btn dk-btn-sm">
+                {{ deck_icon("upload", 12) }} Choose {{ "Image" if spec.file_kind == 'image' else "File" }}
+                <input type="file"
+                       id="fld_{{ spec.name }}"
+                       name="{{ spec.name }}"
+                       accept="{{ spec.file_accept }}"
+                       data-dz-input
+                       hidden="hidden"
+                       {% if spec.readonly %}disabled{% endif %}>
+              </label>
+              {% if spec.value and not spec.required and not spec.readonly %}
+              <label class="dk-pop-item dk-clear-check">
+                <input type="checkbox" name="_clear_{{ spec.name }}" value="1">
+                <span class="dk-subtle">Remove existing</span>
+              </label>
+              {% endif %}
+            </div>
+          </div>
+
+          {% elif spec.kind == 'array' %}
+          <div class="dk-tag-editor" data-deck-tags>
+            <input type="hidden" name="{{ spec.name }}" value="{{ spec.value or '[]' }}" data-tags-hidden>
+            <div class="dk-tag-chips" data-tags-chips></div>
+            <input type="text" id="fld_{{ spec.name }}" class="dk-input dk-tag-input" placeholder="Type tag and press Enter…" data-tags-input{% if spec.readonly %} readonly{% endif %}>
+          </div>
+
+          {% elif spec.kind == 'boolean' %}
+          <label class="dk-switch-row">
+            <span class="dk-switch">
+              <input type="checkbox" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="true"{% if spec.value %} checked{% endif %}{% if spec.readonly %} disabled{% endif %}>
+              <span class="dk-switch-track" aria-hidden="true"></span>
+            </span>
+            <span class="dk-muted" data-switch-label>{{ "Enabled" if spec.value else "Disabled" }}</span>
+          </label>
+
+          {% elif spec.kind == 'enum' and wtype == 'segmented' %}
+          <div class="dk-seg-radios" role="radiogroup" aria-label="{{ spec.label }}">
+            {% for val, lbl in spec.choices %}
+            <label class="dk-seg-radio">
+              <input type="radio" name="{{ spec.name }}" value="{{ val }}"{% if spec.value|string == val %} checked{% endif %}{% if spec.readonly %} disabled{% endif %}{% if spec.required %} required{% endif %}>
+              <span>{{ lbl }}</span>
+            </label>
+            {% endfor %}
+          </div>
+
+          {% elif spec.kind == 'enum' %}
+          <select id="fld_{{ spec.name }}" name="{{ spec.name }}" class="dk-select"{% if spec.readonly %} disabled{% endif %}{% if spec.required %} required{% endif %}>
+            {% if not spec.required %}<option value="">— None —</option>{% endif %}
+            {% for val, lbl in spec.choices %}
+            <option value="{{ val }}"{% if spec.value|string == val %} selected{% endif %}>{{ lbl }}</option>
+            {% endfor %}
+          </select>
+
+          {% elif spec.kind == 'fk' %}
+          <div class="dk-fk-wrap" data-deck-fk data-fk-url="{{ spec.fk_search_url or '' }}"{% if spec.dependent_json %} data-dependent="{{ spec.dependent_json }}"{% endif %}>
+            <input type="hidden" name="{{ spec.name }}" value="{{ spec.value }}" data-fk-value>
+            <input type="text"
+                   id="fld_{{ spec.name }}"
+                   class="dk-input"
+                   value="{{ spec.fk_current_label or spec.value }}"
+                   placeholder="Search {{ spec.label | lower }}…"
+                   autocomplete="off"
+                   data-fk-search
+                   {% if spec.readonly %}readonly{% endif %}>
+            <div class="dk-fk-dropdown" data-fk-dropdown hidden="hidden">
+              {% for opt in spec.fk_options %}
+              <div class="dk-fk-opt" data-id="{{ opt.id }}" data-label="{{ opt.label }}">
+                <span>{{ opt.label }}</span>
+                <span class="dk-mono dk-subtle">#{{ opt.id }}</span>
+              </div>
+              {% endfor %}
+            </div>
+          </div>
+
+          {% elif spec.kind == 'm2m' %}
+          <div class="dk-m2m-wrap" data-deck-m2m>
+            <div class="dk-m2m-head">
+              <input type="search" class="dk-input dk-m2m-search" placeholder="Filter {{ spec.label | lower }}…" data-m2m-filter>
+              <span class="dk-badge dk-badge-neutral dk-mono" data-m2m-count>{{ spec.selected_ids | length }} selected</span>
+            </div>
+            <div class="dk-m2m-box">
+              {% for opt in spec.options %}
+              <label class="dk-m2m-pill" data-m2m-item="{{ opt.label | lower }}">
+                <input type="checkbox" name="{{ spec.name }}" value="{{ opt.id }}"{% if opt.id in spec.selected_ids %} checked{% endif %}{% if spec.readonly %} disabled{% endif %} data-m2m-check>
+                <span>{{ opt.label }}</span>
+              </label>
+              {% else %}
+              <span class="dk-subtle">No related records available.</span>
+              {% endfor %}
+            </div>
+          </div>
+
+          {% elif spec.kind == 'json' and wtype == 'json_kv' %}
+          <div class="dk-kv-editor" data-deck-json-kv>
+            <div class="dk-kv-ed-bar">
+              <div class="dk-seg">
+                <button type="button" class="dk-seg-btn is-active" data-kv-mode="kv">Key-Value</button>
+                <button type="button" class="dk-seg-btn" data-kv-mode="raw">Raw JSON</button>
+              </div>
+              <button type="button" class="dk-btn dk-btn-sm" data-kv-add>{{ deck_icon("plus", 12) }} Add Pair</button>
+            </div>
+            <div class="dk-kv-rows" data-kv-rows></div>
+            <textarea id="fld_{{ spec.name }}" name="{{ spec.name }}" class="dk-textarea dk-mono" data-kv-raw hidden="hidden"{% if spec.readonly %} readonly{% endif %}>{{ spec.value or '{}' }}</textarea>
+          </div>
+
+          {% elif wtype == 'markdown' %}
+          <div class="dk-md-editor" data-deck-md>
+            <div class="dk-kv-ed-bar">
+              <div class="dk-seg">
+                <button type="button" class="dk-seg-btn is-active" data-md-mode="write">Write</button>
+                <button type="button" class="dk-seg-btn" data-md-mode="preview">Preview</button>
+              </div>
+              <span class="dk-subtle dk-mono">XSS-safe DOM preview</span>
+            </div>
+            <textarea id="fld_{{ spec.name }}" name="{{ spec.name }}" class="dk-textarea dk-mono" data-md-input{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>{{ spec.value }}</textarea>
+            <div class="dk-md-preview" data-md-preview hidden="hidden"></div>
+          </div>
+
+          {% elif wtype == 'slider' and spec.kind in ['integer', 'float'] %}
+          <div class="dk-slider-row" data-deck-slider>
+            <input type="range" min="0" max="100" step="1" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value or 0 }}" class="dk-slider" data-slider-input{% if spec.readonly %} disabled{% endif %}>
+            <span class="dk-badge dk-badge-neutral dk-mono dk-tabular" data-slider-val>{{ spec.value or 0 }}%</span>
+          </div>
+
+          {% elif spec.kind in ['text', 'json'] %}
+          <textarea id="fld_{{ spec.name }}"
+                    name="{{ spec.name }}"
+                    class="dk-textarea{% if spec.kind == 'json' %} dk-mono{% endif %}"
+                    {% if spec.readonly %}readonly{% endif %}
+                    {% if spec.required %}required{% endif %}>{{ spec.value }}</textarea>
+
+          {% elif spec.kind in ['integer', 'float', 'decimal'] %}
+          <input type="number"
+                 step="{{ '1' if spec.kind == 'integer' else 'any' }}"
+                 id="fld_{{ spec.name }}"
+                 name="{{ spec.name }}"
+                 value="{{ spec.value }}"
+                 class="dk-input dk-mono dk-tabular"
+                 {% if spec.readonly %}readonly{% endif %}
+                 {% if spec.required %}required{% endif %}>
+
+          {% elif spec.kind == 'date' %}
+          <input type="date" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
+          {% elif spec.kind == 'datetime' %}
+          <input type="datetime-local" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
+          {% elif spec.kind == 'email' %}
+          <input type="email" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input"{% if spec.max_length %} maxlength="{{ spec.max_length }}"{% endif %}{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
+          {% elif spec.kind == 'url' %}
+          <input type="url" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono" placeholder="https://…"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
+          {% else %}
+          <input type="text" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input"{% if spec.max_length %} maxlength="{{ spec.max_length }}"{% endif %}{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+          {% endif %}
+
+          {% if errors.get(spec.name) %}
+          <div class="dk-field-err">{{ errors[spec.name] | join(' ') }}</div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+  {% endfor %}
+
+  <!-- One-to-Many Inline Child Editors -->
+  {% for inline in inlines %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">{{ inline.label }}</h2>
+        <p class="dk-panel-sub">Inline child records saved atomically with parent</p>
+      </div>
+      {% if inline.can_create %}
+      <button type="button" class="dk-btn dk-btn-sm" data-deck-add-inline="{{ inline.slug }}">{{ deck_icon("plus", 12) }} Add Row</button>
+      {% endif %}
+    </div>
+    {% set inl_ns = namespace(errs=[]) %}
+    {% for ek, emsgs in errors.items() %}
+      {% if ek == inline.slug or ek.startswith(inline.slug ~ '[') %}
+        {% for m in emsgs %}{% set _ = inl_ns.errs.append(ek ~ ': ' ~ m) %}{% endfor %}
+      {% endif %}
+    {% endfor %}
+    {% if inl_ns.errs %}
+    <div class="dk-panel-body">
+      <div class="dk-alert dk-alert-danger" role="alert">
+        {% for msg in inl_ns.errs %}<div>{{ msg }}</div>{% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead>
+          <tr>
+            {% for col in inline.columns %}<th>{{ col.label }}</th>{% endfor %}
+            {% if inline.can_delete %}<th class="dk-td-actions">Remove</th>{% endif %}
+          </tr>
+        </thead>
+        <tbody data-inline-body="{{ inline.slug }}" data-next-index="{{ inline.rows | length }}">
+          {% for row in inline.rows %}
+          {% set idx = loop.index0 %}
+          <tr>
+            {% for col in inline.columns %}
+            <td>
+              {% if loop.first %}
+              <input type="hidden" name="inline__{{ inline.slug }}__{{ idx }}___pk" value="{{ row.pk }}">
+              <input type="hidden" name="inline__{{ inline.slug }}__{{ idx }}___delete" value="0" data-inline-del-flag>
+              {% endif %}
+              {% if col.kind == 'fk' %}
+              <select name="inline__{{ inline.slug }}__{{ idx }}__{{ col.name }}" class="dk-select">
+                <option value="">—</option>
+                {% for opt in col.fk_options %}
+                <option value="{{ opt.id }}"{% if row.values[col.name]|string == opt.id %} selected{% endif %}>{{ opt.label }}</option>
+                {% endfor %}
+              </select>
+              {% elif col.kind == 'enum' %}
+              <select name="inline__{{ inline.slug }}__{{ idx }}__{{ col.name }}" class="dk-select">
+                {% for val, lbl in col.choices %}
+                <option value="{{ val }}"{% if row.values[col.name]|string == val %} selected{% endif %}>{{ lbl }}</option>
+                {% endfor %}
+              </select>
+              {% else %}
+              <input type="{{ 'number' if col.kind in ['integer','float','decimal'] else 'text' }}"
+                     step="{{ '1' if col.kind == 'integer' else 'any' }}"
+                     name="inline__{{ inline.slug }}__{{ idx }}__{{ col.name }}"
+                     value="{{ row.values[col.name] }}"
+                     class="dk-input dk-mono">
+              {% endif %}
+            </td>
+            {% endfor %}
+            {% if inline.can_delete %}
+            <td class="dk-td-actions">
+              <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-del-inline aria-label="Remove row">{{ deck_icon("trash", 13) }}</button>
+            </td>
+            {% endif %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <template data-inline-template="{{ inline.slug }}">
+      <tr>
+        {% for col in inline.columns %}
+        <td>
+          {% if col.kind == 'fk' %}
+          <select name="inline__{{ inline.slug }}____INDEX____{{ col.name }}" class="dk-select">
+            <option value="">—</option>
+            {% for opt in col.fk_options %}<option value="{{ opt.id }}">{{ opt.label }}</option>{% endfor %}
+          </select>
+          {% elif col.kind == 'enum' %}
+          <select name="inline__{{ inline.slug }}____INDEX____{{ col.name }}" class="dk-select">
+            {% for val, lbl in col.choices %}<option value="{{ val }}">{{ lbl }}</option>{% endfor %}
+          </select>
+          {% else %}
+          <input type="{{ 'number' if col.kind in ['integer','float','decimal'] else 'text' }}"
+                 step="{{ '1' if col.kind == 'integer' else 'any' }}"
+                 name="inline__{{ inline.slug }}____INDEX____{{ col.name }}"
+                 class="dk-input dk-mono">
+          {% endif %}
+        </td>
+        {% endfor %}
+        {% if inline.can_delete %}
+        <td class="dk-td-actions">
+          <button type="button" class="dk-btn dk-btn-ghost dk-btn-icon" data-deck-del-inline aria-label="Remove row">{{ deck_icon("x", 13) }}</button>
+        </td>
+        {% endif %}
+      </tr>
+    </template>
+  </section>
+  {% endfor %}
+
+  <div class="dk-page-actions">
+    {% if use_wizard %}
+    <button type="button" class="dk-btn" data-wiz-prev hidden="hidden">{{ deck_icon("arrow-left", 13) }} {{ _("Prev") }}</button>
+    <button type="button" class="dk-btn dk-btn-primary" data-wiz-next>{{ _("Next") }} {{ deck_icon("arrow-right", 13) }}</button>
+    {% endif %}
+    <button type="submit" class="dk-btn dk-btn-primary"{% if use_wizard %} data-wiz-submit hidden="hidden"{% endif %}>{{ deck_icon("check", 13) }} {{ "Create " ~ view.label if mode == 'create' else "Save Changes" }}</button>
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-btn">{{ _("Cancel") }}</a>
+  </div>
+</form>
+{% endblock %}

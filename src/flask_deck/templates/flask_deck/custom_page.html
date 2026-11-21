@@ -1,0 +1,12 @@
+{% extends "flask_deck/base.html" %}
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ page_spec.title }}</h1>
+    {% if page_spec.subtitle %}<p class="dk-page-sub">{{ page_spec.subtitle }}</p>{% endif %}
+  </div>
+</div>
+<div class="dk-content">
+  {% include "flask_deck/partials/widget_grid.html" %}
+</div>
+{% endblock %}

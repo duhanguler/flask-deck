@@ -1,0 +1,117 @@
+{% extends "flask_deck/base.html" %}
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">Audit Ledger</h1>
+    <p class="dk-page-sub dk-mono dk-tabular">{{ "{:,}".format(total) }} immutable mutation records · sensitive fields auto-redacted</p>
+  </div>
+</div>
+
+<div class="dk-toolbar">
+  <form method="get" action="{{ url_for(bp_name ~ '.audit_list') }}" class="dk-toolbar-left">
+    <div class="dk-search-box">
+      <span class="dk-search-icon">{{ deck_icon("search", 13) }}</span>
+      <input type="search" name="q" value="{{ search_term }}" class="dk-input" placeholder="Search record, diff, actor…">
+    </div>
+    <select name="model" class="dk-select">
+      <option value="">All models</option>
+      {% for slug, v in deck.views.items() %}
+      <option value="{{ slug }}"{% if model_filter == slug %} selected{% endif %}>{{ v.plural_label }}</option>
+      {% endfor %}
+    </select>
+    <select name="action" class="dk-select">
+      <option value="">All actions</option>
+      {% for act in ['create','update','inline_edit','delete','soft_delete','restore','bulk_action','async_job','import','revert','sql_query','impersonate_start','impersonate_stop','mfa_enabled','mfa_disabled'] %}
+      <option value="{{ act }}"{% if action_filter == act %} selected{% endif %}>{{ act }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="dk-btn dk-btn-primary">Filter</button>
+    {% if search_term or model_filter or action_filter or actor_filter %}
+    <a href="{{ url_for(bp_name ~ '.audit_list') }}" class="dk-btn dk-btn-ghost">Reset</a>
+    {% endif %}
+  </form>
+</div>
+
+<div class="dk-table-wrap">
+  <table class="dk-table">
+    <thead>
+      <tr>
+        <th>Timestamp ({{ active_timezone }})</th>
+        <th>Action</th>
+        <th>Actor</th>
+        <th>Resource</th>
+        <th>Field-Level Diff</th>
+        <th class="dk-td-actions">Revert</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for entry in entries %}
+      <tr>
+        <td class="dk-mono dk-tabular dk-muted">{{ format_dt(entry.timestamp, '%Y-%m-%d %H:%M:%S') }}</td>
+        <td>
+          <span class="dk-badge dk-badge-{{ 'ok' if entry.action in ['create','restore','mfa_enabled'] else ('danger' if entry.action in ['delete','soft_delete','mfa_disabled'] else ('warn' if entry.action in ['update','inline_edit','revert','impersonate_start'] else 'info')) }} dk-mono">{{ entry.action }}</span>
+        </td>
+        <td>
+          <div>{{ entry.actor_name }}</div>
+          <div class="dk-mono dk-subtle">{{ entry.actor_ip }}</div>
+        </td>
+        <td>
+          <div><strong>{{ entry.model_label }}</strong> · {{ entry.record_repr }}</div>
+          <code class="dk-code">{{ entry.model_slug }}#{{ entry.record_pk }}</code>
+        </td>
+        <td>
+          {% if entry.changes %}
+          <div class="dk-diff-list">
+            {% for fname, delta in entry.changes.items() %}
+            <div class="dk-diff-row">
+              <span class="dk-diff-key">{{ fname }}:</span>
+              {% if delta.old is not none %}<span class="dk-diff-old">{{ delta.old }}</span><span class="dk-subtle">→</span>{% endif %}
+              <span class="dk-diff-new">{{ delta.new }}</span>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if entry.metadata %}
+          <div class="dk-chip-group dk-mono">
+            {% for mk, mv in entry.metadata.items() %}
+            <span class="dk-chip">{{ mk }}={{ mv }}</span>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if not entry.changes and not entry.metadata %}
+          <span class="dk-null">—</span>
+          {% endif %}
+        </td>
+        <td class="dk-td-actions">
+          {% if can_revert and entry.is_revertible %}
+          <form method="post" action="{{ url_for(bp_name ~ '.audit_revert', entry_id=entry.id) }}">
+            <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+            <button type="submit"
+                    class="dk-btn dk-btn-sm"
+                    data-deck-confirm-form
+                    data-confirm-title="Revert Mutation"
+                    data-confirm-msg="Restore previous field values on {{ entry.record_repr }}?"
+                    {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="REVERT"{% endif %}>
+              {{ deck_icon("rotate-ccw", 12) }} Revert
+            </button>
+          </form>
+          {% else %}
+          <span class="dk-null">—</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="dk-chart-empty">No audit records match the current filters.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="dk-pagination dk-mono dk-tabular">
+  <span>Page {{ page }} of {{ pages }} · {{ "{:,}".format(total) }} entries</span>
+  <div class="dk-pag-btns">
+    {% if page > 1 %}<a href="{{ url_for(bp_name ~ '.audit_list', page=page-1, model=model_filter or None, action=action_filter or None, actor=actor_filter or None, q=search_term or None) }}" class="dk-btn dk-btn-sm">Prev</a>{% endif %}
+    {% if page < pages %}<a href="{{ url_for(bp_name ~ '.audit_list', page=page+1, model=model_filter or None, action=action_filter or None, actor=actor_filter or None, q=search_term or None) }}" class="dk-btn dk-btn-sm">Next</a>{% endif %}
+  </div>
+</div>
+{% endblock %}

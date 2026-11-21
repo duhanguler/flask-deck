@@ -1,0 +1,87 @@
+{% extends "flask_deck/base.html" %}
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">Read-Only SQL Console</h1>
+    <p class="dk-page-sub dk-mono">SELECT / WITH / EXPLAIN only · rolled-back transaction · auto-redacts sensitive columns · max {{ config.sql_console_max_rows }} rows</p>
+  </div>
+</div>
+
+<div class="dk-content">
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div class="dk-toolbar-left">
+        <span class="dk-badge dk-badge-ok dk-mono"><span class="dk-dot"></span>READ-ONLY GUARD</span>
+        {% if sql_presets %}
+        <span class="dk-subtle dk-mono">Presets:</span>
+        {% for plabel, psql in sql_presets %}
+        <button type="button" class="dk-btn dk-btn-sm" data-deck-sql-preset="{{ psql }}">{{ plabel }}</button>
+        {% endfor %}
+        {% endif %}
+      </div>
+      <div class="dk-chip-group dk-mono">
+        {% for tbl in tables[:6] %}
+        <button type="button" class="dk-chip" data-deck-sql-preset="SELECT * FROM {{ tbl }} LIMIT 25">{{ tbl }}</button>
+        {% endfor %}
+      </div>
+    </div>
+
+    <form method="post" class="dk-panel-body">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <div class="dk-field">
+        <textarea id="dk-sql-editor" name="sql" class="dk-textarea dk-mono dk-sql-editor" rows="5" placeholder="SELECT id, name FROM ... LIMIT 25">{{ sql_text }}</textarea>
+      </div>
+      <div class="dk-form-actions">
+        <button type="submit" name="output" value="table" class="dk-btn dk-btn-primary">{{ deck_icon("play", 12) }} Run Query</button>
+        <button type="submit" name="output" value="csv" class="dk-btn">{{ deck_icon("download", 13) }} Run &amp; Export CSV</button>
+        <span class="dk-subtle dk-mono">Every execution is audited in the Audit Ledger.</span>
+      </div>
+    </form>
+  </section>
+
+  {% if result %}
+  {% if result.error %}
+  <div class="dk-alert dk-alert-danger dk-mono" role="alert">{{ result.error }}</div>
+  {% else %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div class="dk-toolbar-left dk-mono">
+        <strong>{{ result.row_count }} row(s)</strong>
+        <span class="dk-subtle">· {{ "%.2f"|format(result.duration_ms) }} ms</span>
+        {% if result.truncated %}<span class="dk-badge dk-badge-warn">TRUNCATED AT {{ config.sql_console_max_rows }}</span>{% endif %}
+        {% if result.redacted_columns %}<span class="dk-badge dk-badge-ok">REDACTED: {{ result.redacted_columns | join(", ") }}</span>{% endif %}
+      </div>
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table dk-mono">
+        <thead>
+          <tr>
+            {% for col in result.columns %}<th>{{ col }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in result.rows %}
+          <tr>
+            {% for cell in row %}
+            <td>
+              {% if cell == '[REDACTED]' %}
+              <span class="dk-masked">[REDACTED]</span>
+              {% elif cell is none %}
+              <span class="dk-null">NULL</span>
+              {% else %}
+              {{ cell }}
+              {% endif %}
+            </td>
+            {% endfor %}
+          </tr>
+          {% else %}
+          <tr><td colspan="{{ result.columns | length or 1 }}" class="dk-chart-empty">Query returned 0 rows.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,59 @@
+{% extends "flask_deck/base.html" %}
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">RBAC Policy Matrix</h1>
+    <p class="dk-page-sub">Deny-by-default 4-level authorization: model actions, field masking, read-only guards, and row scoping.</p>
+  </div>
+</div>
+
+<div class="dk-content">
+  {% for block in matrix %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">{{ block.role.display_label }} <code class="dk-code">{{ block.role.name }}</code></h2>
+        {% if block.role.description %}<p class="dk-panel-sub">{{ block.role.description }}</p>{% endif %}
+      </div>
+      <div class="dk-page-actions">
+        <span class="dk-badge dk-badge-{{ 'ok' if block.audit_view else 'neutral' }} dk-mono">audit:view {{ 'ON' if block.audit_view else 'OFF' }}</span>
+        <span class="dk-badge dk-badge-{{ 'warn' if block.audit_revert else 'neutral' }} dk-mono">audit:revert {{ 'ON' if block.audit_revert else 'OFF' }}</span>
+      </div>
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead>
+          <tr>
+            <th>Model</th>
+            {% for act in actions %}<th>{{ act | upper }}</th>{% endfor %}
+            <th>Field Controls (Hidden / Read-Only / Masked)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in block.models %}
+          <tr>
+            <td><strong>{{ row.label }}</strong></td>
+            {% for act in actions %}
+            <td>
+              {% if row.grants[act] %}
+              <span class="dk-badge dk-badge-ok dk-mono">ALLOW</span>
+              {% else %}
+              <span class="dk-badge dk-badge-neutral dk-mono">DENY</span>
+              {% endif %}
+            </td>
+            {% endfor %}
+            <td class="dk-mono">
+              {% if row.hidden %}<span class="dk-badge dk-badge-danger">hide: {{ row.hidden | join(",") }}</span> {% endif %}
+              {% if row.readonly %}<span class="dk-badge dk-badge-warn">ro: {{ row.readonly | join(",") }}</span> {% endif %}
+              {% if row.masked %}<span class="dk-badge dk-badge-info">mask: {{ row.masked | join(",") }}</span>{% endif %}
+              {% if not row.hidden and not row.readonly and not row.masked %}<span class="dk-subtle">Full field access</span>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endfor %}
+</div>
+{% endblock %}

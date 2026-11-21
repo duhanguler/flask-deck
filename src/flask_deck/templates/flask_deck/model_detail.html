@@ -1,0 +1,124 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-crumb">{{ view.plural_label }}</a>
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ record_repr }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ record_repr }}</h1>
+    <p class="dk-page-sub dk-mono">{{ view.meta.name }} · PK {{ pk_str }}</p>
+  </div>
+  <div class="dk-page-actions">
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-btn">{{ deck_icon("arrow-left", 13) }} List</a>
+    {% if can_view_audit %}
+    <a href="{{ url_for(bp_name ~ '.model_history', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn">{{ deck_icon("git-compare", 13) }} {{ _("History") }}</a>
+    {% endif %}
+    {% if can_create %}
+    <a href="{{ url_for(bp_name ~ '.model_create', slug=view.meta.slug, clone=pk_str) }}" class="dk-btn">{{ deck_icon("copy", 13) }} {{ _("Clone") }}</a>
+    {% endif %}
+    {% if is_soft_deleted and can_edit %}
+    <form method="post" action="{{ url_for(bp_name ~ '.model_restore', slug=view.meta.slug, raw_pk=pk_str) }}">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("rotate-ccw", 13) }} {{ _("Restore") }}</button>
+    </form>
+    {% elif can_edit %}
+    <a href="{{ url_for(bp_name ~ '.model_edit', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn dk-btn-primary">{{ deck_icon("edit", 13) }} {{ _("Edit") }}</a>
+    {% endif %}
+    {% if (can_force_delete if is_soft_deleted else can_delete) %}
+    <form method="post" action="{{ url_for(bp_name ~ '.model_delete', slug=view.meta.slug, raw_pk=pk_str) }}">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      {% if is_soft_deleted %}<input type="hidden" name="force" value="1">{% endif %}
+      <button type="submit"
+              class="dk-btn dk-btn-danger"
+              data-deck-confirm-form
+              data-confirm-title="{{ 'Permanently Delete' if is_soft_deleted else ('Move to Trash' if view.soft_delete_column else 'Delete') }} {{ view.label }}"
+              data-confirm-msg="{{ 'Permanently erase' if (is_soft_deleted or not view.soft_delete_column) else 'Move to Trash:' }} {{ record_repr }}?">
+        {{ deck_icon("trash", 13) }} {{ "Force Delete" if is_soft_deleted else _("Delete") }}
+      </button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="dk-content">
+  <div class="dk-grid">
+    <section class="dk-panel dk-span-8">
+      <div class="dk-panel-head">
+        <h2 class="dk-panel-title">Attributes</h2>
+        <span class="dk-mono dk-subtle">{{ fields_display | length }} fields</span>
+      </div>
+      <div class="dk-kv-grid">
+        {% for f in fields_display %}
+        <div class="dk-kv-item">
+          <div class="dk-kv-key">{{ f.label }}</div>
+          <div class="dk-kv-val">{{ f.formatted }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="dk-panel dk-span-4">
+      <div class="dk-panel-head">
+        <h2 class="dk-panel-title">Relationships</h2>
+      </div>
+      <div class="dk-panel-body">
+        {% for rel in relations_display %}
+        <div class="dk-field">
+          <label>{{ rel.label }} <span class="dk-tab-count dk-mono">{{ rel.count }}</span></label>
+          {% if rel.records %}
+          <div class="dk-chip-group">
+            {% for it in rel.records %}<span class="dk-chip">{{ it }}</span>{% endfor %}
+          </div>
+          {% else %}
+          <span class="dk-null">None</span>
+          {% endif %}
+        </div>
+        {% else %}
+        <div class="dk-subtle">No relationships defined.</div>
+        {% endfor %}
+      </div>
+    </section>
+
+    {% if can_view_audit %}
+    <section class="dk-panel dk-span-12">
+      <div class="dk-panel-head">
+        <h2 class="dk-panel-title">Record Audit History</h2>
+        <span class="dk-mono dk-subtle">{{ history | length }} event(s)</span>
+      </div>
+      <div>
+        {% for entry in history %}
+        <div class="dk-activity-row">
+          <div class="dk-activity-main">
+            <div>
+              <span class="dk-badge dk-badge-{{ 'ok' if entry.action == 'create' else ('danger' if entry.action == 'delete' else 'warn') }} dk-mono">{{ entry.action }}</span>
+              <strong>{{ entry.actor_name }}</strong>
+              <span class="dk-mono dk-subtle">({{ entry.actor_ip }})</span>
+            </div>
+            {% if entry.changes %}
+            <div class="dk-diff-list">
+              {% for fname, delta in entry.changes.items() %}
+              <div class="dk-diff-row">
+                <span class="dk-diff-key">{{ fname }}:</span>
+                {% if delta.old is not none %}<span class="dk-diff-old">{{ delta.old }}</span>{% endif %}
+                <span class="dk-subtle">→</span>
+                <span class="dk-diff-new">{{ delta.new }}</span>
+              </div>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </div>
+          <span class="dk-mono dk-subtle dk-tabular">{{ format_dt(entry.timestamp, '%Y-%m-%d %H:%M:%S') }}</span>
+        </div>
+        {% else %}
+        <div class="dk-chart-empty">No audit history for this record.</div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

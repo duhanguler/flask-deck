@@ -1,0 +1,489 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ view.plural_label }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ view.plural_label }}{% if trashed %} · {{ _("Trash") }}{% endif %}</h1>
+    <p class="dk-page-sub dk-mono dk-tabular">
+      {% if result.total_known %}
+        {% if result.total_is_estimated %}~{% endif %}{{ "{:,}".format(result.total) }} {{ _("matching records") }}
+      {% else %}
+        {{ result.items | length }} rows (cursor stream)
+      {% endif %}
+      {% if result.pagination_mode == 'cursor' %} · keyset cursor{% endif %}
+    </p>
+  </div>
+  <div class="dk-page-actions">
+    {% if supports_soft_delete %}
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(trashed=(None if trashed else '1'), page=1, after=None, before=None) }}"
+       class="dk-btn{% if trashed %} dk-btn-primary{% endif %}">
+      {{ deck_icon("archive", 13) }} {{ _("Trash") }}
+      <span class="dk-tab-count dk-mono dk-tabular">{{ result.trashed_count }}</span>
+    </a>
+    {% endif %}
+    {% if supports_kanban and not trashed %}
+    <div class="dk-seg" role="group" aria-label="View mode">
+      <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='table', after=None, before=None) }}"
+         class="dk-seg-btn{% if view_mode == 'table' %} is-active{% endif %}">{{ deck_icon("table", 12) }} {{ _("Table") }}</a>
+      <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='board', after=None, before=None) }}"
+         class="dk-seg-btn{% if view_mode == 'board' %} is-active{% endif %}">{{ deck_icon("kanban", 12) }} {{ _("Board") }}</a>
+    </div>
+    {% endif %}
+    {% if can_import %}
+    <a href="{{ url_for(bp_name ~ '.model_import', slug=view.meta.slug) }}" class="dk-btn">{{ deck_icon("upload", 13) }} {{ _("Import") }}</a>
+    {% endif %}
+    {% if can_export %}
+    <div class="dk-popover-wrap">
+      <button type="button" class="dk-btn" data-deck-toggle="dk-export-menu">{{ deck_icon("download", 13) }} {{ _("Export") }}</button>
+      <div class="dk-popover" id="dk-export-menu" hidden="hidden">
+        <a class="dk-pop-item" href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='csv') }}{{ qs() }}">{{ deck_icon("file-text", 13) }} Export CSV</a>
+        <a class="dk-pop-item" href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='json') }}{{ qs() }}">{{ deck_icon("file-text", 13) }} Export JSON</a>
+        <a class="dk-pop-item" href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='jsonl') }}{{ qs() }}">{{ deck_icon("file-text", 13) }} Export JSONL</a>
+        {% if can_view_jobs %}
+        <form method="post" action="{{ url_for(bp_name ~ '.model_export_async', slug=view.meta.slug) }}">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <input type="hidden" name="fmt" value="csv">
+          <input type="hidden" name="q" value="{{ search_term }}">
+          {% if trashed %}<input type="hidden" name="trashed" value="1">{% endif %}
+          {% if active_tab %}<input type="hidden" name="tab" value="{{ active_tab }}">{% endif %}
+          {% for fk, fv in result.active_filters.items() %}
+          <input type="hidden" name="f_{{ fk }}" value="{{ fv }}">
+          {% endfor %}
+          <button type="submit" class="dk-pop-item">{{ deck_icon("cpu", 13) }} Background CSV Job</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+    {% if can_create %}
+    <a href="{{ url_for(bp_name ~ '.model_create', slug=view.meta.slug) }}" id="dk-new-record-btn" class="dk-btn dk-btn-primary">
+      {{ deck_icon("plus", 13) }} {{ _("New") }} {{ view.label }}
+    </a>
+    {% endif %}
+  </div>
+</div>
+
+{{ render_slot('list_above_table') }}
+
+{% if view.quick_tabs and view_mode == 'table' and not trashed %}
+<div class="dk-tabs" role="tablist">
+  {% for tab in view.quick_tabs %}
+  <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(tab=tab.key, page=1, after=None, before=None) }}"
+     class="dk-tab{% if active_tab == tab.key %} is-active{% endif %}">
+    {% if tab.normalized_tone != 'neutral' %}
+    <span class="dk-badge dk-badge-{{ tab.normalized_tone }}"><span class="dk-dot"></span>{{ tab.label }}</span>
+    {% else %}
+    <span>{{ tab.label }}</span>
+    {% endif %}
+    <span class="dk-tab-count dk-mono dk-tabular">{{ "{:,}".format(result.tab_counts.get(tab.key, 0)) }}</span>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="dk-toolbar">
+  <form method="get" action="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-toolbar-left">
+    {% if trashed %}<input type="hidden" name="trashed" value="1">{% endif %}
+    {% if active_tab %}<input type="hidden" name="tab" value="{{ active_tab }}">{% endif %}
+    {% if view_mode == 'board' %}<input type="hidden" name="view" value="board">{% endif %}
+    {% for fk, fv in result.active_filters.items() %}
+    <input type="hidden" name="f_{{ fk }}" value="{{ fv }}">
+    {% endfor %}
+    {% if view.resolved_searchable %}
+    <div class="dk-search-box">
+      <span class="dk-search-icon">{{ deck_icon("search", 13) }}</span>
+      <input type="search" id="dk-table-search" name="q" value="{{ search_term }}" class="dk-input" placeholder="{{ _('Search') }} {{ view.plural_label | lower }}… (press /)">
+    </div>
+    <button type="submit" class="dk-btn">{{ _("Search") }}</button>
+    {% endif %}
+    {% if search_term or result.active_filters %}
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug, trashed=('1' if trashed else None)) }}" class="dk-btn dk-btn-ghost">{{ _("Reset") }}</a>
+    {% endif %}
+  </form>
+
+  <div class="dk-toolbar-right">
+    {% if filter_specs %}
+    <button type="button" class="dk-btn" data-deck-toggle="dk-filter-panel">
+      {{ deck_icon("filter", 13) }} {{ _("Filters") }}{% if result.active_filters %} ({{ result.active_filters | length }}){% endif %}
+    </button>
+    {% endif %}
+    <button type="button" class="dk-btn" data-deck-save-view data-model-slug="{{ view.meta.slug }}" title="Save current filter slice">
+      {{ deck_icon("bookmark", 13) }} {{ _("Save View") }}
+    </button>
+    {% if view_mode == 'table' %}
+    <button type="button" class="dk-btn dk-btn-icon" data-deck-density-toggle title="Toggle Compact / Comfortable density" aria-label="Toggle row density">
+      {{ deck_icon("list", 14) }}
+    </button>
+    <div class="dk-popover-wrap">
+      <button type="button" class="dk-btn" data-deck-toggle="dk-cols-menu">{{ deck_icon("columns", 13) }} {{ _("Columns") }}</button>
+      <div class="dk-popover" id="dk-cols-menu" data-deck-cols-menu data-model-slug="{{ view.meta.slug }}" hidden="hidden">
+        {% for col in visible_cols %}
+        <label class="dk-pop-item">
+          <input type="checkbox" data-col-toggle="{{ col }}" checked>
+          <span>{{ view.get_column_label(col) }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Saved Filter Views Strip (Declarative + Browser-Persisted) -->
+<div class="dk-saved-bar" id="dk-saved-views-bar" data-deck-saved-views data-model-slug="{{ view.meta.slug }}" data-base-url="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}"{% if not view.saved_views %} hidden="hidden"{% endif %}>
+  <span class="dk-subtle dk-mono">Views:</span>
+  {% for sv_label, sv_qs in view.saved_views %}
+  <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ sv_qs }}" class="dk-filter-chip">{{ deck_icon("bookmark", 11) }} {{ sv_label }}</a>
+  {% endfor %}
+  <span id="dk-saved-custom-host" class="dk-chip-group"></span>
+</div>
+
+{% if filter_specs %}
+<form method="get" action="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" id="dk-filter-panel" class="dk-filter-bar" {% if not result.active_filters %}hidden="hidden"{% endif %}>
+  {% if trashed %}<input type="hidden" name="trashed" value="1">{% endif %}
+  {% if search_term %}<input type="hidden" name="q" value="{{ search_term }}">{% endif %}
+  {% if active_tab %}<input type="hidden" name="tab" value="{{ active_tab }}">{% endif %}
+  {% if view_mode == 'board' %}<input type="hidden" name="view" value="board">{% endif %}
+  {% for f in filter_specs %}
+  <div class="dk-filter-group">
+    <label for="f_{{ f.name }}">{{ f.label }}</label>
+    {% if f.type == 'boolean' %}
+    <select id="f_{{ f.name }}" name="f_{{ f.name }}" class="dk-select">
+      <option value="">Any</option>
+      <option value="true"{% if f.value == 'true' %} selected{% endif %}>True / Active</option>
+      <option value="false"{% if f.value == 'false' %} selected{% endif %}>False / Inactive</option>
+    </select>
+    {% elif f.type == 'enum' %}
+    <select id="f_{{ f.name }}" name="f_{{ f.name }}" class="dk-select">
+      <option value="">Any</option>
+      {% for val, lbl in f.choices %}
+      <option value="{{ val }}"{% if f.value == val %} selected{% endif %}>{{ lbl }}</option>
+      {% endfor %}
+    </select>
+    {% elif f.type == 'fk' %}
+    <select id="f_{{ f.name }}" name="f_{{ f.name }}" class="dk-select">
+      <option value="">Any</option>
+      {% for opt in f.fk_options %}
+      <option value="{{ opt.id }}"{% if f.value == opt.id %} selected{% endif %}>{{ opt.label }}</option>
+      {% endfor %}
+    </select>
+    {% elif f.type in ['datetime', 'date'] %}
+    <select id="f_{{ f.name }}" name="f_{{ f.name }}__preset" class="dk-select">
+      <option value="">Any time</option>
+      <option value="today"{% if f.preset == 'today' %} selected{% endif %}>Today</option>
+      <option value="7d"{% if f.preset == '7d' %} selected{% endif %}>Last 7 days</option>
+      <option value="30d"{% if f.preset == '30d' %} selected{% endif %}>Last 30 days</option>
+      <option value="month"{% if f.preset == 'month' %} selected{% endif %}>This month</option>
+    </select>
+    {% elif f.type in ['integer', 'float', 'decimal'] %}
+    <div class="dk-toolbar-left">
+      <input type="number" step="any" name="f_{{ f.name }}__gte" value="{{ f.gte }}" class="dk-input" placeholder="Min">
+      <input type="number" step="any" name="f_{{ f.name }}__lte" value="{{ f.lte }}" class="dk-input" placeholder="Max">
+    </div>
+    {% elif f.type == 'json' %}
+    <div class="dk-toolbar-left">
+      <input type="text" name="f_{{ f.name }}__has_key" value="{{ f.has_key }}" class="dk-input dk-mono" placeholder="Has key (e.g. region)">
+      <input type="text" name="f_{{ f.name }}__path" value="{{ f.path }}" class="dk-input dk-mono" placeholder="path=value">
+    </div>
+    {% elif f.type == 'array' %}
+    <div class="dk-toolbar-left">
+      <input type="text" name="f_{{ f.name }}__array_contains" value="{{ f.array_contains }}" class="dk-input dk-mono" placeholder="Contains value">
+      <input type="text" name="f_{{ f.name }}__array_any" value="{{ f.array_any }}" class="dk-input dk-mono" placeholder="Any (a,b)">
+    </div>
+    {% else %}
+    <input type="text" id="f_{{ f.name }}" name="f_{{ f.name }}" value="{{ f.value }}" class="dk-input" placeholder="Exact value">
+    {% endif %}
+  </div>
+  {% endfor %}
+  <!-- Dynamic Multi-Operator Rule Composer -->
+  <div class="dk-filter-group dk-rule-builder" data-deck-rule-builder>
+    <label>Custom Rule</label>
+    <div class="dk-toolbar-left">
+      <select class="dk-select" data-rule-field aria-label="Rule field">
+        <option value="">Field…</option>
+        {% for f in filter_specs %}
+        <option value="{{ f.name }}">{{ f.label }}</option>
+        {% endfor %}
+      </select>
+      <select class="dk-select dk-mono" data-rule-op aria-label="Rule operator">
+        <option value="">=</option>
+        <option value="__neq">!=</option>
+        <option value="__contains">contains</option>
+        <option value="__startswith">starts with</option>
+        <option value="__gt">&gt;</option>
+        <option value="__lt">&lt;</option>
+        <option value="__null">is null</option>
+      </select>
+      <input type="text" class="dk-input dk-mono" data-rule-val placeholder="Value">
+      <button type="button" class="dk-btn dk-btn-sm" data-rule-add>{{ deck_icon("plus", 12) }} {{ _("Add Condition") }}</button>
+    </div>
+    <div data-rule-hidden></div>
+  </div>
+  <div class="dk-filter-group">
+    <label>&nbsp;</label>
+    <div class="dk-toolbar-left">
+      <button type="submit" class="dk-btn dk-btn-primary">{{ _("Apply Filters") }}</button>
+      <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug, trashed=('1' if trashed else None)) }}" class="dk-btn">{{ _("Clear") }}</a>
+    </div>
+  </div>
+</form>
+{% endif %}
+
+{% if result.active_filters %}
+<div class="dk-filter-chips">
+  <span class="dk-subtle dk-mono">Active filters:</span>
+  {% for fk, fv in result.active_filters.items() %}
+  <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(**{'f_' ~ fk: None, 'page': 1, 'after': None, 'before': None}) }}" class="dk-filter-chip dk-mono">
+    <span>{{ fk }}={{ fv }}</span>
+    {{ deck_icon("x", 11) }}
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if view_mode == 'board' %}
+<!-- Drag-and-Drop Kanban Board View -->
+<div class="dk-kanban-board" data-deck-kanban data-field="{{ view.kanban_column }}">
+  {% for col in kanban_columns %}
+  <section class="dk-kanban-col" data-kanban-col="{{ col.key }}">
+    <header class="dk-kanban-head">
+      <strong>{{ col.label }}</strong>
+      <span class="dk-tab-count dk-mono dk-tabular" data-kanban-count>{{ col.records | length }}</span>
+    </header>
+    <div class="dk-kanban-list" data-kanban-dropzone="{{ col.key }}">
+      {% for obj in col.records %}
+      {% set pk_str = encode_pk(extract_pk(obj, view.meta)) %}
+      <article class="dk-kanban-card"
+               {% if can_drag_kanban %}draggable="true"{% endif %}
+               data-kanban-card
+               data-pk="{{ pk_str }}"
+               data-quick-url="{{ url_for(bp_name ~ '.api_quick_edit', slug=view.meta.slug, raw_pk=pk_str) }}">
+        <div class="dk-kanban-card-top">
+          <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-kanban-title">
+            {{ view.format_record_repr(obj, auth=deck.auth, user=current_user) }}
+          </a>
+          <button type="button"
+                  class="dk-btn dk-btn-ghost dk-btn-icon"
+                  title="Quick Peek"
+                  aria-label="Quick peek {{ pk_str }}"
+                  data-deck-drawer-url="{{ url_for(bp_name ~ '.api_drawer', slug=view.meta.slug, raw_pk=pk_str) }}"
+                  data-deck-drawer-title="{{ view.format_record_repr(obj, auth=deck.auth, user=current_user) }}">
+            {{ deck_icon("eye", 13) }}
+          </button>
+        </div>
+        <div class="dk-kanban-meta">
+          {% for cf in kanban_card_fields %}
+          <div class="dk-kanban-field">
+            <span class="dk-subtle">{{ view.get_column_label(cf) }}</span>
+            <span>{{ view.format_cell(cf, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}</span>
+          </div>
+          {% endfor %}
+        </div>
+      </article>
+      {% endfor %}
+      <div class="dk-kanban-empty dk-subtle dk-mono"{% if col.records %} hidden="hidden"{% endif %}>Drop card here</div>
+    </div>
+  </section>
+  {% endfor %}
+</div>
+{% else %}
+<!-- Precision Hairline Data Table -->
+<div class="dk-table-wrap">
+  <table class="dk-table" data-deck-nav-table>
+    <thead>
+      <tr>
+        <th class="dk-th-check"><input type="checkbox" data-deck-select-all aria-label="Select all rows"></th>
+        {% for col in visible_cols %}
+        <th data-col="{{ col }}">
+          {% if col in view.resolved_sortable %}
+          {% set next_dir = 'asc' if (sort_by == col and sort_dir == 'desc') else 'desc' %}
+          <a class="dk-sort-link" href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(sort=col, dir=next_dir, page=1, after=None, before=None) }}">
+            <span>{{ view.get_column_label(col) }}</span>
+            {% if sort_by == col %}
+              {{ deck_icon("arrow-down" if sort_dir == 'desc' else "arrow-up", 11) }}
+            {% else %}
+              {{ deck_icon("arrow-up-down", 11) }}
+            {% endif %}
+          </a>
+          {% else %}
+          <span>{{ view.get_column_label(col) }}</span>
+          {% endif %}
+        </th>
+        {% endfor %}
+        <th class="dk-td-actions">{{ _("Actions") }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for obj in result.items %}
+      {% set pk_str = encode_pk(extract_pk(obj, view.meta)) %}
+      <tr data-deck-row-nav
+          data-detail-url="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}"
+          data-edit-url="{{ url_for(bp_name ~ '.model_edit', slug=view.meta.slug, raw_pk=pk_str) if (can_edit and not trashed) else '' }}"
+          data-drawer-url="{{ url_for(bp_name ~ '.api_drawer', slug=view.meta.slug, raw_pk=pk_str) }}"
+          data-drawer-title="{{ view.format_record_repr(obj, auth=deck.auth, user=current_user) }}">
+        <td class="dk-td-check"><input type="checkbox" value="{{ pk_str }}" data-deck-row-check aria-label="Select record {{ pk_str }}"></td>
+        {% for col in visible_cols %}
+        <td data-col="{{ col }}">
+          {% if col in inline_editable and not trashed %}
+            {% set fmeta = view.meta.fields_by_name[col] %}
+            {% set cur_val = obj | attr(col) %}
+            {% if fmeta.field_type == 'boolean' %}
+            <button type="button"
+                    class="dk-inline-toggle"
+                    data-deck-quick-edit
+                    data-url="{{ url_for(bp_name ~ '.api_quick_edit', slug=view.meta.slug, raw_pk=pk_str) }}"
+                    data-field="{{ col }}"
+                    data-next="{{ 'false' if cur_val else 'true' }}"
+                    title="Click to toggle {{ col }}">
+              {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}
+            </button>
+            {% elif fmeta.field_type == 'enum' %}
+            {% set cur_enum = cur_val.value if (cur_val is not none and cur_val.value is defined) else cur_val %}
+            <select class="dk-inline-select dk-mono"
+                    aria-label="Quick edit {{ col }}"
+                    data-deck-quick-select
+                    data-url="{{ url_for(bp_name ~ '.api_quick_edit', slug=view.meta.slug, raw_pk=pk_str) }}"
+                    data-field="{{ col }}">
+              {% for val, lbl in fmeta.choices %}
+              <option value="{{ val }}"{% if cur_enum|string == val %} selected{% endif %}>{{ lbl }}</option>
+              {% endfor %}
+            </select>
+            {% else %}
+            {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}
+            {% endif %}
+          {% elif (loop.first and col not in view.file_fields) or (loop.index == 2 and visible_cols[0] in view.file_fields) %}
+          <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-mono">
+            {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}
+          </a>
+          {% else %}
+          {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}
+          {% endif %}
+        </td>
+        {% endfor %}
+        <td class="dk-td-actions">
+          <div class="dk-row-actions">
+            {% if trashed and can_edit %}
+            <form method="post" action="{{ url_for(bp_name ~ '.model_restore', slug=view.meta.slug, raw_pk=pk_str) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <button type="submit" class="dk-btn dk-btn-sm">{{ deck_icon("rotate-ccw", 12) }} {{ _("Restore") }}</button>
+            </form>
+            {% else %}
+            <button type="button"
+                    class="dk-btn dk-btn-ghost dk-btn-icon"
+                    title="Quick Peek Drawer (Space)"
+                    aria-label="Quick peek {{ pk_str }}"
+                    data-deck-drawer-url="{{ url_for(bp_name ~ '.api_drawer', slug=view.meta.slug, raw_pk=pk_str) }}"
+                    data-deck-drawer-title="{{ view.format_record_repr(obj, auth=deck.auth, user=current_user) }}">
+              {{ deck_icon("eye", 14) }}
+            </button>
+            {% if can_edit %}
+            <a href="{{ url_for(bp_name ~ '.model_edit', slug=view.meta.slug, raw_pk=pk_str) }}"
+               class="dk-btn dk-btn-ghost dk-btn-icon"
+               title="Edit (e)"
+               aria-label="Edit {{ pk_str }}">
+              {{ deck_icon("edit", 14) }}
+            </a>
+            {% endif %}
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="{{ visible_cols | length + 2 }}" class="dk-chart-empty">
+          No {{ view.plural_label | lower }} match the current criteria.
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    {% if page_aggregates %}
+    <tfoot>
+      <tr class="dk-tfoot-row dk-mono dk-tabular">
+        <td></td>
+        {% for col in visible_cols %}
+        <td data-col="{{ col }}">
+          {% if col in page_aggregates %}
+          {% set agg_op, agg_val = page_aggregates[col] %}
+          <span class="dk-subtle">{{ agg_op }}:</span>
+          <strong>{{ "{:,.2f}".format(agg_val / 100.0) if col.endswith('_cents') else ("{:,.1f}".format(agg_val)) }}</strong>
+          {% elif loop.first %}
+          <span class="dk-subtle">{{ _("Page Summary") }}</span>
+          {% endif %}
+        </td>
+        {% endfor %}
+        <td></td>
+      </tr>
+    </tfoot>
+    {% endif %}
+  </table>
+</div>
+
+<div class="dk-pagination dk-mono dk-tabular">
+  {% if result.pagination_mode == 'cursor' %}
+  <span>Cursor stream · {{ result.items | length }} rows{% if result.total_known %} · {% if result.total_is_estimated %}~{% endif %}{{ "{:,}".format(result.total) }} total{% endif %} · j/k navigate</span>
+  <div class="dk-pag-btns">
+    {% if result.has_prev %}
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(after=None, before=None) }}" class="dk-btn dk-btn-sm">{{ _("First") }}</a>
+    {% endif %}
+    {% if result.prev_cursor %}
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(before=result.prev_cursor, after=None) }}" class="dk-btn dk-btn-sm">{{ deck_icon("chevron-left", 13) }} {{ _("Prev") }}</a>
+    {% endif %}
+    {% if result.next_cursor %}
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(after=result.next_cursor, before=None) }}" class="dk-btn dk-btn-sm">{{ _("Next") }} {{ deck_icon("chevron-right", 13) }}</a>
+    {% endif %}
+  </div>
+  {% else %}
+  <span>Page {{ result.page }} of {{ result.pages }} · {{ "{:,}".format(result.total) }} total · j/k navigate · Space peek</span>
+  <div class="dk-pag-btns">
+    {% if result.page > 1 %}
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(page=result.page - 1) }}" class="dk-btn dk-btn-sm">{{ deck_icon("chevron-left", 13) }} {{ _("Prev") }}</a>
+    {% endif %}
+    {% if result.page < result.pages %}
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(page=result.page + 1) }}" class="dk-btn dk-btn-sm">{{ _("Next") }} {{ deck_icon("chevron-right", 13) }}</a>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- Hidden Bulk Action Form + Floating Selection Dock -->
+<form method="post" id="dk-bulk-form" hidden="hidden">
+  <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+</form>
+
+<div class="dk-bulk-dock" id="dk-bulk-dock" hidden="hidden" role="region" aria-label="Bulk actions">
+  <strong id="dk-bulk-count" class="dk-mono dk-tabular">0 selected</strong>
+  {% if can_export %}
+  <a class="dk-btn dk-btn-sm" data-deck-export-selected data-base-href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='csv', trashed=('1' if trashed else None)) }}">Export CSV</a>
+  {% endif %}
+  {% if not trashed %}
+  {% for act in bulk_actions %}
+  <button type="button"
+          class="dk-btn dk-btn-sm{% if act.variant == 'danger' %} dk-btn-danger{% endif %}"
+          data-deck-bulk-action
+          data-url="{{ url_for(bp_name ~ '.model_action', slug=view.meta.slug, action_name=act.name) }}"
+          data-label="{{ act.label }}"
+          data-confirm="{{ 'true' if act.confirm else 'false' }}"
+          {% if act.name in bulk_action_fields_json %}data-action-fields="{{ bulk_action_fields_json[act.name] }}"{% endif %}
+          {% if act.require_confirm_text and config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="CONFIRM {n}"{% endif %}>
+    {{ deck_icon(act.icon, 12) }} {{ act.label }}
+  </button>
+  {% endfor %}
+  {% endif %}
+  {% if can_delete and not trashed %}
+  <button type="button"
+          class="dk-btn dk-btn-sm dk-btn-danger"
+          data-deck-bulk-action
+          data-url="{{ url_for(bp_name ~ '.model_action', slug=view.meta.slug, action_name='delete') }}"
+          data-label="Delete Selected"
+          data-confirm="true"
+          {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="DELETE {n}"{% endif %}>
+    {{ deck_icon("trash", 12) }} {{ _("Delete") }}
+  </button>
+  {% endif %}
+</div>
+{% endblock %}

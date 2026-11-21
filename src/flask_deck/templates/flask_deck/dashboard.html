@@ -1,0 +1,32 @@
+{% extends "flask_deck/base.html" %}
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">Operations Overview</h1>
+    <p class="dk-page-sub">{{ config.subtitle }} · {{ deck.views | length }} registered models</p>
+  </div>
+  <div class="dk-page-actions">
+    <div class="dk-seg" role="group" aria-label="Time range">
+      {% for r in [7, 14, 30, 90] %}
+      <a href="{{ url_for(bp_name ~ '.index', range=r ~ 'd') }}"
+         class="dk-seg-btn dk-mono{% if range_days == r %} is-active{% endif %}">{{ r }}d</a>
+      {% endfor %}
+    </div>
+    <button type="button" class="dk-btn dk-mono" data-deck-live-toggle title="Toggle auto-refresh">
+      <span class="dk-dot" id="dk-live-dot"></span>
+      <span id="dk-live-label">Live: Off</span>
+    </button>
+    {% if can_view_sql %}
+    <a href="{{ url_for(bp_name ~ '.sql_console') }}" class="dk-btn">{{ deck_icon("terminal", 13) }} SQL</a>
+    {% endif %}
+    {% if can_view_schema %}
+    <a href="{{ url_for(bp_name ~ '.schema_inspector') }}" class="dk-btn">{{ deck_icon("git-branch", 13) }} Schema</a>
+    {% endif %}
+  </div>
+</div>
+
+<div class="dk-content">
+  {{ render_slot('dashboard_top') }}
+  {% include "flask_deck/partials/widget_grid.html" %}
+</div>
+{% endblock %}

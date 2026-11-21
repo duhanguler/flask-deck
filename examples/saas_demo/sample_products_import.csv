@@ -1,0 +1,5 @@
+sku,name,category,price_cents,stock_pct,is_active
+GPU-H200-8X,Dedicated H200 8x Cluster Node (Gen2),compute,259000,82,true
+NVME-10TB,Replicated NVMe Block Pool (10 TB),storage,31000,61,true
+GPU-B200-4X,Blackwell B200 4x Inference Node,compute,340000,90,true
+NET-WAF-EDGE,Zero-Trust Edge WAF Rulepack,networking,not_an_integer,95,true

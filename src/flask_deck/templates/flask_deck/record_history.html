@@ -1,0 +1,102 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-crumb">{{ view.plural_label }}</a>
+<span class="dk-crumb-sep">/</span>
+<a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-crumb">{{ record_repr }}</a>
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("History") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">Revision Diff · {{ record_repr }}</h1>
+    <p class="dk-page-sub dk-mono">{{ entries | length }} recorded revision(s) · Side-by-side field inspection</p>
+  </div>
+  <div class="dk-page-actions">
+    <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn">{{ deck_icon("arrow-left", 13) }} {{ _("Back") }}</a>
+  </div>
+</div>
+
+<div class="dk-content">
+  <div class="dk-grid">
+    <section class="dk-panel dk-span-4">
+      <div class="dk-panel-head">
+        <h2 class="dk-panel-title">Revisions</h2>
+        <span class="dk-mono dk-subtle">{{ entries | length }}</span>
+      </div>
+      <div class="dk-rev-list">
+        {% for entry in entries %}
+        {% set is_sel = selected_entry and selected_entry.id == entry.id %}
+        <a href="{{ url_for(bp_name ~ '.model_history', slug=view.meta.slug, raw_pk=pk_str, rev=entry.id) }}"
+           class="dk-rev-item{% if is_sel %} is-active{% endif %}">
+          <div class="dk-rev-top">
+            <span class="dk-badge dk-badge-{{ 'ok' if entry.action in ['create', 'restore'] else ('danger' if 'delete' in entry.action else 'warn') }} dk-mono">{{ entry.action }}</span>
+            <span class="dk-mono dk-subtle dk-tabular">{{ format_dt(entry.timestamp, '%m-%d %H:%M') }}</span>
+          </div>
+          <div class="dk-rev-meta">
+            <strong>{{ entry.actor_name }}</strong>
+            <span class="dk-subtle dk-mono">{{ entry.changes | length }} field(s)</span>
+          </div>
+        </a>
+        {% else %}
+        <div class="dk-chart-empty">No revision snapshots recorded for this record.</div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="dk-panel dk-span-8">
+      {% if selected_entry %}
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">Revision #{{ selected_entry.id[:8] }} · {{ selected_entry.action }}</h2>
+          <p class="dk-panel-sub dk-mono">Actor: {{ selected_entry.actor_name }} ({{ selected_entry.actor_ip }}) · {{ format_dt(selected_entry.timestamp, '%Y-%m-%d %H:%M:%S') }}</p>
+        </div>
+        {% if can_revert and selected_entry.is_revertible %}
+        <form method="post" action="{{ url_for(bp_name ~ '.audit_revert', entry_id=selected_entry.id) }}">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <button type="submit"
+                  class="dk-btn dk-btn-sm dk-btn-danger"
+                  data-deck-confirm-form
+                  data-confirm-title="Restore Revision"
+                  data-confirm-msg="Revert changed fields back to their pre-mutation values?"
+                  {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="REVERT"{% endif %}>
+            {{ deck_icon("rotate-ccw", 12) }} Restore Revision
+          </button>
+        </form>
+        {% endif %}
+      </div>
+      <div class="dk-table-wrap">
+        <table class="dk-table dk-sbs-table">
+          <thead>
+            <tr>
+              <th>Field</th>
+              <th>Before</th>
+              <th>After (Revision)</th>
+              <th>Current Live</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in diff_rows %}
+            <tr>
+              <td class="dk-mono"><strong>{{ row.label }}</strong></td>
+              <td><span class="dk-diff-old">{{ row.old if row.old is not none else "—" }}</span></td>
+              <td><span class="dk-diff-new">{{ row.new if row.new is not none else "—" }}</span></td>
+              <td class="dk-mono dk-muted">{{ row.live if row.live is not none else "—" }}</td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="4" class="dk-chart-empty">No scalar field diffs in this revision.</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="dk-chart-empty">Select a revision from the timeline to inspect field-level diffs.</div>
+      {% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

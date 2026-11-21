@@ -1,0 +1,95 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("Background Jobs") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ _("Background Jobs") }}</h1>
+    <p class="dk-page-sub">Asynchronous bulk actions &amp; large exports with live Server-Sent Events progress telemetry.</p>
+  </div>
+  <div class="dk-page-actions">
+    <a href="{{ url_for(bp_name ~ '.jobs_list') }}" class="dk-btn">{{ deck_icon("refresh-cw", 13) }} Refresh</a>
+  </div>
+</div>
+
+<div class="dk-content">
+  <div class="dk-table-wrap">
+    <table class="dk-table">
+      <thead>
+        <tr>
+          <th>Job</th>
+          <th>Status</th>
+          <th>Progress</th>
+          <th>Operator</th>
+          <th>Message</th>
+          <th>Created</th>
+          <th class="dk-td-actions">{{ _("Actions") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+        {% set tone = 'ok' if job.status == 'succeeded' else ('danger' if job.status == 'failed' else ('warn' if job.status in ['running', 'queued'] else 'neutral')) %}
+        <tr data-job-row="{{ job.id }}"
+            {% if focus_id and focus_id == job.id %}class="is-selected"{% endif %}
+            {% if job.status in ['queued', 'running'] %}
+            data-deck-job-stream="{{ url_for(bp_name ~ '.api_job_stream', job_id=job.id) }}"
+            data-deck-job-poll="{{ url_for(bp_name ~ '.api_job_status', job_id=job.id) }}"
+            {% endif %}>
+          <td>
+            <div class="dk-mono"><strong>#{{ job.id }}</strong></div>
+            <div>{{ job.label }}</div>
+          </td>
+          <td>
+            <span class="dk-badge dk-badge-{{ tone }} dk-mono" data-job-status>
+              <span class="dk-dot"></span>{{ job.status }}
+            </span>
+          </td>
+          <td>
+            <span class="dk-progress-cell">
+              <svg class="dk-progress-svg" viewBox="0 0 100 6" width="84" height="6" aria-hidden="true">
+                <rect class="dk-prog-track" x="0" y="0" width="100" height="6" rx="2"></rect>
+                <rect class="dk-prog-fill-{{ 'danger' if job.status == 'failed' else 'ok' }}" data-job-bar x="0" y="0" width="{{ job.progress }}" height="6" rx="2"></rect>
+              </svg>
+              <span class="dk-mono dk-tabular dk-muted" data-job-pct>{{ job.progress }}%</span>
+            </span>
+          </td>
+          <td class="dk-muted">{{ job.actor_name }}</td>
+          <td data-job-msg>
+            <div>{{ job.error or job.message }}</div>
+            {% if job.logs %}
+            <details class="dk-job-logs">
+              <summary class="dk-subtle dk-mono">Logs ({{ job.logs | length }})</summary>
+              <pre class="dk-job-log-pre dk-mono" data-job-logs>{{ job.logs | join('\n') }}</pre>
+            </details>
+            {% endif %}
+          </td>
+          <td class="dk-mono dk-tabular dk-subtle">{{ format_dt(job.created_at) }}</td>
+          <td class="dk-td-actions">
+            <div class="dk-row-actions">
+              {% if job.artifact_filename %}
+              <a href="{{ url_for(bp_name ~ '.job_artifact', job_id=job.id) }}" class="dk-btn dk-btn-sm">
+                {{ deck_icon("download", 12) }} Download
+              </a>
+              {% endif %}
+              {% if job.status in ['queued', 'running'] %}
+              <form method="post" action="{{ url_for(bp_name ~ '.job_cancel', job_id=job.id) }}">
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+                <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger">{{ deck_icon("stop-circle", 12) }} Cancel</button>
+              </form>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="7" class="dk-chart-empty">No background jobs queued yet. Trigger an async bulk action or background export from any model view.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

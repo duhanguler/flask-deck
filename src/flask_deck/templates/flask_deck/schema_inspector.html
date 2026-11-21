@@ -1,0 +1,83 @@
+{% extends "flask_deck/base.html" %}
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">Schema ERD &amp; Index Inspector</h1>
+    <p class="dk-page-sub dk-mono">{{ views | length }} registered SQLAlchemy 2.0 models · zero per-request reflection</p>
+  </div>
+  <div class="dk-page-actions">
+    {% if can_view_diagnostics %}
+    <a href="{{ url_for(bp_name ~ '.diagnostics') }}" class="dk-btn">{{ deck_icon("heart-pulse", 13) }} Diagnostics</a>
+    {% endif %}
+  </div>
+</div>
+
+<div class="dk-content">
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">Entity-Relationship Diagram</h2>
+        <p class="dk-panel-sub">Pure SSR SVG graph generated from frozen ModelMeta &amp; ForeignKey constraints</p>
+      </div>
+      <span class="dk-badge dk-badge-neutral dk-mono">SVG ERD</span>
+    </div>
+    <div class="dk-panel-body">{{ erd_svg }}</div>
+  </section>
+
+  {% for v in views %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">{{ v.meta.name }} <code class="dk-code">{{ v.meta.table_name }}</code></h2>
+        <p class="dk-panel-sub dk-mono">{{ "{:,}".format(row_counts.get(v.meta.slug, 0)) }} rows · {{ v.meta.fields | length }} columns · {{ v.meta.indexed_fields | length }} indexed</p>
+      </div>
+      <a href="{{ url_for(bp_name ~ '.model_list', slug=v.meta.slug) }}" class="dk-btn dk-btn-sm">Open Table</a>
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead>
+          <tr>
+            <th>Column</th>
+            <th>Type</th>
+            <th>Constraints</th>
+            <th>Index Health</th>
+            <th>Privacy</th>
+            <th>Foreign Key</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for f in v.meta.fields %}
+          <tr>
+            <td><code class="dk-code">{{ f.name }}</code></td>
+            <td class="dk-mono dk-muted">{{ f.field_type }}{% if f.max_length %}({{ f.max_length }}){% endif %}</td>
+            <td class="dk-mono">
+              {% if f.primary_key %}<span class="dk-badge dk-badge-info">PK</span> {% endif %}
+              {% if f.unique %}<span class="dk-badge dk-badge-neutral">UNIQUE</span> {% endif %}
+              {% if not f.nullable %}<span class="dk-badge dk-badge-neutral">NOT NULL</span>{% else %}<span class="dk-subtle">nullable</span>{% endif %}
+            </td>
+            <td>
+              {% if f.indexed %}
+              <span class="dk-badge dk-badge-ok dk-mono">INDEXED</span>
+              {% elif f.name in v.resolved_searchable %}
+              <span class="dk-badge dk-badge-warn dk-mono">SEARCHABLE · NO INDEX</span>
+              {% else %}
+              <span class="dk-subtle dk-mono">unindexed</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if f.is_sensitive %}
+              <span class="dk-badge dk-badge-danger dk-mono">AUTO-REDACTED</span>
+              {% else %}
+              <span class="dk-subtle dk-mono">visible</span>
+              {% endif %}
+            </td>
+            <td class="dk-mono dk-muted">{{ f.fk_column or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endfor %}
+</div>
+{% endblock %}

@@ -1,0 +1,207 @@
+<div class="dk-grid">
+  {% for w in widgets %}
+    {% if w.kind == 'callout' %}
+    <div class="{{ w.span_class }}">
+      <div class="dk-callout dk-callout-{{ w.normalized_tone }}" role="status">
+        <div class="dk-callout-body">
+          <strong>{{ w.title }}</strong>
+          {% if w.message %}<span class="dk-muted">{{ w.message }}</span>{% endif %}
+        </div>
+        {% if w.safe_action_href and w.action_label %}
+        <a href="{{ w.safe_action_href }}" class="dk-btn dk-btn-sm">{{ w.action_label }} {{ deck_icon("arrow-right", 12) }}</a>
+        {% endif %}
+      </div>
+    </div>
+
+    {% elif w.kind == 'kpi' %}
+    <div class="{{ w.span_class }}">
+      {% if w.safe_href %}<a href="{{ w.safe_href }}" class="dk-kpi">{% else %}<div class="dk-kpi">{% endif %}
+        <div class="dk-kpi-top">
+          <span>{{ w.title }}</span>
+          {{ deck_icon(w.icon, 14) }}
+        </div>
+        <div class="dk-kpi-mid">
+          <div>
+            <div class="dk-kpi-val dk-tabular">{{ w.value }}</div>
+            {% if w.delta %}
+            <div class="dk-kpi-delta dk-mono{% if w.trend == 'up' %} is-up{% elif w.trend == 'down' %} is-down{% endif %}">{{ w.delta }}</div>
+            {% endif %}
+          </div>
+          {% if w.sparkline %}
+          {{ w.sparkline_svg }}
+          {% endif %}
+        </div>
+      {% if w.safe_href %}</a>{% else %}</div>{% endif %}
+    </div>
+
+    {% elif w.kind == 'chart' %}
+    <section class="dk-panel {{ w.span_class }}">
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">{{ w.title }}</h2>
+          {% if w.subtitle %}<p class="dk-panel-sub">{{ w.subtitle }}</p>{% endif %}
+        </div>
+        <span class="dk-badge dk-badge-neutral dk-mono">{{ w.chart_type | upper }}</span>
+      </div>
+      <div class="dk-panel-body">{{ w.chart_svg }}</div>
+    </section>
+
+    {% elif w.kind == 'heatmap' %}
+    <section class="dk-panel {{ w.span_class }}">
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">{{ w.title }}</h2>
+          {% if w.subtitle %}<p class="dk-panel-sub">{{ w.subtitle }}</p>{% endif %}
+        </div>
+        <span class="dk-badge dk-badge-neutral dk-mono">91D GRID</span>
+      </div>
+      <div class="dk-panel-body">{{ w.heatmap_svg }}</div>
+    </section>
+
+    {% elif w.kind == 'statbars' %}
+    <section class="dk-panel {{ w.span_class }}">
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">{{ w.title }}</h2>
+          {% if w.subtitle %}<p class="dk-panel-sub">{{ w.subtitle }}</p>{% endif %}
+        </div>
+      </div>
+      <div class="dk-panel-body">{{ w.bars_svg }}</div>
+    </section>
+
+    {% elif w.kind == 'gauge' %}
+    <section class="dk-panel {{ w.span_class }}">
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">{{ w.title }}</h2>
+          {% if w.subtitle %}<p class="dk-panel-sub">{{ w.subtitle }}</p>{% endif %}
+        </div>
+      </div>
+      <div class="dk-panel-body">
+        {{ w.gauge_svg }}
+        {% if w.details %}
+        <div class="dk-gauge-meta">
+          {% for k, v in w.details %}
+          <div class="dk-donut-row">
+            <span class="dk-muted">{{ k }}</span>
+            <span class="dk-mono dk-tabular">{{ v }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+    </section>
+
+    {% elif w.kind == 'timeline' %}
+    <section class="dk-panel {{ w.span_class }}">
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">{{ w.title }}</h2>
+          {% if w.subtitle %}<p class="dk-panel-sub">{{ w.subtitle }}</p>{% endif %}
+        </div>
+      </div>
+      <div class="dk-panel-body">
+        <ol class="dk-timeline">
+          {% for ev in w.safe_events %}
+          <li class="dk-tl-item">
+            <span class="dk-tl-dot dk-tl-{{ ev.tone or 'neutral' }}" aria-hidden="true"></span>
+            <div class="dk-tl-content">
+              <div class="dk-tl-top">
+                {% if ev.href %}<a href="{{ ev.href }}" class="dk-tl-title">{{ ev.title }}</a>{% else %}<strong class="dk-tl-title">{{ ev.title }}</strong>{% endif %}
+                <span class="dk-mono dk-subtle dk-tabular">{{ ev.time }}</span>
+              </div>
+              {% if ev.detail %}<div class="dk-muted">{{ ev.detail }}</div>{% endif %}
+            </div>
+          </li>
+          {% else %}
+          <li class="dk-chart-empty">No timeline events.</li>
+          {% endfor %}
+        </ol>
+      </div>
+    </section>
+
+    {% elif w.kind == 'table' %}
+    <section class="dk-panel {{ w.span_class }}">
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">{{ w.title }}</h2>
+          {% if w.subtitle %}<p class="dk-panel-sub">{{ w.subtitle }}</p>{% endif %}
+        </div>
+        {% if w.safe_href %}<a href="{{ w.safe_href }}" class="dk-btn dk-btn-sm">{{ w.href_label }}</a>{% endif %}
+      </div>
+      <div class="dk-table-wrap">
+        <table class="dk-table">
+          <thead>
+            <tr>
+              {% for h in w.headers %}<th>{{ h }}</th>{% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in w.rows %}
+            <tr>
+              {% for cell in row %}<td>{{ cell }}</td>{% endfor %}
+            </tr>
+            {% else %}
+            <tr><td colspan="{{ w.headers | length }}" class="dk-chart-empty">No records</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    {% elif w.kind == 'activity' %}
+    <section class="dk-panel {{ w.span_class }}">
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">{{ w.title }}</h2>
+          {% if w.subtitle %}<p class="dk-panel-sub">{{ w.subtitle }}</p>{% endif %}
+        </div>
+        {% if can_view_audit %}
+        <a href="{{ url_for(bp_name ~ '.audit_list') }}" class="dk-btn dk-btn-sm">Full Ledger</a>
+        {% endif %}
+      </div>
+      <div>
+        {% for entry in w.entries %}
+        <div class="dk-activity-row">
+          <div class="dk-activity-main">
+            <div>
+              <span class="dk-badge dk-badge-{{ 'ok' if entry.action == 'create' else ('danger' if entry.action == 'delete' else ('warn' if entry.action in ['update','inline_edit','revert'] else 'info')) }} dk-mono">{{ entry.action }}</span>
+              <strong>{{ entry.model_label }}</strong>
+              <span class="dk-muted">{{ entry.record_repr }}</span>
+            </div>
+            {% if entry.changes %}
+            <div class="dk-diff-list">
+              {% for field, delta in (entry.changes.items() | list)[:3] %}
+              <div class="dk-diff-row">
+                <span class="dk-diff-key">{{ field }}:</span>
+                {% if delta.old is not none %}<span class="dk-diff-old">{{ delta.old }}</span>{% endif %}
+                <span class="dk-subtle">→</span>
+                <span class="dk-diff-new">{{ delta.new }}</span>
+              </div>
+              {% endfor %}
+            </div>
+            {% endif %}
+          </div>
+          <div class="dk-mono dk-subtle dk-tabular">
+            <div>{{ entry.actor_name }}</div>
+            <div>{{ format_dt(entry.timestamp, '%m-%d %H:%M') }}</div>
+          </div>
+        </div>
+        {% else %}
+        <div class="dk-chart-empty">No audit events recorded yet.</div>
+        {% endfor %}
+      </div>
+    </section>
+
+    {% elif w.kind == 'notes' %}
+    <section class="dk-panel {{ w.span_class }}">
+      <div class="dk-panel-head">
+        <h2 class="dk-panel-title">{{ w.title }}</h2>
+      </div>
+      <div class="dk-panel-body">
+        {% for line in w.lines %}<p class="dk-muted">{{ line }}</p>{% endfor %}
+      </div>
+    </section>
+    {% endif %}
+  {% endfor %}
+</div>

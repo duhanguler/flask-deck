@@ -1,0 +1,80 @@
+{% extends "flask_deck/base.html" %}
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">Security &amp; Performance Diagnostics</h1>
+    <p class="dk-page-sub">Live runtime posture from run_security_audit(), asset budgets, and schema index health</p>
+  </div>
+</div>
+
+<div class="dk-content">
+  <div class="dk-grid">
+    <div class="dk-kpi dk-span-3">
+      <div class="dk-kpi-top"><span>Static Asset Payload</span>{{ deck_icon("cpu", 14) }}</div>
+      <div class="dk-kpi-val dk-tabular">{{ asset_kb }} KB</div>
+      <div class="dk-kpi-delta dk-mono is-up">CSS {{ css_kb }}KB · JS {{ js_kb }}KB gz</div>
+    </div>
+    <div class="dk-kpi dk-span-3">
+      <div class="dk-kpi-top"><span>Schema Index Coverage</span>{{ deck_icon("database", 14) }}</div>
+      <div class="dk-kpi-val dk-tabular">{{ total_idx }} / {{ total_cols }}</div>
+      <div class="dk-kpi-delta dk-mono">indexed columns</div>
+    </div>
+    <div class="dk-kpi dk-span-3">
+      <div class="dk-kpi-top"><span>Auto-Redacted Secrets</span>{{ deck_icon("lock", 14) }}</div>
+      <div class="dk-kpi-val dk-tabular">{{ total_redacted }}</div>
+      <div class="dk-kpi-delta dk-mono is-up">excluded from UI/export/SQL</div>
+    </div>
+    <div class="dk-kpi dk-span-3">
+      <div class="dk-kpi-top"><span>Audit Findings</span>{{ deck_icon("shield", 14) }}</div>
+      <div class="dk-kpi-val dk-tabular">{{ findings | length }}</div>
+      <div class="dk-kpi-delta dk-mono{% if findings %} is-down{% else %} is-up{% endif %}">{{ "review below" if findings else "all checks clean" }}</div>
+    </div>
+  </div>
+
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">Defense-in-Depth Control Status</h2>
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead><tr><th>Control</th><th>Active Configuration</th></tr></thead>
+        <tbody>
+          {% for name, status, tone in checks %}
+          <tr>
+            <td><strong>{{ name }}</strong></td>
+            <td><span class="dk-badge dk-badge-{{ tone }} dk-mono"><span class="dk-dot"></span>{{ status }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">Live Security &amp; Index Audit Findings</h2>
+      <span class="dk-mono dk-subtle">Equivalent to `flask deck audit`</span>
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead><tr><th>Severity</th><th>Category</th><th>Finding</th></tr></thead>
+        <tbody>
+          {% for item in findings %}
+          <tr>
+            <td>
+              <span class="dk-badge dk-badge-{{ 'danger' if item.severity in ['CRITICAL','HIGH'] else ('warn' if item.severity == 'WARN' else 'info') }} dk-mono">{{ item.severity }}</span>
+            </td>
+            <td class="dk-mono dk-muted">{{ item.category }}</td>
+            <td>{{ item.message }}</td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="3" class="dk-chart-empty">All security and index checks passed with zero findings.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

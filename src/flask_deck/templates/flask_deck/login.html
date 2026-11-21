@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="{{ active_locale }}" dir="{{ text_dir }}" data-theme="{{ config.default_theme if config.default_theme != 'system' else 'dark' }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if brand.favicon_url %}
+  <link rel="icon" href="{{ brand.favicon_url }}">
+  {% else %}
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2318181b'/%3E%3Ctext x='12' y='17' text-anchor='middle' fill='%23fafafa' font-family='monospace' font-size='14' font-weight='700'%3ED%3C/text%3E%3C/svg%3E">
+  {% endif %}
+  <title>{{ _("Sign in") }} · {{ config.title }}</title>
+  <script nonce="{{ csp_nonce }}">
+    (function(){try{var s=localStorage.getItem("flask_deck_theme");if(s==="light"||s==="dark"){document.documentElement.setAttribute("data-theme",s);}else if("{{ config.default_theme }}"==="system"&&window.matchMedia("(prefers-color-scheme: light)").matches){document.documentElement.setAttribute("data-theme","light");}}catch(_){}})();
+  </script>
+  <link rel="stylesheet" href="{{ asset_url('css/deck.css') }}">
+  {% if brand.has_custom_theme %}
+  <link rel="stylesheet" href="{{ url_for(bp_name ~ '.brand_theme_css', v=brand_css_hash) }}">
+  {% endif %}
+  {% for css_href in brand.extra_css %}
+  <link rel="stylesheet" href="{{ css_href }}">
+  {% endfor %}
+  <script defer src="{{ asset_url('js/deck.js') }}"></script>
+</head>
+<body>
+<div class="dk-login-wrap">
+  <div class="dk-login-card">
+    <div class="dk-top-left">
+      {% if brand.logo_url and brand.logo_dark_url %}
+      <img src="{{ brand.logo_dark_url }}" alt="{{ config.title }}" class="dk-brand-logo dk-brand-logo-dark">
+      <img src="{{ brand.logo_url }}" alt="{{ config.title }}" class="dk-brand-logo dk-brand-logo-light">
+      {% elif brand.logo_url or brand.logo_dark_url %}
+      <img src="{{ brand.logo_url or brand.logo_dark_url }}" alt="{{ config.title }}" class="dk-brand-logo">
+      {% else %}
+      <span class="dk-brand-mark" aria-hidden="true">{{ (brand.logo_mark or config.title[:1]) | upper }}</span>
+      {% endif %}
+      <div>
+        <div class="dk-brand">{{ brand.login_title or config.title }}</div>
+        <div class="dk-subtle">{{ brand.login_subtitle or config.subtitle }}</div>
+      </div>
+    </div>
+
+    {% if brand.login_notice %}
+    <div class="dk-alert dk-alert-neutral dk-mono" role="note">{{ brand.login_notice }}</div>
+    {% endif %}
+
+    {% if error_msg %}
+    <div class="dk-alert dk-alert-danger" role="alert">{{ error_msg }}</div>
+    {% endif %}
+
+    {% if sso_providers %}
+    <div class="dk-diff-list">
+      {% for prov in sso_providers %}
+      <a href="{{ url_for(bp_name ~ '.sso_login', provider_name=prov.name, next=next_url) }}" class="dk-btn dk-sso-btn">
+        {{ deck_icon("lock", 13) }} Sign in with {{ prov.label }}
+      </a>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <form method="post" action="{{ url_for(bp_name ~ '.login') }}" class="dk-diff-list">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next_url }}">
+
+      <div class="dk-field">
+        <label for="dk-login-user">Username / Email</label>
+        <input type="text" id="dk-login-user" name="username" class="dk-input" autocomplete="username" required autofocus>
+      </div>
+
+      <div class="dk-field">
+        <label for="dk-login-pass">Password</label>
+        <input type="password" id="dk-login-pass" name="password" class="dk-input" autocomplete="current-password" required>
+      </div>
+
+      <button type="submit" class="dk-btn dk-btn-primary">{{ _("Sign in") }}</button>
+    </form>
+
+    {% if demo_credentials %}
+    <div class="dk-demo-creds">
+      <div class="dk-rail-group-title">Demo RBAC Profiles</div>
+      {% for uname, pwd, desc in demo_credentials %}
+      <button type="button" class="dk-demo-cred-btn" data-deck-fill-login data-user="{{ uname }}" data-pass="{{ pwd }}">
+        <span class="dk-mono">{{ uname }}</span>
+        <span class="dk-subtle">{{ desc }}</span>
+      </button>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {{ render_slot('login_footer') }}
+  </div>
+</div>
+</body>
+</html>

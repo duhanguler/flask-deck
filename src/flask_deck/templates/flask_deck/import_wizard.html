@@ -1,0 +1,143 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-crumb">{{ view.plural_label }}</a>
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">Dry-Run Import</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">Import {{ view.plural_label }}</h1>
+    <p class="dk-page-sub">Every upload is validated inside a guaranteed-rollback SQLAlchemy SAVEPOINT before commit.</p>
+  </div>
+  <div class="dk-page-actions">
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-btn">{{ deck_icon("arrow-left", 13) }} Back to {{ view.plural_label }}</a>
+  </div>
+</div>
+
+<div class="dk-content">
+  {% if error_msg %}
+  <div class="dk-alert dk-alert-danger" role="alert">{{ error_msg }}</div>
+  {% endif %}
+
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">Step 1 · Upload CSV or JSON for Dry-Run Diff</h2>
+      <span class="dk-mono dk-subtle">Max {{ config.max_import_rows }} rows · {{ config.max_upload_bytes // (1024 * 1024) }} MiB</span>
+    </div>
+    <form method="post" enctype="multipart/form-data" class="dk-panel-body">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <input type="hidden" name="step" value="preview">
+      <div class="dk-form-grid">
+        <div class="dk-field">
+          <label for="dk-import-file">Source File (.csv or .json)</label>
+          <input type="file" id="dk-import-file" name="file" accept=".csv,.json,text/csv,application/json" class="dk-input dk-file-input" required>
+        </div>
+        <div class="dk-field">
+          <label for="dk-upsert-key">Upsert Match Column (optional)</label>
+          <select id="dk-upsert-key" name="upsert_key" class="dk-select">
+            <option value="">Insert only (always create new rows)</option>
+            {% for key_col in upsert_candidates %}
+            <option value="{{ key_col }}"{% if report and report.upsert_key == key_col %} selected{% endif %}>Upsert by {{ key_col }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="dk-form-actions">
+        <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("eye", 13) }} Run Dry-Run Diff Preview</button>
+      </div>
+    </form>
+  </section>
+
+  {% if report %}
+  <div class="dk-grid">
+    <div class="dk-kpi dk-span-3">
+      <div class="dk-kpi-top"><span>Creates (+INSERT)</span></div>
+      <div class="dk-kpi-val dk-tabular dk-text-ok">{{ report.creates }}</div>
+    </div>
+    <div class="dk-kpi dk-span-3">
+      <div class="dk-kpi-top"><span>Updates (~DIFF)</span></div>
+      <div class="dk-kpi-val dk-tabular dk-text-warn">{{ report.updates }}</div>
+    </div>
+    <div class="dk-kpi dk-span-3">
+      <div class="dk-kpi-top"><span>Unchanged (=SKIP)</span></div>
+      <div class="dk-kpi-val dk-tabular dk-muted">{{ report.unchanged }}</div>
+    </div>
+    <div class="dk-kpi dk-span-3">
+      <div class="dk-kpi-top"><span>Validation Errors</span></div>
+      <div class="dk-kpi-val dk-tabular{% if report.errors %} dk-text-danger{% endif %}">{{ report.errors }}</div>
+    </div>
+  </div>
+
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">Step 2 · Savepoint Diff Preview ({{ report.filename }})</h2>
+        <p class="dk-panel-sub dk-mono">Mapped columns: {{ report.mapped_columns | length }} · Zero changes written to DB yet</p>
+      </div>
+      {% if report.applicable_count > 0 %}
+      <form method="post" class="dk-toolbar-left">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+        <input type="hidden" name="step" value="commit">
+        <input type="hidden" name="preview_token" value="{{ report.token }}">
+        {% if report.errors > 0 %}
+        <label class="dk-pop-item"><input type="checkbox" name="skip_errors" value="1"> Skip {{ report.errors }} errored row(s)</label>
+        {% endif %}
+        <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("check", 13) }} Commit {{ report.applicable_count }} Change(s)</button>
+      </form>
+      {% endif %}
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead>
+          <tr>
+            <th>Row</th>
+            <th>Action</th>
+            <th>Key</th>
+            <th>Field-Level Diff / Diagnostics</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in report.rows[:200] %}
+          <tr>
+            <td class="dk-mono dk-tabular">#{{ row.row_number }}</td>
+            <td>
+              {% if row.status == 'create' %}
+              <span class="dk-badge dk-badge-ok dk-mono">+ INSERT</span>
+              {% elif row.status == 'update' %}
+              <span class="dk-badge dk-badge-warn dk-mono">~ UPDATE</span>
+              {% elif row.status == 'error' %}
+              <span class="dk-badge dk-badge-danger dk-mono">! ERROR</span>
+              {% else %}
+              <span class="dk-badge dk-badge-neutral dk-mono">= UNCHANGED</span>
+              {% endif %}
+            </td>
+            <td class="dk-mono">{{ row.key_display }}</td>
+            <td>
+              {% if row.errors %}
+              <div class="dk-field-err dk-mono">{{ row.errors | join(" · ") }}</div>
+              {% elif row.changes %}
+              <div class="dk-diff-list">
+                {% for fname, pair in row.changes.items() %}
+                <div class="dk-diff-row">
+                  <span class="dk-diff-key">{{ fname }}:</span>
+                  {% if pair[0] is not none %}<span class="dk-diff-old">{{ pair[0] }}</span><span class="dk-subtle">→</span>{% endif %}
+                  <span class="dk-diff-new">{{ pair[1] }}</span>
+                </div>
+                {% endfor %}
+              </div>
+              {% else %}
+              <span class="dk-subtle">Identical to existing record</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

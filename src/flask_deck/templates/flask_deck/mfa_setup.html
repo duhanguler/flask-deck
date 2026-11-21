@@ -1,0 +1,121 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("2FA Security") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">Two-Factor Authentication (TOTP)</h1>
+    <p class="dk-page-sub">Zero-dependency RFC 6238 authenticator protection with replay defense &amp; single-use recovery codes.</p>
+  </div>
+  <div class="dk-page-actions">
+    {% if enrollment and enrollment.enabled %}
+    <span class="dk-badge dk-badge-ok dk-mono"><span class="dk-dot"></span>MFA ACTIVE</span>
+    {% else %}
+    <span class="dk-badge dk-badge-warn dk-mono"><span class="dk-dot"></span>NOT ENROLLED</span>
+    {% endif %}
+  </div>
+</div>
+
+<div class="dk-content">
+  {% if error_msg %}
+  <div class="dk-alert dk-alert-danger" role="alert">{{ error_msg }}</div>
+  {% endif %}
+
+  {% if recovery_once %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">Save Your One-Time Recovery Codes</h2>
+        <p class="dk-panel-sub">Stored as PBKDF2 hashes — these plaintext codes will never be displayed again.</p>
+      </div>
+      <span class="dk-badge dk-badge-warn dk-mono">SHOWN ONCE</span>
+    </div>
+    <div class="dk-panel-body">
+      <div class="dk-recovery-grid">
+        {% for rc in recovery_once %}
+        <code class="dk-code dk-mono">{{ rc }}</code>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if enrollment and enrollment.enabled %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">Authenticator Enrolled</h2>
+        <p class="dk-panel-sub">Account: {{ current_user.username }} · {{ enrollment.recovery_hashes | length }} unused recovery code(s) remaining</p>
+      </div>
+    </div>
+    <div class="dk-panel-body">
+      {% if mfa_required_for_user %}
+      <div class="dk-alert dk-alert-neutral" role="note">
+        {{ deck_icon("shield-check", 13) }} Superuser MFA enforcement policy is active; two-factor authentication cannot be disabled on this account.
+      </div>
+      {% else %}
+      <form method="post" action="{{ url_for(bp_name ~ '.security_mfa') }}" class="dk-diff-list">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+        <input type="hidden" name="action" value="disable">
+        <div class="dk-field">
+          <label for="dk-mfa-disable-code">Confirm Current 6-Digit Authenticator or Recovery Code</label>
+          <input type="text" id="dk-mfa-disable-code" name="code" class="dk-input dk-mono dk-tabular"
+                 placeholder="123456 or ABCD-1234" autocomplete="one-time-code" required>
+        </div>
+        <div>
+          <button type="submit" class="dk-btn dk-btn-danger" data-deck-confirm-form
+                  data-confirm-title="Disable 2FA"
+                  data-confirm-msg="Disable two-factor authentication for your account?">
+            {{ deck_icon("shield", 13) }} Disable 2FA
+          </button>
+        </div>
+      </form>
+      {% endif %}
+    </div>
+  </section>
+  {% else %}
+  <div class="dk-grid">
+    <section class="dk-panel dk-span-5">
+      <div class="dk-panel-head">
+        <h2 class="dk-panel-title">1. Scan QR Code</h2>
+        <span class="dk-mono dk-subtle">Pure SSR SVG</span>
+      </div>
+      <div class="dk-panel-body dk-qr-box">
+        {{ qr_svg }}
+        <div class="dk-field">
+          <label>Manual Base32 Secret</label>
+          <span class="dk-copy-wrap">
+            <code class="dk-code dk-mono">{{ setup_secret }}</code>
+            <button type="button" class="dk-btn dk-btn-sm" data-deck-copy="{{ setup_secret }}">{{ deck_icon("copy", 12) }} Copy</button>
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <section class="dk-panel dk-span-7">
+      <div class="dk-panel-head">
+        <h2 class="dk-panel-title">2. Confirm Authenticator Code</h2>
+      </div>
+      <div class="dk-panel-body">
+        <p class="dk-muted">Scan the QR code with 1Password, Apple Passwords, Authy, or Google Authenticator, then enter the generated 6-digit code to activate MFA.</p>
+        <form method="post" action="{{ url_for(bp_name ~ '.security_mfa') }}" class="dk-diff-list">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="enable">
+          <div class="dk-field">
+            <label for="dk-mfa-activate-code">6-Digit Verification Code</label>
+            <input type="text" id="dk-mfa-activate-code" name="code" class="dk-input dk-mono dk-tabular"
+                   placeholder="000000" inputmode="numeric" autocomplete="one-time-code" required>
+          </div>
+          <div>
+            <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("shield-check", 13) }} Activate 2FA</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

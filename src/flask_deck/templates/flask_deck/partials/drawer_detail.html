@@ -1,0 +1,93 @@
+<div data-deck-drawer-root>
+  <div class="dk-tabs">
+    <button type="button" class="dk-tab is-active" data-deck-drawer-tab="fields">Overview</button>
+    <button type="button" class="dk-tab" data-deck-drawer-tab="relations">Relations <span class="dk-tab-count dk-mono">{{ relations_display | length }}</span></button>
+    <button type="button" class="dk-tab" data-deck-drawer-tab="history">Audit <span class="dk-tab-count dk-mono">{{ history | length }}</span></button>
+  </div>
+
+  <div data-deck-drawer-panel="fields">
+    <div class="dk-toolbar">
+      <code class="dk-code">{{ view.label }} #{{ pk_str }}</code>
+      <div class="dk-page-actions">
+        {% if can_create %}
+        <a href="{{ url_for(bp_name ~ '.model_create', slug=view.meta.slug, clone=pk_str) }}" class="dk-btn dk-btn-sm">{{ deck_icon("copy", 12) }} {{ _("Clone") }}</a>
+        {% endif %}
+        <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn dk-btn-sm">Full View</a>
+        {% if can_edit %}
+        <a href="{{ url_for(bp_name ~ '.model_edit', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn dk-btn-primary dk-btn-sm">{{ deck_icon("edit", 12) }} {{ _("Edit") }}</a>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="dk-kv-grid">
+      {% for f in fields_display %}
+      <div class="dk-kv-item">
+        <div class="dk-kv-key">{{ f.label }}</div>
+        <div class="dk-kv-val">{{ f.formatted }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div data-deck-drawer-panel="relations" hidden="hidden">
+    <div class="dk-panel-body">
+      {% for rel in relations_display %}
+      <div class="dk-field">
+        <label>{{ rel.label }} <span class="dk-tab-count dk-mono">{{ rel.count }}</span></label>
+        {% if rel.records %}
+        <div class="dk-chip-group">
+          {% for it in rel.records %}<span class="dk-chip">{{ it }}</span>{% endfor %}
+        </div>
+        {% else %}
+        <span class="dk-null">None</span>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="dk-chart-empty">No relationships defined on this model.</div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div data-deck-drawer-panel="history" hidden="hidden">
+    {% for entry in history %}
+    <div class="dk-activity-row">
+      <div class="dk-activity-main">
+        <div>
+          <span class="dk-badge dk-badge-{{ 'ok' if entry.action == 'create' else ('danger' if entry.action == 'delete' else 'warn') }} dk-mono">{{ entry.action }}</span>
+          <span class="dk-muted">{{ entry.actor_name }}</span>
+        </div>
+        {% if entry.changes %}
+        <div class="dk-diff-list">
+          {% for fname, delta in entry.changes.items() %}
+          <div class="dk-diff-row">
+            <span class="dk-diff-key">{{ fname }}:</span>
+            {% if delta.old is not none %}<span class="dk-diff-old">{{ delta.old }}</span>{% endif %}
+            <span class="dk-subtle">→</span>
+            <span class="dk-diff-new">{{ delta.new }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+      <div class="dk-page-actions">
+        <span class="dk-mono dk-subtle">{{ format_dt(entry.timestamp, '%m-%d %H:%M') }}</span>
+        {% if can_revert and entry.is_revertible %}
+        <form method="post" action="{{ url_for(bp_name ~ '.audit_revert', entry_id=entry.id) }}">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <button type="submit"
+                  class="dk-btn dk-btn-sm"
+                  data-deck-confirm-form
+                  data-confirm-title="Revert Mutation"
+                  data-confirm-msg="Restore previous field values on {{ record_repr }}?"
+                  {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="REVERT"{% endif %}>
+            {{ deck_icon("rotate-ccw", 11) }}
+          </button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    {% else %}
+    <div class="dk-chart-empty">No recorded audit history for this record.</div>
+    {% endfor %}
+  </div>
+</div>
