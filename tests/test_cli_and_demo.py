@@ -5,13 +5,14 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from flask import Flask
+from flask import Flask, request
 from sqlalchemy.pool import StaticPool
 
 from flask_deck import Deck, __version__, run_security_audit
 from flask_deck.cli import deck_cli, main
 from flask_deck.demo import _DEMO_STATE_TABLE, Organization, create_demo_app, reset_demo_app
-from tests.conftest import SampleBase, Tenant, login_as
+from flask_deck.security import check_origin_headers
+from tests.conftest import SampleBase, Tenant, extract_csrf, login_as
 
 
 def test_demo_app_all_views_and_rbac_profiles() -> None:
@@ -302,4 +303,114 @@ def test_demo_daily_reset_endpoint_and_midnight_rollover(
                 == 32
             )
     finally:
+        deck2.close()
+
+
+def test_demo_vercel_multi_instance_session_export_and_stale_login_csrf() -> None:
+    shared_secret = "shared-vercel-demo-secret-key-0123456789abcdef"
+    app1 = create_demo_app(
+        db_uri="sqlite:///:memory:",
+        secret_key=shared_secret,
+        seed_profile="showcase",
+        stateless_ephemeral_sessions=True,
+    )
+    app2 = create_demo_app(
+        db_uri="sqlite:///:memory:",
+        secret_key=shared_secret,
+        seed_profile="showcase",
+        stateless_ephemeral_sessions=True,
+    )
+    deck1: Deck = app1.extensions["flask_deck"]["deck"]
+    deck2: Deck = app2.extensions["flask_deck"]["deck"]
+    try:
+        # 1. Log in on Serverless Instance 1
+        c1 = app1.test_client()
+        login_as(c1, "admin@acme.dev", "deck-demo-2026")
+        sess_cookie = c1.get_cookie("session")
+        assert sess_cookie is not None
+
+        # 2. Replay same signed cookie on Serverless Instance 2 (fresh in-memory SQLite)
+        c2 = app2.test_client()
+        c2.set_cookie("session", sess_cookie.value, domain=sess_cookie.domain)
+
+        with c2.get("/admin/organizations/export.csv", follow_redirects=False) as r_csv:
+            assert r_csv.status_code == 200
+            assert "Northstar Robotics" in r_csv.get_data(as_text=True)
+
+        with c2.get("/admin/orders/export.json", follow_redirects=False) as r_json:
+            assert r_json.status_code == 200
+            assert "ORD-2026-" in r_json.get_data(as_text=True)
+
+        with c2.get("/admin/_sql", follow_redirects=False) as r_sql:
+            assert r_sql.status_code == 200
+
+        with c2.get("/admin/_security/sessions", follow_redirects=False) as r_sess:
+            assert r_sess.status_code == 200
+            assert "admin@acme.dev" in r_sess.get_data(as_text=True)
+
+        # 3. Stale same-origin POST /admin/login recovers cleanly with fresh CSRF (HTTP 400)
+        c3 = app2.test_client()
+        r_stale = c3.post(
+            "/admin/login",
+            data={
+                "username": "admin@acme.dev",
+                "password": "deck-demo-2026",
+                "_csrf_token": "stale-expired-token",
+            },
+            headers={
+                "Origin": "https://demo.vercel.app",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            base_url="https://demo.vercel.app",
+            follow_redirects=False,
+        )
+        assert r_stale.status_code == 400
+        stale_html = r_stale.get_data(as_text=True)
+        assert "Session refreshed" in stale_html
+
+        fresh_csrf = extract_csrf(stale_html)
+        r_retry = c3.post(
+            "/admin/login",
+            data={
+                "username": "admin@acme.dev",
+                "password": "deck-demo-2026",
+                "_csrf_token": fresh_csrf,
+            },
+            headers={
+                "Origin": "https://demo.vercel.app",
+                "Sec-Fetch-Site": "same-origin",
+            },
+            base_url="https://demo.vercel.app",
+            follow_redirects=False,
+        )
+        assert r_retry.status_code == 302
+        assert r_retry.headers["Location"].endswith("/admin/")
+
+        # 4. Cross-origin POST /admin/login remains strictly blocked with HTTP 403
+        r_evil = c3.post(
+            "/admin/login",
+            data={
+                "username": "admin@acme.dev",
+                "password": "deck-demo-2026",
+                "_csrf_token": fresh_csrf,
+            },
+            headers={
+                "Origin": "https://evil.example",
+                "Sec-Fetch-Site": "cross-site",
+            },
+            base_url="https://demo.vercel.app",
+            follow_redirects=False,
+        )
+        assert r_evil.status_code == 403
+
+        # 5. Default port (:443) normalization matches bare HTTPS origin
+        with app1.test_request_context(
+            "/admin/login",
+            method="POST",
+            base_url="https://demo.vercel.app:443",
+            headers={"Origin": "https://demo.vercel.app"},
+        ):
+            assert check_origin_headers(request) is True
+    finally:
+        deck1.close()
         deck2.close()

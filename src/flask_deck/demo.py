@@ -12,12 +12,21 @@ from zoneinfo import ZoneInfo
 
 import sqlalchemy as sa
 from flask import Flask, jsonify, redirect, request
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+from flask import session as flask_session
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    relationship,
+    sessionmaker,
+)
+from werkzeug.security import generate_password_hash
 
 from flask_deck.api_keys import build_api_key_record
 from flask_deck.approvals import ApprovalRequest
 from flask_deck.audit import SQLAlchemyAuditStore, make_audit_entry
-from flask_deck.auth import DeckUser, RBACAuthProvider, Role
+from flask_deck.auth import AUTH_USER_KEY, DeckUser, RBACAccount, RBACAuthProvider, Role
 from flask_deck.branding import BrandConfig
 from flask_deck.dashboard import (
     ActivityWidget,
@@ -49,6 +58,7 @@ from flask_deck.jobs import JobContext, JobRecord, ThreadPoolJobBackend
 from flask_deck.model_view import ActionField, InlineModelView, ModelView, action
 from flask_deck.query import QuickTab
 from flask_deck.saved_views import RecordNote, SavedViewRecord
+from flask_deck.sessions import DECK_SID_SESSION_KEY, SessionRecord, SQLAlchemySessionStore
 from flask_deck.sql_console import (
     SavedQueryRecord,
     execute_readonly_sql,
@@ -58,6 +68,7 @@ from flask_deck.storage import FileFieldConfig, MemoryFileStorage, make_demo_png
 from flask_deck.widgets import CodeWidget, ColorWidget, SliderWidget, TagInputWidget
 
 DEMO_MEDIA_STORAGE = MemoryFileStorage()
+_DEMO_PASSWORD_HASH = generate_password_hash("deck-demo-2026", method="pbkdf2:sha256:200000")
 _DEMO_STATE_META = sa.MetaData()
 _DEMO_STATE_TABLE = sa.Table(
     "_flask_deck_demo_state",
@@ -65,6 +76,52 @@ _DEMO_STATE_TABLE = sa.Table(
     sa.Column("key", sa.String(64), primary_key=True),
     sa.Column("value", sa.String(255), nullable=False),
 )
+
+
+class _EphemeralServerlessSessionStore(SQLAlchemySessionStore):
+    """Demo-only SessionStore tolerating stateless serverless instances without shared DB."""
+
+    def is_active(self, session_id: str) -> bool:
+        if not session_id:
+            return False
+        with Session(self._engine) as sess:
+            row = sess.execute(
+                sa.select(self._table.c.revoked_at).where(self._table.c.session_id == session_id)
+            ).first()
+            if row is None:
+                # Session was signed on another ephemeral microVM; trust signed cookie + timestamps.
+                return True
+            return row[0] is None
+
+    def ensure_session(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        username: str,
+        ip_address: str,
+        user_agent: str,
+    ) -> None:
+        if not session_id:
+            return
+        with Session(self._engine) as sess:
+            exists = sess.execute(
+                sa.select(self._table.c.session_id).where(self._table.c.session_id == session_id)
+            ).first()
+            if exists is not None:
+                return
+        now = datetime.now(timezone.utc)
+        self.register(
+            SessionRecord(
+                session_id=session_id,
+                user_id=user_id,
+                username=username,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                created_at=now,
+                last_seen_at=now,
+            )
+        )
 
 
 def _resolve_tz(tz_name: str) -> tzinfo:
@@ -1642,6 +1699,7 @@ def create_demo_app(
     seed_profile: Literal["standard", "showcase"] = "standard",
     auto_daily_reset: bool = False,
     reset_timezone: str = "Europe/Istanbul",
+    stateless_ephemeral_sessions: bool = False,
 ) -> Flask:
     """Create the complete Acme Cloud Ops SaaS demo Flask application."""
     app = Flask(__name__)
@@ -1709,7 +1767,7 @@ def create_demo_app(
     auth = RBACAuthProvider(
         roles=roles,
         accounts=[
-            RBACAuthProvider.make_account(
+            RBACAccount(
                 user=DeckUser(
                     id="admin",
                     username="admin@acme.dev",
@@ -1718,9 +1776,9 @@ def create_demo_app(
                     roles=("superadmin",),
                     is_superuser=True,
                 ),
-                password=demo_pwd,
+                password_hash=_DEMO_PASSWORD_HASH,
             ),
-            RBACAuthProvider.make_account(
+            RBACAccount(
                 user=DeckUser(
                     id="support",
                     username="support@acme.dev",
@@ -1728,9 +1786,9 @@ def create_demo_app(
                     email="support@acme.dev",
                     roles=("support",),
                 ),
-                password=demo_pwd,
+                password_hash=_DEMO_PASSWORD_HASH,
             ),
-            RBACAuthProvider.make_account(
+            RBACAccount(
                 user=DeckUser(
                     id="viewer",
                     username="viewer@acme.dev",
@@ -1738,9 +1796,15 @@ def create_demo_app(
                     email="viewer@acme.dev",
                     roles=("auditor",),
                 ),
-                password=demo_pwd,
+                password_hash=_DEMO_PASSWORD_HASH,
             ),
         ],
+    )
+
+    ephemeral_session_store = (
+        _EphemeralServerlessSessionStore(engine)
+        if stateless_ephemeral_sessions and db_uri == "sqlite:///:memory:"
+        else None
     )
 
     deck = Deck(
@@ -1749,6 +1813,7 @@ def create_demo_app(
         engine=engine,
         auth=auth,
         audit_store=audit_store,
+        session_store=ephemeral_session_store,
         title="Acme Ops",
         subtitle="Cloud Infrastructure & Billing Control Plane",
         environment="staging",
@@ -2265,6 +2330,24 @@ def create_demo_app(
             return None
 
         app.before_request_funcs.setdefault(None, []).insert(0, _check_daily_demo_reset)
+
+    if ephemeral_session_store is not None:
+        @app.before_request
+        def _hydrate_ephemeral_session() -> None:
+            if not request.path.rstrip("/").endswith("/_security/sessions"):
+                return None
+            uid = flask_session.get(AUTH_USER_KEY)
+            sid = flask_session.get(DECK_SID_SESSION_KEY)
+            if isinstance(uid, str) and uid and isinstance(sid, str) and sid:
+                acc = auth._accounts_by_id.get(uid)
+                ephemeral_session_store.ensure_session(
+                    session_id=sid,
+                    user_id=uid,
+                    username=acc.user.username if acc is not None else uid,
+                    ip_address=str(request.remote_addr or "127.0.0.1"),
+                    user_agent=str(request.headers.get("User-Agent", "")),
+                )
+            return None
 
     @app.route("/api/cron/reset-demo", methods=["GET", "POST"])
     def cron_reset_demo() -> Any:

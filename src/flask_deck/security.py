@@ -131,6 +131,21 @@ def rotate_csrf_token() -> str:
     return token
 
 
+def _origin_tuple(url: str) -> tuple[str, str, int] | None:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if not scheme or not host:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else (80 if scheme == "http" else 0)
+    return scheme, host, port
+
+
 def _check_origin_headers(req: Request) -> bool:
     """Secondary same-origin verification using Sec-Fetch-Site and Origin headers."""
     sec_fetch_site = req.headers.get("Sec-Fetch-Site", "").strip().lower()
@@ -143,15 +158,15 @@ def _check_origin_headers(req: Request) -> bool:
             # Chromium may emit Origin: null on same-origin form posts under strict referrer policies.
             # Allow ONLY when browser explicitly confirms Sec-Fetch-Site: same-origin.
             return sec_fetch_site == "same-origin"
-        parsed_origin = urlsplit(origin)
-        parsed_host = urlsplit(req.host_url)
-        if (
-            parsed_origin.scheme.lower() != parsed_host.scheme.lower()
-            or parsed_origin.netloc.lower() != parsed_host.netloc.lower()
-        ):
+        origin_parts = _origin_tuple(origin)
+        host_parts = _origin_tuple(req.host_url)
+        if origin_parts is None or host_parts is None or origin_parts != host_parts:
             return False
 
     return True
+
+
+check_origin_headers = _check_origin_headers
 
 
 def validate_csrf(req: Request) -> bool:

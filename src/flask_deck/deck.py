@@ -148,10 +148,12 @@ from flask_deck.security import (
     RateLimitStore,
     SQLAlchemyRateLimitStore,
     apply_security_headers,
+    check_origin_headers,
     generate_nonce,
     get_csrf_token,
     is_safe_redirect_url,
     is_sensitive_field,
+    rotate_csrf_token,
     validate_csrf,
 )
 from flask_deck.sessions import (
@@ -2153,6 +2155,19 @@ class Deck:
             if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not validate_csrf(request):
                 if is_api:
                     return jsonify({"error": "Invalid or missing CSRF token."}), 403  # type: ignore[return-value]
+                if endpoint == f"{bp_name}.login" and check_origin_headers(request):
+                    rotate_csrf_token()
+                    return Response(
+                        render_template(
+                            "flask_deck/login.html",
+                            **deck._base_context(
+                                next_url=request.form.get("next", ""),
+                                error_msg="Session refreshed — please click Sign in again.",
+                                demo_credentials=deck._demo_credentials,
+                            ),
+                        ),
+                        status=400,
+                    )
                 abort(403, description="Invalid or missing CSRF token.")
 
             # 3. Authentication, session timeout & audited impersonation resolution

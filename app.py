@@ -26,7 +26,11 @@ def _resolve_secret_key() -> str:
     configured = os.environ.get("FLASK_DECK_SECRET_KEY")
     if configured:
         return configured
-    seed = f"flask-deck-demo:{os.environ.get('VERCEL_DEPLOYMENT_ID', 'local')}:{os.environ.get('VERCEL_PROJECT_ID', 'demo')}"
+    # Keep secret stable across Vercel deployments/instances so cookies stay valid.
+    seed = (
+        f"flask-deck-demo:{os.environ.get('VERCEL_PROJECT_ID', 'demo')}:"
+        f"{os.environ.get('VERCEL_GIT_REPO_SLUG', 'flask-deck')}"
+    )
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
@@ -44,14 +48,16 @@ def _resolve_reset_timezone() -> str:
     return os.environ.get("FLASK_DECK_RESET_TIMEZONE", "Europe/Istanbul").strip() or "Europe/Istanbul"
 
 
+_db_uri = _resolve_db_uri()
 app = create_demo_app(
-    db_uri=_resolve_db_uri(),
+    db_uri=_db_uri,
     secret_key=_resolve_secret_key(),
     seed_profile=_resolve_seed_profile(),
     auto_daily_reset=_resolve_auto_reset(),
     reset_timezone=_resolve_reset_timezone(),
+    stateless_ephemeral_sessions=(_db_uri == "sqlite:///:memory:"),
 )
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)  # type: ignore[method-assign]
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)  # type: ignore[method-assign]
 if os.environ.get("VERCEL"):
     app.config["SESSION_COOKIE_SECURE"] = True
 
