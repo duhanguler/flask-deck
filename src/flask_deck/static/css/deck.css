@@ -1332,12 +1332,47 @@ button.dk-pop-item { width: 100%; text-align: start; }
 .dk-color-input { width: 42px; height: 28px; padding: 1px; border: 1px solid var(--border-strong); border-radius: 4px; background: var(--bg-surface); }
 .dk-erd-link { text-decoration: underline; }
 
+/* v0.5.0: Fieldsets, Sticky Form Bar, Dual/Async M2M, Stacked Inlines, Query Intel, Cascade Impact & IAM */
+.dk-fieldset-details > summary.dk-panel-head { cursor: pointer; list-style: none; }
+.dk-fieldset-desc { font-size: 11.5px; margin-bottom: 10px; }
+.dk-field-row { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.dk-help-text { font-size: 11px; color: var(--ink-3); line-height: 1.4; }
+.dk-ro-val { padding: 6px 9px; border-radius: 4px; background: var(--bg-surface); border: 1px solid var(--border); font-size: 12px; color: var(--ink-2); }
+.dk-fk-input-row, .dk-fk-actions, .dk-chip-group, .dk-inline-head-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dk-fk-input-row .dk-fk-wrap { flex: 1; min-width: 0; }
+.dk-m2m-dual { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; }
+.dk-m2m-dual-pane { display: flex; flex-direction: column; gap: 4px; }
+.dk-m2m-dual-list { min-height: 132px; font-size: 12px; }
+.dk-m2m-dual-ctrls { display: flex; flex-direction: column; gap: 6px; }
+.dk-m2m-async, .dk-m2m-async-selected { display: flex; flex-direction: column; gap: 6px; }
+.dk-inline-cards { display: flex; flex-direction: column; gap: 10px; }
+.dk-inline-card { border: 1px solid var(--border-strong); border-radius: 6px; padding: 10px; background: var(--bg-canvas); }
+.dk-inline-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.dk-form-sticky-bar { position: sticky; bottom: 0; z-index: 20; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 10px 14px; background: var(--bg-panel); border-top: 1px solid var(--border-strong); }
+.dk-dirty-badge { padding: 2px 7px; border-radius: 4px; font-size: 11px; color: var(--warn); background: var(--warn-bg); border: 1px solid var(--warn-bd); }
+.dk-search-wrap { display: flex; flex-direction: column; gap: 3px; }
+.dk-date-hierarchy { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 7px 14px; border-bottom: 1px solid var(--border); background: var(--bg-surface); font-size: 11.5px; }
+.dk-dh-crumb { color: var(--ink-2); padding: 2px 5px; border-radius: 4px; }
+.dk-dh-crumb.is-active { color: var(--ink-1); font-weight: 600; background: var(--bg-active); }
+.dk-dh-sep { color: var(--ink-3); }
+.dk-multisort-bar, .dk-select-across { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 7px 14px; border-bottom: 1px solid var(--border); background: var(--bg-surface); font-size: 11.5px; }
+.dk-sort-rank { font-size: 9.5px; padding: 0 4px; border-radius: 3px; background: var(--bg-active); border: 1px solid var(--border); }
+.dk-page-size-select { width: auto; min-width: 96px; height: 26px; font-size: 11.5px; }
+.dk-impact-tree { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding: 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--bg-surface); font-size: 12px; }
+.dk-impact-row { display: flex; flex-direction: column; gap: 3px; padding-top: 5px; border-top: 1px solid var(--border); }
+.dk-impact-note { color: var(--ok); font-size: 11.5px; }
+.dk-impact-samples { display: flex; flex-wrap: wrap; gap: 6px; font-size: 11px; }
+.dk-impact-sample-link { padding: 1px 6px; border-radius: 3px; border: 1px solid var(--border); background: var(--bg-panel); color: var(--ink-1); }
+.dk-iam-sys-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px; }
+.dk-iam-matrix { margin-top: 6px; }
+
 /* Responsive */
 @media (max-width: 1024px) {
   .dk-span-3, .dk-span-4, .dk-span-5 { grid-column: span 6; }
   .dk-span-7, .dk-span-8, .dk-span-9 { grid-column: span 12; }
 }
 @media (max-width: 768px) {
+  .dk-m2m-dual { grid-template-columns: 1fr; }
   .dk-shell { grid-template-columns: 0 1fr; }
   .dk-rail {
     position: fixed;

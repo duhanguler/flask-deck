@@ -61,6 +61,8 @@ class FieldMeta:
     array_item_type: FieldType | None = None
     is_jsonb: bool = False
     is_computed: bool = False
+    help_text: str = ""
+    ondelete: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +77,7 @@ class RelationshipMeta:
     local_columns: tuple[str, ...]
     remote_columns: tuple[str, ...]
     back_populates: str | None
+    cascade: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +288,7 @@ def introspect_model(
             local_columns=local_cols,
             remote_columns=remote_cols,
             back_populates=rel.back_populates,
+            cascade=", ".join(sorted(str(c) for c in rel.cascade)) if rel.cascade else "",
         )
         relationships.append(rel_meta)
         if direction == "MANYTOONE" and len(local_cols) == 1:
@@ -364,9 +368,12 @@ def introspect_model(
         fk_target_model: type[Any] | None = None
         fk_col_str: str | None = None
         fk_rel_name: str | None = None
+        fk_ondelete: str | None = None
         is_joined_pk_fk = False
         if col.foreign_keys:
             fk = next(iter(col.foreign_keys))
+            if fk.ondelete:
+                fk_ondelete = str(fk.ondelete).strip().upper()
             if col.primary_key and len(all_tables) > 1 and fk.column.table.name in inheritance_table_names:
                 is_joined_pk_fk = True
             else:
@@ -382,6 +389,11 @@ def introspect_model(
                     fk_target_model = rel_match.target_model
 
         has_default = col.default is not None or col.server_default is not None
+        raw_help = ""
+        if isinstance(col.info, dict):
+            raw_help = str(col.info.get("help_text") or "").strip()
+        if not raw_help and getattr(col, "comment", None):
+            raw_help = str(col.comment).strip()
         autoincrement = bool(
             col.primary_key
             and field_type == "integer"
@@ -425,6 +437,8 @@ def introspect_model(
             array_item_type=array_item_type,
             is_jsonb=is_jsonb,
             is_computed=False,
+            help_text=raw_help,
+            ondelete=fk_ondelete,
         )
         fields.append(fmeta)
         if fmeta.primary_key:

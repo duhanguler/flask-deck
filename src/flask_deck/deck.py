@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import enum
 import hashlib
+import hmac
 import json
 import logging
 import threading
@@ -9,10 +11,10 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import sqlalchemy as sa
 from flask import (
@@ -63,7 +65,7 @@ from flask_deck.audit import (
     compute_diff,
     make_audit_entry,
 )
-from flask_deck.auth import AuthProvider, DeckUser, OpenAuthProvider, RBACAuthProvider
+from flask_deck.auth import AuthProvider, DeckUser, OpenAuthProvider
 from flask_deck.branding import render_brand_css, render_safe_slot
 from flask_deck.config import DeckConfig
 from flask_deck.dashboard import (
@@ -87,6 +89,12 @@ from flask_deck.exceptions import (
     ReadOnlyError,
     SecurityConfigurationError,
 )
+from flask_deck.filters import (
+    ListFilter,
+    build_date_hierarchy_predicate,
+    filter_param_name,
+    filter_title,
+)
 from flask_deck.i18n import (
     CURATED_TIMEZONES,
     LOCALE_LABELS,
@@ -101,6 +109,7 @@ from flask_deck.i18n import (
 )
 from flask_deck.icons import render_icon
 from flask_deck.importer import ImportPreviewStore, PreviewStore, SQLAlchemyPreviewStore
+from flask_deck.introspection import introspect_model
 from flask_deck.jobs import (
     JobBackend,
     JobCallable,
@@ -131,6 +140,7 @@ from flask_deck.query import (
     begin_request_telemetry,
     estimate_table_rows,
     get_request_telemetry,
+    prepare_scoped_clauses,
     soft_delete_predicate,
 )
 from flask_deck.routes import register_all_routes
@@ -831,6 +841,96 @@ class Deck:
             return raw.encode()
         return b"flask-deck-default-cursor-key"
 
+    @staticmethod
+    def _sanitize_return_qs(raw: str | None) -> str:
+        """Strictly sanitize preserved list query parameters (open-redirect safe)."""
+        if not raw or not isinstance(raw, str):
+            return ""
+        cleaned = raw.strip().lstrip("?")
+        if not cleaned or len(cleaned) > 2048:
+            return ""
+        allowed_exact = {
+            "q",
+            "tab",
+            "sort",
+            "dir",
+            "page",
+            "page_size",
+            "view",
+            "trashed",
+            "dh",
+            "after",
+            "before",
+        }
+        kept: list[tuple[str, str]] = []
+        for k, v in parse_qsl(cleaned, keep_blank_values=False):
+            if "\r" in v or "\n" in v or "\r" in k or "\n" in k:
+                continue
+            if k in allowed_exact or k.startswith("f_") or k.startswith("cf_"):
+                kept.append((k, v[:256]))
+        if not kept:
+            return ""
+        encoded = urlencode(kept, doseq=True)
+        return encoded if len(encoded) <= 1024 else ""
+
+    def _list_url_with_return(self, slug: str, return_qs: str = "") -> str:
+        base = url_for(f"{self.config.name}.model_list", slug=slug)
+        clean = self._sanitize_return_qs(return_qs)
+        return f"{base}?{clean}" if clean else base
+
+    def _sign_select_across_token(
+        self,
+        slug: str,
+        user: DeckUser | None,
+        query_state: Mapping[str, Any],
+    ) -> str:
+        """Create HMAC-SHA256 signed query slice token bound to slug, actor, and active filters."""
+        payload = {
+            "v": 1,
+            "slug": slug,
+            "uid": user.id if user is not None else "__anon__",
+            "exp": int(time.time()) + 900,
+            "state": dict(query_state),
+        }
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        b64 = base64.urlsafe_b64encode(body).decode("ascii").rstrip("=")
+        sig = hmac.new(self._cursor_secret(), body, hashlib.sha256).hexdigest()[:32]
+        return f"{b64}.{sig}"
+
+    def _verify_select_across_token(
+        self,
+        token: str | None,
+        *,
+        expected_slug: str,
+        user: DeckUser | None,
+    ) -> dict[str, Any] | None:
+        """Verify HMAC signature, expiration, slug, and actor identity (fail-closed -> None)."""
+        if not token or "." not in token or len(token) > 4096:
+            return None
+        b64_part, provided_sig = token.rsplit(".", 1)
+        pad = "=" * (-len(b64_part) % 4)
+        try:
+            body = base64.urlsafe_b64decode(b64_part + pad)
+        except Exception:
+            return None
+        expected_sig = hmac.new(self._cursor_secret(), body, hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(expected_sig, provided_sig):
+            return None
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        uid = user.id if user is not None else "__anon__"
+        if parsed.get("slug") != expected_slug or parsed.get("uid") != uid:
+            return None
+        exp = parsed.get("exp")
+        if not isinstance(exp, int) or exp < int(time.time()):
+            return None
+        state = parsed.get("state")
+        return dict(state) if isinstance(state, dict) else None
+
     def _media_url_builder(self, view: ModelView) -> Callable[[str, Any], str | None]:
         bp_name = self.config.name
         slug = view.meta.slug
@@ -963,10 +1063,22 @@ class Deck:
             for col_spec in view.resolved_filterable
             if self._is_dotted_field_allowed(view, col_spec, user, restricted)
         )
+        sortable_set: set[str] = set()
+        for col_spec in view.resolved_sortable:
+            if not self._is_dotted_field_allowed(view, col_spec, user, restricted):
+                continue
+            d_spec = view.display_fields.get(col_spec)
+            if (
+                d_spec is not None
+                and isinstance(d_spec.ordering, str)
+                and not self._is_dotted_field_allowed(view, d_spec.ordering, user, restricted)
+            ):
+                continue
+            sortable_set.add(col_spec)
         return (
             searchable,
             filterable,
-            view.resolved_sortable - restricted,
+            frozenset(sortable_set),
         )
 
     def _collect_orphan_files(self, view: ModelView, obj: Any) -> list[tuple[Any, str]]:
@@ -1607,17 +1719,19 @@ class Deck:
             and user is not None
             and (user.is_superuser or self.auth.has_permission(user, "api_keys:manage"))
         )
+        can_manage_iam = bool(
+            self.auth.supports_iam_management
+            and user is not None
+            and (user.is_superuser or self.auth.has_permission(user, "iam:manage"))
+        )
+        can_change_password = bool(self.auth.supports_password_change and user is not None)
         passkey_login_enabled = (
             self.passkey_store is not None
             and is_webauthn_available()
             and self.auth.supports_login_form
         )
         demo_accounts: Sequence[DeckUser] = ()
-        if (
-            self.config.demo_role_switcher
-            and self.config.environment != "production"
-            and isinstance(self.auth, RBACAuthProvider)
-        ):
+        if self.config.demo_role_switcher and self.config.environment != "production":
             demo_accounts = self.auth.get_demo_accounts()
 
         impersonate_targets: Sequence[DeckUser] = ()
@@ -1674,6 +1788,8 @@ class Deck:
             "can_manage_sessions": can_manage_sessions,
             "can_manage_passkeys": can_manage_passkeys,
             "can_manage_api_keys": can_manage_api_keys,
+            "can_manage_iam": can_manage_iam,
+            "can_change_password": can_change_password,
             "passkey_login_enabled": passkey_login_enabled,
             "show_password_form": self.auth.supports_password_login,
             "demo_accounts": demo_accounts,
@@ -1766,6 +1882,196 @@ class Deck:
                 pass
         return options
 
+    def _build_filter_specs(
+        self,
+        view: ModelView,
+        allowed_filterable: frozenset[str],
+        filter_params: Mapping[str, str],
+        user: DeckUser | None,
+    ) -> list[dict[str, Any]]:
+        slug = view.meta.slug
+        hidden_fields = self.auth.hidden_fields_for(user, slug)
+        masked_fields = self.auth.masked_fields_for(user, slug)
+        filter_specs: list[dict[str, Any]] = []
+        for fname in sorted(allowed_filterable):
+            if "." in fname:
+                rel_name, target_col = fname.split(".", 1)
+                if rel_name in hidden_fields or rel_name in masked_fields:
+                    continue
+                rel_meta = view.meta.relationships_by_name.get(rel_name)
+                if rel_meta is None or rel_meta.direction != "MANYTOONE":
+                    continue
+                t_view = self._views_by_model.get(rel_meta.target_model)
+                t_meta = t_view.meta if t_view is not None else introspect_model(rel_meta.target_model)
+                fm = t_meta.fields_by_name.get(target_col)
+                if fm is None or fm.is_sensitive:
+                    continue
+                filter_specs.append(
+                    {
+                        "name": fname,
+                        "label": f"{rel_meta.label} · {fm.label}",
+                        "type": fm.field_type,
+                        "choices": fm.choices,
+                        "value": filter_params.get(fname, ""),
+                        "gte": filter_params.get(f"{fname}__gte", ""),
+                        "lte": filter_params.get(f"{fname}__lte", ""),
+                        "preset": filter_params.get(f"{fname}__preset", ""),
+                        "has_key": filter_params.get(f"{fname}__has_key", ""),
+                        "path": filter_params.get(f"{fname}__path", ""),
+                        "array_contains": filter_params.get(f"{fname}__array_contains", ""),
+                        "array_any": filter_params.get(f"{fname}__array_any", ""),
+                    }
+                )
+                continue
+            if fname in hidden_fields or fname in masked_fields:
+                continue
+            fm = view.meta.fields_by_name.get(fname)
+            if fm is None:
+                continue
+            spec: dict[str, Any] = {
+                "name": fname,
+                "label": view.get_column_label(fname),
+                "type": "fk" if fm.fk_target_model is not None else fm.field_type,
+                "choices": fm.choices,
+                "value": filter_params.get(fname, ""),
+                "gte": filter_params.get(f"{fname}__gte", ""),
+                "lte": filter_params.get(f"{fname}__lte", ""),
+                "preset": filter_params.get(f"{fname}__preset", ""),
+                "has_key": filter_params.get(f"{fname}__has_key", ""),
+                "path": filter_params.get(f"{fname}__path", ""),
+                "array_contains": filter_params.get(f"{fname}__array_contains", ""),
+                "array_any": filter_params.get(f"{fname}__array_any", ""),
+            }
+            if fm.fk_target_model is not None:
+                spec["fk_options"] = self._fk_options_for_field(
+                    fm.fk_target_model, limit=40, fallback_bind_key=view.bind_key
+                )
+            filter_specs.append(spec)
+        return filter_specs
+
+    def _resolve_custom_filters_and_dh(
+        self,
+        view: ModelView,
+        multi_items: Sequence[tuple[str, str]],
+        user: DeckUser | None,
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, Callable[[sa.Select[Any]], sa.Select[Any]]],
+        dict[str, str],
+        sa.ColumnElement[bool] | None,
+    ]:
+        """Resolve validated custom ListFilters and SARGable date_hierarchy predicate."""
+        sess = self.get_session(view.bind_key)
+        raw_cf: dict[str, str] = {}
+        dh_raw = ""
+        for k, v in multi_items:
+            if k.startswith("cf_") and v.strip():
+                raw_cf[k[3:]] = v.strip()
+            elif k == "dh" and v.strip():
+                dh_raw = v.strip()
+
+        custom_specs: list[dict[str, Any]] = []
+        appliers_by_param: dict[str, Callable[[sa.Select[Any]], sa.Select[Any]]] = {}
+        active_custom: dict[str, str] = {}
+        for cf in view.resolved_custom_filters:
+            p_name = filter_param_name(cf)
+            choices = list(cf.lookups(sess, view, user))
+            valid_vals = {k for k, _ in choices}
+            sel_val = raw_cf.get(p_name, "")
+            if sel_val not in valid_vals:
+                sel_val = ""
+            custom_specs.append(
+                {
+                    "param": p_name,
+                    "title": filter_title(cf),
+                    "choices": choices,
+                    "value": sel_val,
+                }
+            )
+            if sel_val:
+                active_custom[p_name] = sel_val
+
+                def _apply_one(
+                    stmt: sa.Select[Any],
+                    *,
+                    _cf: ListFilter = cf,
+                    _v: str = sel_val,
+                    _s: Session = sess,
+                    _vw: ModelView = view,
+                    _u: DeckUser | None = user,
+                ) -> sa.Select[Any]:
+                    return _cf.apply(stmt, _v, _s, _vw, _u)
+
+                appliers_by_param[p_name] = _apply_one
+
+        dh_col = view.date_hierarchy
+        if dh_col and user is not None:
+            restricted_dh = self.auth.hidden_fields_for(user, view.meta.slug) | self.auth.masked_fields_for(
+                user, view.meta.slug
+            )
+            if dh_col in restricted_dh:
+                dh_col = None
+        dh_pred = build_date_hierarchy_predicate(view.meta, dh_col, dh_raw)
+        return custom_specs, appliers_by_param, active_custom, dh_pred
+
+    def _build_filtered_pk_statement(
+        self,
+        view: ModelView,
+        multi_items: Sequence[tuple[str, str]],
+        *,
+        user: DeckUser | None,
+        trashed_override: bool | None = None,
+    ) -> tuple[sa.Select[Any], str]:
+        """Reconstruct a strictly scoped statement matching a verified list slice (select_across / impact)."""
+        single: dict[str, str] = {}
+        filter_pairs: list[tuple[str, str]] = []
+        for k, v in multi_items:
+            single.setdefault(k, v)
+            if k.startswith("f_") and v.strip():
+                filter_pairs.append((k[2:], v.strip()))
+
+        search_term = single.get("q", "").strip()
+        active_tab = single.get("tab", "").strip() or (
+            view.quick_tabs[0].key if view.quick_tabs else ""
+        )
+        trashed = (
+            bool(trashed_override)
+            if trashed_override is not None
+            else bool(view.soft_delete_column and single.get("trashed") == "1")
+        )
+        allowed_searchable, allowed_filterable, _ = self._allowed_query_fields(view, user)
+        _, appliers_by_param, _, dh_pred = self._resolve_custom_filters_and_dh(
+            view, multi_items, user
+        )
+        sess = self.get_session(view.bind_key)
+        dialect_name = sess.get_bind().dialect.name if sess.get_bind() is not None else ""
+        base_stmt = view.scope_query(sa.select(view.model), user)
+        _, all_where, _, joins = prepare_scoped_clauses(
+            view.meta,
+            base_stmt=base_stmt,
+            searchable_columns=allowed_searchable,
+            filterable_columns=allowed_filterable,
+            quick_tabs=view.quick_tabs,
+            active_tab_key=active_tab or None,
+            search_term=search_term,
+            filter_params=filter_pairs,
+            soft_delete_column=view.soft_delete_column,
+            trashed=trashed,
+            dialect_name=dialect_name,
+            views_by_model=self._views_by_model,
+            user=user,
+            auth=self.auth,
+            extra_where=[dh_pred] if dh_pred is not None else (),
+        )
+        stmt = sa.select(view.model)
+        for rel_attr in joins:
+            stmt = stmt.outerjoin(rel_attr)
+        if all_where:
+            stmt = stmt.where(*all_where)
+        for applier in appliers_by_param.values():
+            stmt = applier(stmt)
+        return stmt, active_tab
+
     def _build_form_context(
         self,
         view: ModelView,
@@ -1777,35 +2083,60 @@ class Deck:
     ) -> dict[str, Any]:
         user = self._current_user()
         visible = view.visible_form_fields(self.auth, user)
-        readonly = self.auth.readonly_fields_for(user, view.meta.slug)
+        rbac_readonly = self.auth.readonly_fields_for(user, view.meta.slug)
         masked = self.auth.masked_fields_for(user, view.meta.slug)
-
-        # Resolve fieldsets (either declarative or single default group)
-        if view.fieldsets:
-            fieldsets: list[tuple[str, list[str]]] = []
-            used: set[str] = set()
-            for title, cols in view.fieldsets:
-                kept = [c for c in cols if c in visible]
-                if kept:
-                    fieldsets.append((title, kept))
-                    used.update(kept)
-            remaining = [c for c in visible if c not in used]
-            if remaining:
-                fieldsets.append(("Additional Fields", remaining))
-        else:
-            fieldsets = [(f"{view.label} Details", list(visible))]
+        fieldsets = view.resolve_fieldsets(visible, errors=errors)
+        media_builder = self._media_url_builder(view)
+        rel_url_builder = self._rel_url_builder(user)
+        bp_name = self.config.name
 
         field_specs: dict[str, dict[str, Any]] = {}
         for col_name in visible:
+            d_spec = view.display_fields.get(col_name)
+            if d_spec is not None and col_name not in view.meta.fields_by_name:
+                if obj is not None:
+                    formatted_preview = view.format_cell(
+                        col_name,
+                        obj,
+                        auth=self.auth,
+                        user=user,
+                        media_url_builder=media_builder,
+                        rel_repr=self._rel_repr,
+                        rel_url_builder=rel_url_builder,
+                    )
+                else:
+                    formatted_preview = f"— ({d_spec.label})"
+                field_specs[col_name] = {
+                    "kind": "display_ro",
+                    "widget": "",
+                    "custom_widget_html": None,
+                    "widget_full": True,
+                    "formatted_html": formatted_preview,
+                    "help_text": view.get_field_help_text(col_name),
+                    "prepopulate_json": "",
+                    "name": col_name,
+                    "label": view.get_column_label(col_name),
+                    "required": False,
+                    "readonly": True,
+                    "masked": col_name in masked,
+                    "value": "",
+                }
+                continue
+
             fmeta = view.meta.fields_by_name.get(col_name)
             rel_meta = view.meta.relationships_by_name.get(col_name)
             is_ro = (
-                (col_name in readonly or col_name in masked) and mode == "edit"
-            ) or (fmeta is not None and fmeta.primary_key and mode == "edit")
+                col_name in view.resolved_readonly_fields
+                or ((col_name in rbac_readonly or col_name in masked) and mode == "edit")
+                or (fmeta is not None and fmeta.primary_key and mode == "edit")
+            )
+            help_text = view.get_field_help_text(col_name)
+            prepop_sources = view.prepopulated_fields.get(col_name)
+            prepopulate_json = json.dumps(list(prepop_sources)) if prepop_sources else ""
 
             if fmeta is not None:
                 if col_name in masked and mode == "edit":
-                    raw_val = self.auth.mask_field_value(
+                    raw_val: Any = self.auth.mask_field_value(
                         user,
                         view.meta.slug,
                         col_name,
@@ -1833,6 +2164,8 @@ class Deck:
                     raw_val = raw_val.value
                 elif isinstance(raw_val, datetime):
                     raw_val = to_user_timezone(raw_val).strftime("%Y-%m-%dT%H:%M")
+                elif isinstance(raw_val, date):
+                    raw_val = raw_val.isoformat()
                 elif fmeta.field_type == "json" and isinstance(raw_val, (dict, list)):
                     raw_val = json.dumps(raw_val, indent=2)
                 elif fmeta.field_type == "array" and isinstance(raw_val, (list, tuple)):
@@ -1841,6 +2174,10 @@ class Deck:
                 fk_options: list[dict[str, str]] = []
                 fk_search_url: str | None = None
                 fk_current_label = ""
+                fk_target_slug = ""
+                fk_can_create = False
+                fk_can_edit = False
+                fk_can_view = False
                 if fmeta.fk_target_model is not None:
                     fk_options = self._fk_options_for_field(
                         fmeta.fk_target_model,
@@ -1849,7 +2186,27 @@ class Deck:
                     )
                     target_v = self._views_by_model.get(fmeta.fk_target_model)
                     if target_v is not None:
-                        fk_search_url = url_for(f"{self.config.name}.api_fk", slug=target_v.meta.slug)
+                        t_slug = target_v.meta.slug
+                        fk_target_slug = t_slug
+                        fk_search_url = url_for(f"{bp_name}.api_fk", slug=t_slug)
+                        fk_can_view = bool(
+                            target_v.can_view
+                            and self.auth.has_permission(user, f"{t_slug}:view", model_slug=t_slug)
+                        )
+                        fk_can_create = bool(
+                            not is_ro
+                            and not self.config.read_only
+                            and target_v.can_create
+                            and not target_v.file_fields
+                            and self.auth.has_permission(user, f"{t_slug}:create", model_slug=t_slug)
+                        )
+                        fk_can_edit = bool(
+                            not is_ro
+                            and not self.config.read_only
+                            and target_v.can_edit
+                            and not target_v.file_fields
+                            and self.auth.has_permission(user, f"{t_slug}:edit", model_slug=t_slug)
+                        )
                     if raw_val is not None:
                         for opt in fk_options:
                             if opt["id"] == str(raw_val):
@@ -1861,7 +2218,7 @@ class Deck:
                 if file_cfg is not None and obj is not None and raw_val:
                     pk_str_cur = encode_pk(extract_pk(obj, view.meta))
                     media_url = url_for(
-                        f"{self.config.name}.serve_media",
+                        f"{bp_name}.serve_media",
                         slug=view.meta.slug,
                         field_name=col_name,
                         raw_pk=pk_str_cur,
@@ -1881,7 +2238,12 @@ class Deck:
                 )
 
                 widget_override = view.field_widgets.get(col_name, "")
-                is_req = not fmeta.nullable and not fmeta.has_default and not fmeta.autoincrement
+                is_req = (
+                    not is_ro
+                    and not fmeta.nullable
+                    and not fmeta.has_default
+                    and not fmeta.autoincrement
+                )
                 custom_widget_html: Any = None
                 widget_full = False
                 widget_name = widget_override if isinstance(widget_override, str) else ""
@@ -1913,6 +2275,8 @@ class Deck:
                     "media_url": media_url,
                     "show_when_json": show_when_json,
                     "dependent_json": dependent_json,
+                    "help_text": help_text,
+                    "prepopulate_json": prepopulate_json,
                     "name": col_name,
                     "label": view.get_column_label(col_name),
                     "required": is_req,
@@ -1924,27 +2288,113 @@ class Deck:
                     "fk_options": fk_options,
                     "fk_search_url": fk_search_url,
                     "fk_current_label": fk_current_label,
+                    "fk_target_slug": fk_target_slug,
+                    "fk_can_create": fk_can_create,
+                    "fk_can_edit": fk_can_edit,
+                    "fk_can_view": fk_can_view,
                 }
             elif rel_meta is not None and rel_meta.direction == "MANYTOMANY":
-                options = self._fk_options_for_field(
-                    rel_meta.target_model,
-                    limit=100,
-                    fallback_bind_key=view.bind_key,
-                )
+                from flask_deck.introspection import introspect_model
+
+                target_v = self._views_by_model.get(rel_meta.target_model)
+                t_meta = target_v.meta if target_v is not None else introspect_model(rel_meta.target_model)
+                t_bind = target_v.bind_key if target_v is not None else view.bind_key
+                t_sess = self.get_session(t_bind)
+                cnt_stmt = sa.select(sa.func.count()).select_from(rel_meta.target_model)
+                if target_v is not None:
+                    cnt_stmt = target_v.scope_query(cnt_stmt, user)
+                    t_sd = soft_delete_predicate(target_v.meta, target_v.soft_delete_column, trashed=False)
+                    if t_sd is not None:
+                        cnt_stmt = cnt_stmt.where(t_sd)
+                m2m_total = int(t_sess.execute(cnt_stmt).scalar() or 0)
+
+                if view.m2m_mode == "async" and target_v is not None:
+                    m2m_eff_mode = "async"
+                elif view.m2m_mode in {"pills", "dual"}:
+                    m2m_eff_mode = view.m2m_mode
+                elif m2m_total > 250 and target_v is not None:
+                    m2m_eff_mode = "async"
+                elif m2m_total > 30:
+                    m2m_eff_mode = "dual"
+                else:
+                    m2m_eff_mode = "pills"
+
                 selected_ids: set[str] = set()
+                selected_items: list[dict[str, str]] = []
                 if submitted is not None and hasattr(submitted, "getlist"):
                     selected_ids = {str(v) for v in submitted.getlist(col_name) if v}
                 elif obj is not None:
-                    from flask_deck.introspection import introspect_model
-
-                    t_meta = introspect_model(rel_meta.target_model)
                     for item in getattr(obj, col_name, []) or []:
-                        selected_ids.add(encode_pk(extract_pk(item, t_meta)))
+                        sid = encode_pk(extract_pk(item, t_meta))
+                        selected_ids.add(sid)
+                        selected_items.append(
+                            {
+                                "id": sid,
+                                "label": (
+                                    target_v.format_record_repr(item, auth=self.auth, user=user)
+                                    if target_v is not None
+                                    else str(item)
+                                ),
+                            }
+                        )
+
+                options: list[dict[str, str]] = []
+                m2m_search_url: str | None = None
+                if m2m_eff_mode == "async" and target_v is not None:
+                    m2m_search_url = url_for(f"{bp_name}.api_fk", slug=target_v.meta.slug)
+                    if submitted is not None and selected_ids and not selected_items and len(t_meta.primary_keys) == 1:
+                        pk_f = t_meta.primary_keys[0]
+                        from flask_deck.model_view import coerce_form_value
+
+                        typed_ids: list[Any] = []
+                        for s_id in selected_ids:
+                            try:
+                                typed_ids.append(coerce_form_value(s_id, pk_f))
+                            except ValueError:
+                                continue
+                        if typed_ids:
+                            q_stmt = sa.select(rel_meta.target_model).where(
+                                getattr(rel_meta.target_model, pk_f.name).in_(typed_ids)
+                            )
+                            if target_v is not None:
+                                q_stmt = target_v.scope_query(q_stmt, user)
+                            for it in t_sess.scalars(q_stmt).all():
+                                selected_items.append(
+                                    {
+                                        "id": encode_pk(extract_pk(it, t_meta)),
+                                        "label": target_v.format_record_repr(it, auth=self.auth, user=user),
+                                    }
+                                )
+                else:
+                    opt_limit = 250 if m2m_eff_mode == "dual" else 100
+                    options = self._fk_options_for_field(
+                        rel_meta.target_model,
+                        limit=opt_limit,
+                        fallback_bind_key=view.bind_key,
+                    )
+                    seen_opt_ids = {o["id"] for o in options}
+                    for s_it in selected_items:
+                        if s_it["id"] not in seen_opt_ids:
+                            options.insert(0, s_it)
+                            seen_opt_ids.add(s_it["id"])
+
+                m2m_can_create = bool(
+                    target_v is not None
+                    and not is_ro
+                    and not self.config.read_only
+                    and target_v.can_create
+                    and not target_v.file_fields
+                    and self.auth.has_permission(
+                        user, f"{target_v.meta.slug}:create", model_slug=target_v.meta.slug
+                    )
+                )
                 field_specs[col_name] = {
                     "kind": "m2m",
                     "widget": "",
                     "custom_widget_html": None,
-                    "widget_full": False,
+                    "widget_full": True,
+                    "help_text": help_text,
+                    "prepopulate_json": "",
                     "name": col_name,
                     "label": view.get_column_label(col_name),
                     "required": False,
@@ -1952,6 +2402,11 @@ class Deck:
                     "masked": False,
                     "options": options,
                     "selected_ids": selected_ids,
+                    "selected_items": selected_items,
+                    "m2m_mode": m2m_eff_mode,
+                    "m2m_search_url": m2m_search_url,
+                    "m2m_target_slug": target_v.meta.slug if target_v is not None else "",
+                    "m2m_can_create": m2m_can_create,
                 }
 
         # Inline child rows (routed to view.bind_key!)
@@ -1961,23 +2416,17 @@ class Deck:
         )
         for inline in view.inline_views:
             fk_col = inline.resolve_fk_column(view.meta)
-            existing_rows: list[Any] = []
-            if parent_pk is not None:
-                order_col_name = (
-                    inline.order_by
-                    if inline.order_by and inline.order_by in inline.meta.fields_by_name
-                    else inline.meta.primary_keys[0].name
+            inline_target_v = self._views_by_model.get(inline.model)
+            can_open_inline = bool(
+                inline.show_change_link
+                and inline_target_v is not None
+                and self.auth.has_permission(
+                    user,
+                    f"{inline_target_v.meta.slug}:view",
+                    model_slug=inline_target_v.meta.slug,
                 )
-                existing_rows = list(
-                    self.get_session(view.bind_key)
-                    .scalars(
-                        sa.select(inline.model)
-                        .where(getattr(inline.model, fk_col) == parent_pk)
-                        .order_by(getattr(inline.model, order_col_name).asc())
-                    )
-                    .all()
-                )
-            col_specs = []
+            )
+            col_specs: list[dict[str, Any]] = []
             for col in inline.editable_columns:
                 fm = inline.meta.fields_by_name[col]
                 fk_opts = (
@@ -1987,6 +2436,7 @@ class Deck:
                     if fm.fk_target_model is not None
                     else []
                 )
+                fk_t_view = self._views_by_model.get(fm.fk_target_model) if fm.fk_target_model else None
                 col_specs.append(
                     {
                         "name": col,
@@ -1994,23 +2444,149 @@ class Deck:
                         "kind": "fk" if fm.fk_target_model is not None else fm.field_type,
                         "choices": fm.choices,
                         "fk_options": fk_opts,
+                        "fk_search_url": (
+                            url_for(f"{bp_name}.api_fk", slug=fk_t_view.meta.slug)
+                            if fk_t_view is not None
+                            else ""
+                        ),
+                        "required": not fm.nullable and not fm.has_default and not fm.autoincrement,
+                        "help_text": inline.field_help_texts.get(col) or fm.help_text,
                     }
                 )
-            rows_data = []
+
+            prefix = f"inline__{inline.meta.slug}__"
+            has_submitted_inlines = submitted is not None and any(
+                k.startswith(prefix) for k in submitted
+            )
+            rows_data: list[dict[str, Any]] = []
             pk_name = inline.meta.primary_keys[0].name
-            for r in existing_rows:
-                vals: dict[str, Any] = {}
-                for col in inline.editable_columns:
-                    v = getattr(r, col, None)
-                    if isinstance(v, enum.Enum):
-                        v = v.value
-                    vals[col] = "" if v is None else v
-                rows_data.append({"pk": str(getattr(r, pk_name)), "values": vals})
+
+            def _build_change_url(
+                pk_str_val: str,
+                *,
+                _can_open: bool = can_open_inline,
+                _target: ModelView | None = inline_target_v,
+            ) -> str | None:
+                if not _can_open or not pk_str_val or _target is None:
+                    return None
+                ep = (
+                    f"{bp_name}.model_edit"
+                    if self.auth.has_permission(
+                        user,
+                        f"{_target.meta.slug}:edit",
+                        model_slug=_target.meta.slug,
+                    )
+                    and _target.can_edit
+                    else f"{bp_name}.model_detail"
+                )
+                return url_for(ep, slug=_target.meta.slug, raw_pk=pk_str_val)
+
+            if has_submitted_inlines and submitted is not None:
+                sub_indices: set[int] = set()
+                for key in submitted:
+                    if key.startswith(prefix):
+                        part = key[len(prefix) :].split("__", 1)[0]
+                        if part.isdigit():
+                            sub_indices.add(int(part))
+                for idx in sorted(sub_indices):
+                    rp = f"{prefix}{idx}__"
+                    row_pk = str(submitted.get(f"{rp}_pk", "")).strip()
+                    vals: dict[str, Any] = {}
+                    fk_labels: dict[str, str] = {}
+                    for cs in col_specs:
+                        c_name = cs["name"]
+                        if cs["kind"] == "boolean":
+                            vals[c_name] = str(submitted.get(f"{rp}{c_name}", "")).lower() in {
+                                "1",
+                                "true",
+                                "yes",
+                                "on",
+                            }
+                        else:
+                            raw_v = submitted.get(f"{rp}{c_name}", "")
+                            vals[c_name] = "" if raw_v is None else str(raw_v)
+                            if cs["kind"] == "fk" and vals[c_name]:
+                                fk_labels[c_name] = next(
+                                    (o["label"] for o in cs["fk_options"] if o["id"] == str(vals[c_name])),
+                                    str(vals[c_name]),
+                                )
+                    rows_data.append(
+                        {
+                            "pk": row_pk,
+                            "values": vals,
+                            "fk_labels": fk_labels,
+                            "change_url": _build_change_url(row_pk),
+                        }
+                    )
+            else:
+                existing_rows: list[Any] = []
+                if parent_pk is not None:
+                    order_col_name = (
+                        inline.order_by
+                        if inline.order_by and inline.order_by in inline.meta.fields_by_name
+                        else pk_name
+                    )
+                    existing_rows = list(
+                        self.get_session(view.bind_key)
+                        .scalars(
+                            sa.select(inline.model)
+                            .where(getattr(inline.model, fk_col) == parent_pk)
+                            .order_by(getattr(inline.model, order_col_name).asc())
+                        )
+                        .all()
+                    )
+                for r in existing_rows:
+                    vals = {}
+                    fk_labels = {}
+                    row_pk_str = str(getattr(r, pk_name))
+                    for cs in col_specs:
+                        col = cs["name"]
+                        v = getattr(r, col, None)
+                        if isinstance(v, enum.Enum):
+                            v = v.value
+                        elif isinstance(v, datetime):
+                            v = to_user_timezone(v).strftime("%Y-%m-%dT%H:%M")
+                        elif isinstance(v, date):
+                            v = v.isoformat()
+                        if cs["kind"] == "boolean":
+                            vals[col] = bool(v)
+                        else:
+                            vals[col] = "" if v is None else v
+                            if cs["kind"] == "fk" and vals[col] != "":
+                                fk_labels[col] = next(
+                                    (o["label"] for o in cs["fk_options"] if o["id"] == str(vals[col])),
+                                    str(vals[col]),
+                                )
+                    rows_data.append(
+                        {
+                            "pk": row_pk_str,
+                            "values": vals,
+                            "fk_labels": fk_labels,
+                            "change_url": _build_change_url(row_pk_str),
+                        }
+                    )
+
+                desired_extra = inline.extra if mode == "create" else 0
+                target_rows = min(
+                    inline.max_rows,
+                    max(inline.min_num, len(rows_data) + desired_extra),
+                )
+                while inline.can_create and len(rows_data) < target_rows:
+                    blank_vals = {
+                        cs["name"]: (False if cs["kind"] == "boolean" else "") for cs in col_specs
+                    }
+                    rows_data.append(
+                        {"pk": "", "values": blank_vals, "fk_labels": {}, "change_url": None}
+                    )
 
             inlines_ctx.append(
                 {
                     "slug": inline.meta.slug,
                     "label": inline.display_label,
+                    "layout": inline.layout,
+                    "min_num": inline.min_num,
+                    "extra": inline.extra,
+                    "show_change_link": inline.show_change_link,
                     "columns": col_specs,
                     "rows": rows_data,
                     "can_create": inline.can_create,

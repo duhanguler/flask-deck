@@ -6,22 +6,60 @@
 
   const bulkDock = document.getElementById("dk-bulk-dock");
   const bulkCountEl = document.getElementById("dk-bulk-count");
+  const selectAcrossBar = document.getElementById("dk-select-across-bar");
+  const selectAcrossBtn = document.getElementById("dk-select-across-btn");
+  const selectAcrossMsg = document.getElementById("dk-select-across-msg");
+  const selectAcrossTotal = selectAcrossBar ? Number(selectAcrossBar.getAttribute("data-total") || "0") : 0;
+  const selectAcrossPageCount = selectAcrossBar ? Number(selectAcrossBar.getAttribute("data-page-count") || "0") : 0;
+  const selectAcrossToken = selectAcrossBar ? (selectAcrossBar.getAttribute("data-slice-token") || "") : "";
+  let selectAcrossActive = false;
 
   function selectedPks() {
     return Array.from(document.querySelectorAll("[data-deck-row-check]:checked")).map((cb) => cb.value);
   }
+  function updateSelectAcrossUI(pks) {
+    if (!selectAcrossBar) return;
+    const allChecked = selectAcrossPageCount > 0 && pks.length === selectAcrossPageCount && selectAcrossTotal > selectAcrossPageCount;
+    if (!allChecked) selectAcrossActive = false;
+    selectAcrossBar.hidden = !allChecked;
+    if (selectAcrossMsg && selectAcrossBtn) {
+      if (selectAcrossActive) {
+        selectAcrossMsg.textContent = "All " + selectAcrossTotal.toLocaleString() + " matching records across pages are selected.";
+        selectAcrossBtn.textContent = "Clear full selection";
+      } else {
+        selectAcrossMsg.textContent = "All " + selectAcrossPageCount + " records on this page are selected.";
+        selectAcrossBtn.textContent = "Select all " + selectAcrossTotal.toLocaleString() + " matching records";
+      }
+    }
+  }
   function syncBulkDock() {
     if (!bulkDock) return;
     const pks = selectedPks();
-    bulkDock.hidden = pks.length === 0;
-    if (bulkCountEl) bulkCountEl.textContent = pks.length + " selected";
+    updateSelectAcrossUI(pks);
+    bulkDock.hidden = pks.length === 0 && !selectAcrossActive;
+    if (bulkCountEl) {
+      bulkCountEl.textContent = selectAcrossActive
+        ? selectAcrossTotal.toLocaleString() + " matching selected"
+        : pks.length + " selected";
+    }
     document.querySelectorAll("[data-deck-row-check]").forEach((cb) => {
       const tr = cb.closest("tr");
       if (tr) tr.classList.toggle("is-selected", cb.checked);
     });
     document.querySelectorAll("[data-deck-export-selected]").forEach((a) => {
-      const base = a.getAttribute("data-base-href") || "";
-      a.setAttribute("href", base + (base.includes("?") ? "&" : "?") + "ids=" + encodeURIComponent(pks.join(",")));
+      if (selectAcrossActive && selectAcrossToken) {
+        const filtBase = a.getAttribute("data-base-filtered-href") || a.getAttribute("data-base-href") || "";
+        a.setAttribute("href", filtBase + (filtBase.includes("?") ? "&" : "?") + "select_across=1&slice_token=" + encodeURIComponent(selectAcrossToken));
+      } else {
+        const base = a.getAttribute("data-base-href") || "";
+        a.setAttribute("href", base + (base.includes("?") ? "&" : "?") + "ids=" + encodeURIComponent(pks.join(",")));
+      }
+    });
+  }
+  if (selectAcrossBtn) {
+    selectAcrossBtn.addEventListener("click", () => {
+      selectAcrossActive = !selectAcrossActive;
+      syncBulkDock();
     });
   }
 
@@ -30,11 +68,26 @@
     if (!form) return;
     form.action = actionUrl;
     form.querySelectorAll('input:not([name="_csrf_token"])').forEach((n) => n.remove());
-    selectedPks().forEach((pk) => {
-      const h = document.createElement("input");
-      h.type = "hidden"; h.name = "selected_pks"; h.value = pk;
-      form.appendChild(h);
-    });
+    const retQs = form.getAttribute("data-return-qs") || "";
+    if (retQs) {
+      const r = document.createElement("input");
+      r.type = "hidden"; r.name = "_return_qs"; r.value = retQs;
+      form.appendChild(r);
+    }
+    if (selectAcrossActive && selectAcrossToken) {
+      const sa = document.createElement("input");
+      sa.type = "hidden"; sa.name = "select_across"; sa.value = "1";
+      const tk = document.createElement("input");
+      tk.type = "hidden"; tk.name = "slice_token"; tk.value = selectAcrossToken;
+      form.appendChild(sa);
+      form.appendChild(tk);
+    } else {
+      selectedPks().forEach((pk) => {
+        const h = document.createElement("input");
+        h.type = "hidden"; h.name = "selected_pks"; h.value = pk;
+        form.appendChild(h);
+      });
+    }
     if (confirmText) {
       const c = document.createElement("input");
       c.type = "hidden"; c.name = "confirm_text"; c.value = confirmText;
@@ -236,9 +289,69 @@
     sel.addEventListener("focus", () => sel.setAttribute("data-prev-val", sel.value));
   });
 
+  const filterPanel = document.getElementById("dk-filter-panel");
+  function hydrateFilterFacets() {
+    if (!filterPanel || filterPanel.hidden) return;
+    if (filterPanel.getAttribute("data-facets-loaded") === "1") return;
+    const facetsUrl = filterPanel.getAttribute("data-facets-url") || "";
+    if (!facetsUrl) return;
+    filterPanel.setAttribute("data-facets-loaded", "1");
+    fetch(facetsUrl + (window.location.search || ""), { headers: { Accept: "application/json" } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data || !data.facets) return;
+        Object.entries(data.facets).forEach(([fieldKey, counts]) => {
+          const sel = filterPanel.querySelector('select[data-facet-field="' + CSS.escape(fieldKey) + '"]');
+          if (!sel || !counts) return;
+          Array.from(sel.options).forEach((opt) => {
+            const base = opt.getAttribute("data-facet-base");
+            if (!base || !opt.value) return;
+            if (Object.prototype.hasOwnProperty.call(counts, opt.value)) {
+              opt.textContent = base + " (" + counts[opt.value] + ")";
+            }
+          });
+        });
+      })
+      .catch(() => { filterPanel.removeAttribute("data-facets-loaded"); });
+  }
+  if (filterPanel && !filterPanel.hidden) hydrateFilterFacets();
+
   document.addEventListener("click", (e) => {
     const t = e.target;
     if (!(t instanceof Element)) return;
+
+    const filterToggle = t.closest('[data-deck-toggle="dk-filter-panel"]');
+    if (filterToggle) {
+      window.setTimeout(hydrateFilterFacets, 0);
+      return;
+    }
+
+    const sortLink = t.closest("a[data-sort-col]");
+    if (sortLink && e.shiftKey) {
+      e.preventDefault();
+      const col = sortLink.getAttribute("data-sort-col") || "";
+      if (!col) return;
+      const curRaw = sortLink.getAttribute("data-sort-active") || "";
+      const specs = curRaw
+        ? curRaw.split(",").map((s) => s.trim().split(":")).filter((p) => p[0]).map((p) => [p[0], p[1] === "asc" ? "asc" : "desc"])
+        : [];
+      const idx = specs.findIndex((p) => p[0] === col);
+      if (idx >= 0) {
+        specs[idx][1] = specs[idx][1] === "desc" ? "asc" : "desc";
+      } else {
+        if (specs.length >= 3) specs.shift();
+        specs.push([col, "desc"]);
+      }
+      const nextSort = specs.map((p) => p[0] + ":" + p[1]).join(",");
+      const url = new URL(window.location.href);
+      url.searchParams.set("sort", nextSort);
+      url.searchParams.delete("dir");
+      url.searchParams.set("page", "1");
+      url.searchParams.delete("after");
+      url.searchParams.delete("before");
+      window.location.assign(url.toString());
+      return;
+    }
 
     const saveViewBtn = t.closest("[data-deck-save-view]");
     if (saveViewBtn) {
@@ -270,17 +383,29 @@
       const label = bulkBtn.getAttribute("data-label") || "Execute Action";
       const needConfirm = bulkBtn.getAttribute("data-confirm") === "true";
       const phraseTpl = bulkBtn.getAttribute("data-confirm-phrase") || "";
+      const impactUrl = bulkBtn.getAttribute("data-impact-url") || "";
+      const impactForce = bulkBtn.getAttribute("data-impact-force") === "true";
       const rawFields = bulkBtn.getAttribute("data-action-fields") || "";
       let fields = [];
       if (rawFields) { try { fields = JSON.parse(rawFields); } catch (_) {} }
-      const count = selectedPks().length;
+      const pks = selectedPks();
+      const count = selectAcrossActive ? selectAcrossTotal : pks.length;
       const phrase = phraseTpl ? phraseTpl.replace("{n}", String(count)) : "";
-      if (needConfirm || phrase || fields.length) {
+      if (needConfirm || phrase || fields.length || impactUrl) {
         D.openConfirm({
           title: label,
-          message: "Apply '" + label + "' to " + count + " selected record(s)?",
+          message: "Apply '" + label + "' to " + count.toLocaleString() + " selected record(s)?",
           phrase,
           fields,
+          impactUrl,
+          impactBody: impactUrl
+            ? {
+                pks: selectAcrossActive ? [] : pks,
+                select_across: selectAcrossActive,
+                slice_token: selectAcrossActive ? selectAcrossToken : "",
+                force: impactForce,
+              }
+            : null,
           onConfirm: (txt, extras) => submitBulkAction(url, txt, extras),
         });
       } else {
@@ -292,6 +417,12 @@
   document.addEventListener("change", (e) => {
     const t = e.target;
     if (!(t instanceof Element)) return;
+    if (t.matches("[data-deck-page-size]")) {
+      const opt = t.options && t.selectedIndex >= 0 ? t.options[t.selectedIndex] : null;
+      const href = opt ? opt.getAttribute("data-href") : "";
+      if (href) window.location.assign(href);
+      return;
+    }
     if (t.matches("[data-deck-select-all]")) { document.querySelectorAll("[data-deck-row-check]").forEach((cb) => { cb.checked = t.checked; }); syncBulkDock(); return; }
     if (t.matches("[data-deck-row-check]")) { syncBulkDock(); return; }
     if (t.matches("[data-deck-quick-select]")) {

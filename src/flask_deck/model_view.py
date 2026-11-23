@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import hashlib
+import inspect
 import json
 import math
 import uuid
@@ -13,12 +14,13 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, ClassVar, Literal
 
 import sqlalchemy as sa
-from markupsafe import Markup
+from markupsafe import Markup, escape
 from sqlalchemy.orm import Session
 
 from flask_deck.audit import compute_diff, serialize_audit_value
 from flask_deck.auth import AuthProvider, DeckUser
 from flask_deck.exceptions import PermissionDeniedError, ValidationError
+from flask_deck.filters import resolve_custom_filters
 from flask_deck.formatters import (
     BadgeFormatter,
     BooleanIconFormatter,
@@ -27,6 +29,7 @@ from flask_deck.formatters import (
     Formatter,
     ImageFormatter,
     RelativeTimeFormatter,
+    normalize_tone,
 )
 from flask_deck.i18n import from_user_timezone
 from flask_deck.introspection import FieldMeta, ModelMeta, humanize, introspect_model
@@ -34,6 +37,64 @@ from flask_deck.query import CountMode, PaginationMode, QuickTab
 from flask_deck.security import check_json_depth, is_safe_display_url, is_sensitive_field
 from flask_deck.storage import FileFieldConfig, store_validated_upload
 from flask_deck.widgets import FormWidget
+
+
+@dataclass(frozen=True, slots=True)
+class DisplaySpec:
+    """Metadata attached to a ModelView computed display method via ``@display``."""
+
+    name: str
+    label: str
+    handler_name: str
+    ordering: str | Callable[[type[Any]], Any] | None = None
+    boolean: bool = False
+    tone: str | Mapping[str, str] | None = None
+    description: str = ""
+    empty_value: str | None = None
+
+
+def display(
+    *,
+    label: str | None = None,
+    ordering: str | Callable[[type[Any]], Any] | None = None,
+    boolean: bool = False,
+    tone: str | Mapping[str, str] | None = None,
+    description: str = "",
+    empty_value: str | None = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorator marking a ModelView method as a computed display column / form preview."""
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        target_fn = func.__func__ if isinstance(func, staticmethod) else func
+        spec = DisplaySpec(
+            name=target_fn.__name__,
+            label=label or humanize(target_fn.__name__),
+            handler_name=target_fn.__name__,
+            ordering=ordering,
+            boolean=boolean,
+            tone=tone,
+            description=description,
+            empty_value=empty_value,
+        )
+        target_fn._deck_display_spec = spec  # type: ignore[attr-defined]
+        return func
+
+    return decorator
+
+
+FieldRow = str | tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Fieldset:
+    """Structured declarative form fieldset with optional horizontal rows & collapse."""
+
+    title: str
+    fields: tuple[FieldRow, ...]
+    description: str = ""
+    collapsible: bool = False
+    collapsed: bool = False
+    icon: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +221,12 @@ class InlineModelView:
     can_edit: ClassVar[bool] = True
     can_delete: ClassVar[bool] = True
     max_rows: ClassVar[int] = 50
+    # v0.5.0 Beyond-Django Inline upgrades
+    layout: ClassVar[Literal["tabular", "stacked"]] = "tabular"
+    min_num: ClassVar[int] = 0
+    extra: ClassVar[int] = 0
+    show_change_link: ClassVar[bool] = True
+    field_help_texts: ClassVar[Mapping[str, str]] = {}
 
     def __init__(self, extra_sensitive_patterns: Sequence[Any] = ()) -> None:
         self.meta: ModelMeta = introspect_model(
@@ -376,7 +443,7 @@ class ModelView:
 
     form_columns: ClassVar[Sequence[str]] = ()
     form_excluded_columns: ClassVar[Sequence[str]] = ()
-    fieldsets: ClassVar[Sequence[tuple[str, Sequence[str]]]] = ()
+    fieldsets: ClassVar[Sequence[Fieldset | tuple[str, Sequence[FieldRow]]]] = ()
     column_labels: ClassVar[Mapping[str, str]] = {}
     column_formatters: ClassVar[Mapping[str, Formatter | Callable[[Any, Any], Markup | str]]] = {}
     column_badges: ClassVar[Mapping[str, Mapping[str, str]]] = {}
@@ -420,6 +487,21 @@ class ModelView:
     tree_parent_field: ClassVar[str | None] = None
     tree_title_field: ClassVar[str | None] = None
     aggregate_scope: ClassVar[Literal["page", "all"]] = "page"
+    # v0.5.0 Beyond-Django capabilities
+    readonly_fields: ClassVar[Sequence[str]] = ()
+    field_help_texts: ClassVar[Mapping[str, str]] = {}
+    search_help_text: ClassVar[str] = ""
+    empty_value_display: ClassVar[str] = "—"
+    view_on_site: ClassVar[str | Callable[..., str | None] | None] = None
+    prepopulated_fields: ClassVar[Mapping[str, Sequence[str]]] = {}
+    save_as: ClassVar[bool] = False
+    preserve_filters: ClassVar[bool] = True
+    date_hierarchy: ClassVar[str | None] = None
+    custom_filters: ClassVar[Sequence[Any]] = ()
+    show_facets: ClassVar[Literal["auto", "always", "never"]] = "auto"
+    page_size_options: ClassVar[tuple[int, ...]] = (25, 50, 100)
+    list_max_show_all: ClassVar[int] = 200
+    m2m_mode: ClassVar[Literal["auto", "pills", "dual", "async"]] = "auto"
 
     can_view: bool = True
     can_create: bool = True
@@ -450,13 +532,39 @@ class ModelView:
 
         excluded = set(self.exclude_columns) | set(self.meta.sensitive_fields)
 
+        # Discover @display methods and @action methods first so column/sortable checks can see them.
+        discovered_displays: dict[str, DisplaySpec] = {}
+        discovered_actions: dict[str, ActionSpec] = {}
+        for cls in reversed(self.__class__.__mro__):
+            for attr_val in cls.__dict__.values():
+                target_fn = attr_val.__func__ if isinstance(attr_val, staticmethod) else attr_val
+                d_spec: DisplaySpec | None = getattr(target_fn, "_deck_display_spec", None)
+                if d_spec is not None and d_spec.name not in excluded:
+                    discovered_displays[d_spec.name] = d_spec
+                a_spec: ActionSpec | None = getattr(target_fn, "_deck_action_spec", None)
+                if a_spec is not None:
+                    discovered_actions[a_spec.name] = a_spec
+        self.display_fields: dict[str, DisplaySpec] = discovered_displays
+        self.actions: dict[str, ActionSpec] = discovered_actions
+
+        def _is_model_attr(name: str) -> bool:
+            if name.startswith("_") or name in excluded:
+                return False
+            attr = getattr(self.model, name, None)
+            return attr is not None and not callable(attr)
+
         # Compute frozen column lists once at registration (zero per-request reflection).
         if self.columns:
             self.list_columns: tuple[str, ...] = tuple(
                 c
                 for c in self.columns
                 if c not in excluded
-                and (c in self.meta.fields_by_name or c in self.meta.relationships_by_name)
+                and (
+                    c in self.meta.fields_by_name
+                    or c in self.meta.relationships_by_name
+                    or c in self.display_fields
+                    or _is_model_attr(c)
+                )
             )
         else:
             default_cols: list[str] = []
@@ -486,20 +594,24 @@ class ModelView:
                 and not f.is_heavy
             )[:4]
 
+        def _is_valid_dotted_rel_col(spec_col: str) -> bool:
+            if "." not in spec_col:
+                return False
+            rel_name, target_col = spec_col.split(".", 1)
+            rel_m = self.meta.relationships_by_name.get(rel_name)
+            return bool(
+                rel_m is not None
+                and rel_m.direction == "MANYTOONE"
+                and rel_name not in self.meta.sensitive_fields
+                and not is_sensitive_field(target_col, extra_sensitive_patterns)
+            )
+
         if self.filterable_columns:
             resolved_filt: set[str] = set()
             for c in self.filterable_columns:
-                if "." in c:
-                    rel_name, target_col = c.split(".", 1)
-                    rel_m = self.meta.relationships_by_name.get(rel_name)
-                    if (
-                        rel_m is not None
-                        and rel_m.direction == "MANYTOONE"
-                        and rel_name not in self.meta.sensitive_fields
-                        and not is_sensitive_field(target_col, extra_sensitive_patterns)
-                    ):
-                        resolved_filt.add(c)
-                elif c in self.meta.fields_by_name and c not in self.meta.sensitive_fields:
+                if _is_valid_dotted_rel_col(c) or (
+                    c in self.meta.fields_by_name and c not in self.meta.sensitive_fields
+                ):
                     resolved_filt.add(c)
             self.resolved_filterable: frozenset[str] = frozenset(resolved_filt)
         else:
@@ -510,29 +622,58 @@ class ModelView:
                 or f.fk_target_table is not None
             )
 
+        def _is_sortable_display(col_name: str) -> bool:
+            d_spec = self.display_fields.get(col_name)
+            if d_spec is None or d_spec.ordering is None:
+                return False
+            if isinstance(d_spec.ordering, str):
+                if "." in d_spec.ordering:
+                    return _is_valid_dotted_rel_col(d_spec.ordering)
+                return (
+                    d_spec.ordering in self.meta.fields_by_name
+                    and d_spec.ordering not in self.meta.sensitive_fields
+                )
+            return callable(d_spec.ordering)
+
         if self.sortable_columns:
-            self.resolved_sortable: frozenset[str] = frozenset(
-                c
-                for c in self.sortable_columns
-                if c in self.meta.fields_by_name and c not in self.meta.sensitive_fields
-            )
+            resolved_sort: set[str] = set()
+            for c in self.sortable_columns:
+                if (
+                    (c in self.meta.fields_by_name and c not in self.meta.sensitive_fields)
+                    or _is_valid_dotted_rel_col(c)
+                    or _is_sortable_display(c)
+                ):
+                    resolved_sort.add(c)
+            self.resolved_sortable: frozenset[str] = frozenset(resolved_sort)
         else:
-            self.resolved_sortable = frozenset(
+            auto_sort = {
                 f.name
                 for f in self.meta.fields
                 if not f.is_heavy and not f.is_sensitive and f.field_type != "binary"
-            )
+            }
+            for d_name in self.display_fields:
+                if _is_sortable_display(d_name):
+                    auto_sort.add(d_name)
+            self.resolved_sortable = frozenset(auto_sort)
 
         self.resolved_inline_editable: frozenset[str] = frozenset(
             c
             for c in self.inline_editable_columns
             if c in self.meta.fields_by_name
-            and self.meta.fields_by_name[c].field_type
-            in {"boolean", "enum", "string", "integer", "float", "decimal", "date"}
             and not self.meta.fields_by_name[c].primary_key
             and not self.meta.fields_by_name[c].is_computed
-            and self.meta.fields_by_name[c].fk_target_model is None
             and c not in self.meta.sensitive_fields
+            and (
+                self.meta.fields_by_name[c].field_type
+                in {"boolean", "enum", "string", "integer", "float", "decimal", "date"}
+                or (
+                    self.meta.fields_by_name[c].fk_target_model is not None
+                    and self.meta.fields_by_name[c].field_type in {"integer", "string", "uuid"}
+                )
+            )
+        )
+        self.resolved_readonly_fields: frozenset[str] = frozenset(self.readonly_fields) | frozenset(
+            self.display_fields.keys()
         )
         self.resolved_calendar_field: str | None = (
             self.calendar_date_field
@@ -584,6 +725,32 @@ class ModelView:
                     auto_form.append(rel.name)
             self.resolved_form_fields = tuple(auto_form)
 
+        # Ensure declarative readonly_fields & @display previews declared in readonly/fieldsets appear in forms
+        base_form_list = list(auto_form) if not self.form_columns else list(self.resolved_form_fields)
+        # Re-read using actual resolved_form_fields before extending
+        base_form_set = set(base_form_list)
+        extra_ro_candidates: list[str] = list(self.readonly_fields)
+        for fs in self.fieldsets:
+            fs_rows = fs.fields if isinstance(fs, Fieldset) else fs[1]
+            for row_item in fs_rows:
+                cols_in_item = row_item if isinstance(row_item, (tuple, list)) else (row_item,)
+                for col_candidate in cols_in_item:
+                    if col_candidate in self.display_fields or col_candidate in self.readonly_fields:
+                        extra_ro_candidates.append(col_candidate)
+        for c in extra_ro_candidates:
+            if (
+                c not in base_form_set
+                and c not in form_excluded
+                and (
+                    c in self.meta.fields_by_name
+                    or c in self.meta.relationships_by_name
+                    or c in self.display_fields
+                )
+            ):
+                base_form_list.append(c)
+                base_form_set.add(c)
+        self.resolved_form_fields = tuple(base_form_list)
+
         # Formatters: merge user formatters + column_badges + sensible smart defaults.
         self._formatters: dict[str, Formatter | Callable[[Any, Any], Markup | str]] = {}
         for f in self.meta.fields:
@@ -610,15 +777,7 @@ class ModelView:
             inline_cls(extra_sensitive_patterns=extra_sensitive_patterns)
             for inline_cls in self.inlines
         )
-
-        # Discover @action methods declared on this class or subclasses.
-        discovered_actions: dict[str, ActionSpec] = {}
-        for cls in reversed(self.__class__.__mro__):
-            for attr_val in cls.__dict__.values():
-                spec: ActionSpec | None = getattr(attr_val, "_deck_action_spec", None)
-                if spec is not None:
-                    discovered_actions[spec.name] = spec
-        self.actions: dict[str, ActionSpec] = discovered_actions
+        self.resolved_custom_filters = resolve_custom_filters(self.custom_filters)
 
         # Export & import allowlists (never expose sensitive fields by default).
         if self.export_columns:
@@ -656,11 +815,143 @@ class ModelView:
     def get_column_label(self, col_name: str) -> str:
         if col_name in self.column_labels:
             return self.column_labels[col_name]
+        if col_name in self.display_fields:
+            return self.display_fields[col_name].label
         if col_name in self.meta.fields_by_name:
             return self.meta.fields_by_name[col_name].label
         if col_name in self.meta.relationships_by_name:
             return self.meta.relationships_by_name[col_name].label
         return humanize(col_name)
+
+    def get_field_help_text(self, col_name: str) -> str:
+        if col_name in self.field_help_texts:
+            return self.field_help_texts[col_name]
+        if col_name in self.display_fields and self.display_fields[col_name].description:
+            return self.display_fields[col_name].description
+        fmeta = self.meta.fields_by_name.get(col_name)
+        return fmeta.help_text if fmeta is not None else ""
+
+    def get_view_on_site_url(self, obj: Any) -> str | None:
+        """Resolve and validate ``view_on_site`` for ``obj`` (rejects unsafe URL schemes)."""
+        raw_spec: Any = None
+        if "view_on_site" in self.__dict__:
+            raw_spec = self.__dict__["view_on_site"]
+        else:
+            for cls in self.__class__.__mro__:
+                if "view_on_site" in cls.__dict__:
+                    raw_spec = cls.__dict__["view_on_site"]
+                    break
+        if raw_spec is None:
+            return None
+        candidate: str | None = None
+        if isinstance(raw_spec, staticmethod):
+            candidate = raw_spec.__func__(obj)
+        elif callable(raw_spec):
+            try:
+                sig = inspect.signature(raw_spec)
+                n_params = len(sig.parameters)
+                first_name = next(iter(sig.parameters), "")
+                if first_name == "self" or n_params >= 2:
+                    candidate = raw_spec(self, obj)
+                else:
+                    candidate = raw_spec(obj)
+            except (TypeError, ValueError):
+                candidate = raw_spec(obj)
+        elif isinstance(raw_spec, str):
+            vals: dict[str, Any] = {
+                f.name: getattr(obj, f.name, "") for f in self.meta.fields if not f.is_sensitive
+            }
+            if len(self.meta.primary_keys) == 1:
+                vals.setdefault("pk", getattr(obj, self.meta.primary_keys[0].name, ""))
+            with contextlib.suppress(KeyError, ValueError, TypeError):
+                candidate = raw_spec.format_map(vals)
+        if not candidate or not isinstance(candidate, str):
+            return None
+        clean = candidate.strip()
+        return clean if is_safe_display_url(clean) else None
+
+    def resolve_fieldsets(
+        self,
+        visible_fields: Sequence[str],
+        errors: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Normalize legacy ``(title, cols)`` and ``Fieldset(...)`` into structured row groups."""
+        vis_set = set(visible_fields)
+        err_map = errors or {}
+        out: list[dict[str, Any]] = []
+        used: set[str] = set()
+
+        if self.fieldsets:
+            for entry in self.fieldsets:
+                raw_rows: Sequence[FieldRow]
+                if isinstance(entry, Fieldset):
+                    title = entry.title
+                    raw_rows = entry.fields
+                    desc = entry.description
+                    collapsible = entry.collapsible
+                    collapsed = entry.collapsed
+                    icon = entry.icon
+                else:
+                    title, raw_rows = entry[0], entry[1]
+                    desc = ""
+                    collapsible = False
+                    collapsed = False
+                    icon = None
+                rows: list[list[str]] = []
+                flat: list[str] = []
+                for item in raw_rows:
+                    if isinstance(item, (tuple, list)):
+                        row_cols = [c for c in item if c in vis_set and c not in used]
+                    else:
+                        row_cols = [item] if (item in vis_set and item not in used) else []
+                    if row_cols:
+                        rows.append(row_cols)
+                        flat.extend(row_cols)
+                        used.update(row_cols)
+                if rows:
+                    has_err = any(bool(err_map.get(c)) for c in flat)
+                    out.append(
+                        {
+                            "title": title,
+                            "description": desc,
+                            "collapsible": collapsible,
+                            "collapsed": bool(collapsed and not has_err),
+                            "has_errors": has_err,
+                            "icon": icon,
+                            "rows": rows,
+                            "flat_cols": flat,
+                        }
+                    )
+            remaining = [c for c in visible_fields if c not in used]
+            if remaining:
+                has_rem_err = any(bool(err_map.get(c)) for c in remaining)
+                out.append(
+                    {
+                        "title": "Additional Fields",
+                        "description": "",
+                        "collapsible": False,
+                        "collapsed": False,
+                        "has_errors": has_rem_err,
+                        "icon": None,
+                        "rows": [[c] for c in remaining],
+                        "flat_cols": remaining,
+                    }
+                )
+        else:
+            vis_list = list(visible_fields)
+            out.append(
+                {
+                    "title": f"{self.label} Details",
+                    "description": "",
+                    "collapsible": False,
+                    "collapsed": False,
+                    "has_errors": any(bool(err_map.get(c)) for c in vis_list),
+                    "icon": None,
+                    "rows": [[c] for c in vis_list],
+                    "flat_cols": vis_list,
+                }
+            )
+        return out
 
     def format_record_repr(
         self,
@@ -723,12 +1014,14 @@ class ModelView:
     ) -> tuple[str, ...]:
         """Strict allowlist of writable form fields (mass-assignment barrier)."""
         hidden = auth.hidden_fields_for(user, self.meta.slug)
-        readonly = auth.readonly_fields_for(user, self.meta.slug)
+        rbac_readonly = auth.readonly_fields_for(user, self.meta.slug)
         allowed: list[str] = []
         for col in self.resolved_form_fields:
             if col in hidden or col in self.meta.sensitive_fields:
                 continue
-            if mode == "edit" and col in readonly:
+            if col in self.resolved_readonly_fields:
+                continue
+            if mode == "edit" and col in rbac_readonly:
                 continue
             fmeta = self.meta.fields_by_name.get(col)
             if mode == "edit" and fmeta is not None and fmeta.primary_key:
@@ -751,11 +1044,19 @@ class ModelView:
         rel_repr: Callable[[type[Any], Any], str] | None = None,
         rel_url_builder: Callable[[type[Any], Any], str | None] | None = None,
     ) -> Markup | str:
-        """Format one table/detail cell with RBAC field masking and XSS-safe output."""
-        raw_val = getattr(obj, col_name, None)
+        """Format one table/detail cell with @display support, RBAC field masking, and XSS-safe output."""
+        d_spec = self.display_fields.get(col_name)
+        raw_val = getattr(self, d_spec.handler_name)(obj) if d_spec is not None else getattr(obj, col_name, None)
+
         if col_name in auth.masked_fields_for(user, self.meta.slug):
             masked = auth.mask_field_value(user, self.meta.slug, col_name, raw_val)
-            return Markup(f'<span class="dk-masked">{Markup.escape(str(masked or "—"))}</span>')
+            return Markup(f'<span class="dk-masked">{Markup.escape(str(masked or self.empty_value_display))}</span>')
+
+        empty_marker = (
+            d_spec.empty_value
+            if (d_spec is not None and d_spec.empty_value is not None)
+            else self.empty_value_display
+        )
 
         formatter = self._formatters.get(col_name)
         if formatter is not None:
@@ -765,10 +1066,28 @@ class ModelView:
                 return formatter.format(raw_val, obj)
             return formatter(raw_val, obj)
 
+        if d_spec is not None:
+            if raw_val is None:
+                return Markup(f'<span class="dk-null">{escape(empty_marker)}</span>')
+            if d_spec.boolean:
+                return BooleanIconFormatter().format(raw_val, obj)
+            if isinstance(d_spec.tone, Mapping):
+                return BadgeFormatter(d_spec.tone).format(raw_val, obj)
+            if isinstance(d_spec.tone, str) and d_spec.tone:
+                tone_cls = normalize_tone(d_spec.tone)
+                return Markup(
+                    f'<span class="dk-badge dk-badge-{tone_cls}">'
+                    f'<span class="dk-dot" aria-hidden="true"></span>'
+                    f"{escape(str(raw_val))}</span>"
+                )
+            if isinstance(raw_val, Markup):
+                return raw_val
+            return str(raw_val)
+
         rel_meta = self.meta.relationships_by_name.get(col_name)
         if rel_meta is not None:
             if raw_val is None:
-                return Markup('<span class="dk-null">—</span>')
+                return Markup(f'<span class="dk-null">{escape(empty_marker)}</span>')
 
             def _fmt_rel_item(item: Any) -> str:
                 if rel_repr is not None:
@@ -787,7 +1106,7 @@ class ModelView:
             if rel_meta.uselist:
                 items = list(raw_val)
                 if not items:
-                    return Markup('<span class="dk-null">—</span>')
+                    return Markup(f'<span class="dk-null">{escape(empty_marker)}</span>')
                 chips = "".join(_render_rel_badge(item, chip=True) for item in items[:3])
                 extra = (
                     f'<span class="dk-muted dk-mono">+{len(items) - 3}</span>'
@@ -798,11 +1117,11 @@ class ModelView:
             return Markup(_render_rel_badge(raw_val, chip=False))
 
         if raw_val is None:
-            return Markup('<span class="dk-null">—</span>')
+            return Markup(f'<span class="dk-null">{escape(empty_marker)}</span>')
         fmeta = self.meta.fields_by_name.get(col_name)
         if fmeta is not None and fmeta.field_type == "array" and isinstance(raw_val, (list, tuple)):
             if not raw_val:
-                return Markup('<span class="dk-null">—</span>')
+                return Markup(f'<span class="dk-null">{escape(empty_marker)}</span>')
             chips = "".join(f'<span class="dk-chip">{Markup.escape(str(it))}</span>' for it in raw_val[:4])
             extra = (
                 f'<span class="dk-muted dk-mono">+{len(raw_val) - 4}</span>'
@@ -1161,6 +1480,8 @@ class ModelView:
                 for row in existing_rows:
                     existing_by_pk[getattr(row, child_pk_field.name)] = row
 
+            existing_surviving_pks = set(existing_by_pk.keys())
+            created_count = 0
             errors: dict[str, list[str]] = {}
             for idx in sorted(row_indices):
                 row_prefix = f"{prefix}{idx}__"
@@ -1194,6 +1515,7 @@ class ModelView:
                         ):
                             raise PermissionDeniedError("Not authorized to delete inline items.")
                         session.delete(child_obj)
+                        existing_surviving_pks.discard(typed_pk)
                         events.append((inline, "delete", child_obj, before_snap, typed_pk))
                         continue
                     if not inline.can_edit or not auth.has_permission(
@@ -1223,10 +1545,14 @@ class ModelView:
                     before_snap = {}
                     op_kind = "create"
                     recorded_pk = None
+                    created_count += 1
 
                 for col in inline.editable_columns:
                     fmeta = inline.meta.fields_by_name[col]
-                    raw_val = form_data.get(f"{row_prefix}{col}")
+                    if fmeta.field_type == "boolean":
+                        raw_val: Any = form_data.get(f"{row_prefix}{col}", "false")
+                    else:
+                        raw_val = form_data.get(f"{row_prefix}{col}")
                     try:
                         val = coerce_form_value(raw_val, fmeta, max_json_depth=max_json_depth)
                         setattr(target_obj, col, val)
@@ -1235,6 +1561,11 @@ class ModelView:
 
                 if op_kind in {"create", "edit"}:
                     events.append((inline, op_kind, target_obj, before_snap, recorded_pk))
+
+            if inline.min_num > 0 and (len(existing_surviving_pks) + created_count) < inline.min_num:
+                errors.setdefault(inline.meta.slug, []).append(
+                    f"At least {inline.min_num} {inline.display_label.lower()} row(s) required."
+                )
 
             if errors:
                 raise ValidationError(errors)

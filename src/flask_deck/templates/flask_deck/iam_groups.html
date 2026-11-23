@@ -1,0 +1,173 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("Groups & Roles") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ _("Permission Groups & 4-Level RBAC") }}</h1>
+    <p class="dk-page-sub">Configure visual model CRUD/ops permissions alongside field-level hidden, read-only, and masked guards.</p>
+  </div>
+  <div class="dk-page-actions">
+    <a href="{{ url_for(bp_name ~ '.security_iam_users') }}" class="dk-btn">{{ deck_icon("users", 13) }} Users</a>
+    {% if can_view_rbac %}
+    <a href="{{ url_for(bp_name ~ '.rbac_matrix') }}" class="dk-btn">{{ deck_icon("shield", 13) }} Live RBAC Matrix</a>
+    {% endif %}
+    {% if editing_group %}
+    <a href="{{ url_for(bp_name ~ '.security_iam_groups') }}" class="dk-btn dk-btn-primary">{{ deck_icon("plus", 13) }} New Group</a>
+    {% endif %}
+  </div>
+</div>
+
+<div class="dk-content">
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">
+        {% if editing_group %}Edit Group · <span class="dk-mono">{{ editing_group.name }}</span>{% else %}Create Permission Group{% endif %}
+      </h2>
+      {% if editing_group %}
+      <a href="{{ url_for(bp_name ~ '.security_iam_groups') }}" class="dk-btn dk-btn-sm">Cancel</a>
+      {% endif %}
+    </div>
+    <div class="dk-panel-body">
+      <form method="post"
+            action="{{ url_for(bp_name ~ '.security_iam_group_update', group_id=editing_group.id) if editing_group else url_for(bp_name ~ '.security_iam_group_create') }}"
+            class="dk-content">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+        <div class="dk-grid">
+          {% if not editing_group %}
+          <div class="dk-field dk-span-4">
+            <label for="dk-g-name">Group Identifier *</label>
+            <input id="dk-g-name" type="text" name="name" class="dk-input dk-mono" required maxlength="80" placeholder="billing_ops">
+          </div>
+          {% endif %}
+          <div class="dk-field dk-span-4">
+            <label for="dk-g-label">Display Label</label>
+            <input id="dk-g-label" type="text" name="label" class="dk-input" value="{{ editing_group.label if editing_group else '' }}" maxlength="120" placeholder="Billing Operations">
+          </div>
+          <div class="dk-field dk-span-{{ '8' if editing_group else '4' }}">
+            <label for="dk-g-desc">Description</label>
+            <input id="dk-g-desc" type="text" name="description" class="dk-input" value="{{ editing_group.description if editing_group else '' }}" placeholder="Access scope summary">
+          </div>
+        </div>
+
+        <div>
+          <h3 class="dk-panel-title">Model Permissions Matrix</h3>
+          <div class="dk-table-wrap dk-iam-matrix">
+            <table class="dk-table">
+              <thead>
+                <tr>
+                  <th>Model</th>
+                  <th>View</th>
+                  <th>Create</th>
+                  <th>Edit</th>
+                  <th>Delete</th>
+                  <th>Export</th>
+                  <th>Import</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for m in model_specs %}
+                <tr>
+                  <td><strong>{{ m.label }}</strong> <span class="dk-subtle dk-mono">({{ m.slug }})</span></td>
+                  {% for act in ['view', 'create', 'edit', 'delete', 'export', 'import'] %}
+                  {% set pcode = m.slug ~ ':' ~ act %}
+                  <td>
+                    <input type="checkbox" name="perm" value="{{ pcode }}" aria-label="{{ m.slug }} {{ act }}"
+                           {% if editing_group and pcode in editing_group.permissions %} checked{% endif %}>
+                  </td>
+                  {% endfor %}
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="dk-grid">
+          <div class="dk-field dk-span-6">
+            <label>Platform &amp; Governance Permissions</label>
+            <div class="dk-iam-sys-grid">
+              {% for pcode, plabel in system_permissions %}
+              {% if pcode != '*' or (current_user and current_user.is_superuser) %}
+              <label class="dk-checkbox">
+                <input type="checkbox" name="perm" value="{{ pcode }}"{% if editing_group and pcode in editing_group.permissions %} checked{% endif %}>
+                <span>{{ plabel }} <code class="dk-code">{{ pcode }}</code></span>
+              </label>
+              {% endif %}
+              {% endfor %}
+            </div>
+          </div>
+          <div class="dk-field dk-span-6">
+            <label for="dk-g-extra">Extra Wildcards / Custom Action Patterns</label>
+            <textarea id="dk-g-extra" name="extra_permissions" rows="5" class="dk-textarea dk-mono" placeholder="*:view&#10;orders:action:mark_shipped">{{ extra_perms_text }}</textarea>
+            <div class="dk-help-text">One glob pattern per line or comma-separated (e.g. <code class="dk-code">*:view</code>, <code class="dk-code">orders:action:*</code>).</div>
+          </div>
+        </div>
+
+        <div class="dk-grid">
+          <div class="dk-field dk-span-4">
+            <label for="dk-g-hidden">Hidden Fields (JSON)</label>
+            <textarea id="dk-g-hidden" name="hidden_fields_json" rows="4" class="dk-textarea dk-mono">{{ hidden_json }}</textarea>
+          </div>
+          <div class="dk-field dk-span-4">
+            <label for="dk-g-ro">Read-Only Fields (JSON)</label>
+            <textarea id="dk-g-ro" name="readonly_fields_json" rows="4" class="dk-textarea dk-mono">{{ readonly_json }}</textarea>
+          </div>
+          <div class="dk-field dk-span-4">
+            <label for="dk-g-masked">Masked / PII Fields (JSON)</label>
+            <textarea id="dk-g-masked" name="masked_fields_json" rows="4" class="dk-textarea dk-mono">{{ masked_json }}</textarea>
+          </div>
+        </div>
+
+        <div>
+          <button type="submit" class="dk-btn dk-btn-primary">
+            {{ "Update Permission Group" if editing_group else "Create Permission Group" }}
+          </button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <div class="dk-table-wrap">
+    <table class="dk-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Label</th>
+          <th>Permissions</th>
+          <th>Field Guards</th>
+          <th class="dk-td-actions">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for grp in groups %}
+        <tr>
+          <td class="dk-mono"><strong>{{ grp.name }}</strong></td>
+          <td>{{ grp.label }}</td>
+          <td class="dk-mono">{{ grp.permissions | sort | join(", ") }}</td>
+          <td class="dk-mono dk-subtle">
+            H:{{ grp.hidden_fields | length }} · R:{{ grp.readonly_fields | length }} · M:{{ grp.masked_fields | length }}
+          </td>
+          <td class="dk-td-actions">
+            <div class="dk-row-actions">
+              <a href="{{ url_for(bp_name ~ '.security_iam_groups', edit=grp.id) }}" class="dk-btn dk-btn-sm">{{ deck_icon("edit", 12) }} Edit</a>
+              <form method="post" action="{{ url_for(bp_name ~ '.security_iam_group_delete', group_id=grp.id) }}">
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+                <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger" data-deck-confirm-form
+                        data-confirm-title="Delete Permission Group"
+                        data-confirm-msg="Delete group '{{ grp.name }}'? Members lose permissions granted by this group.">
+                  {{ deck_icon("trash", 12) }} Delete
+                </button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

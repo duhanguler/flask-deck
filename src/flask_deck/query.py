@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dt_time
@@ -154,6 +154,7 @@ class PageResult:
     total_is_estimated: bool = False
     total_known: bool = True
     trashed_count: int = 0
+    precomputed_facets: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def iter_filter_items(
@@ -822,7 +823,7 @@ def estimate_table_rows(session: Session, meta: ModelMeta) -> int | None:
         return None
 
 
-def compute_quick_tab_counts(
+def _compute_quick_tab_and_facet_counts(
     session: Session,
     meta: ModelMeta,
     base_where: Sequence[sa.ColumnElement[bool]],
@@ -831,10 +832,11 @@ def compute_quick_tab_counts(
     *,
     dialect_name: str = "",
     soft_delete_column: str | None = None,
-) -> tuple[dict[str, int], int]:
-    """Compute badge counts for ALL QuickTabs (plus Trash count) in ONE SQL query."""
+    extra_facet_exprs: Sequence[tuple[str, str, sa.ColumnElement[bool]]] = (),
+) -> tuple[dict[str, int], int, dict[str, dict[str, int]]]:
+    """Compute QuickTab + Trash counts plus optional foldable shared facet counts in ONE SQL query."""
     if not quick_tabs and not soft_delete_column:
-        return {}, 0
+        return {}, 0, {}
 
     active_sd = soft_delete_predicate(meta, soft_delete_column, trashed=False)
     trashed_sd = soft_delete_predicate(meta, soft_delete_column, trashed=True)
@@ -859,6 +861,11 @@ def compute_quick_tab_counts(
     if trashed_sd is not None:
         agg_exprs.append(sa.func.count(sa.case((trashed_sd, 1))).label("__trashed"))
 
+    xf_offset = len(agg_exprs)
+    for idx_f, (_, _, pred) in enumerate(extra_facet_exprs):
+        eff_pred = sa.and_(active_sd, pred) if active_sd is not None else pred
+        agg_exprs.append(sa.func.count(sa.case((eff_pred, 1))).label(f"_xf_{idx_f}"))
+
     stmt = sa.select(*agg_exprs).select_from(meta.model)
     for rel_attr in joins:
         stmt = stmt.outerjoin(rel_attr)
@@ -867,9 +874,35 @@ def compute_quick_tab_counts(
 
     row = session.execute(stmt).first()
     if row is None:
-        return {tab.key: 0 for tab in quick_tabs}, 0
+        return {tab.key: 0 for tab in quick_tabs}, 0, {}
     counts = {tab.key: int(row[idx] or 0) for idx, tab in enumerate(quick_tabs)}
     trashed_cnt = int(row[len(quick_tabs)] or 0) if trashed_sd is not None else 0
+    facets_out: dict[str, dict[str, int]] = {}
+    for idx_f, (gk, opt_val, _) in enumerate(extra_facet_exprs):
+        facets_out.setdefault(gk, {})[opt_val] = int(row[xf_offset + idx_f] or 0)
+    return counts, trashed_cnt, facets_out
+
+
+def compute_quick_tab_counts(
+    session: Session,
+    meta: ModelMeta,
+    base_where: Sequence[sa.ColumnElement[bool]],
+    quick_tabs: Sequence[QuickTab],
+    joins: Sequence[Any] = (),
+    *,
+    dialect_name: str = "",
+    soft_delete_column: str | None = None,
+) -> tuple[dict[str, int], int]:
+    """Compute badge counts for ALL QuickTabs (plus Trash count) in ONE SQL query."""
+    counts, trashed_cnt, _ = _compute_quick_tab_and_facet_counts(
+        session,
+        meta,
+        base_where,
+        quick_tabs,
+        joins=joins,
+        dialect_name=dialect_name,
+        soft_delete_column=soft_delete_column,
+    )
     return counts, trashed_cnt
 
 
@@ -908,6 +941,74 @@ def _build_keyset_predicate(
     )
 
 
+def parse_sort_specs(
+    raw_sort: str | None,
+    raw_dir: str | None = None,
+    *,
+    allowed_sortable: frozenset[str],
+    max_levels: int = 3,
+) -> list[tuple[str, str]]:
+    """Parse single or comma-separated multi-column sort expressions (``col1:asc,col2:desc``)."""
+    specs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    clean_sort = (raw_sort or "").strip()
+    if clean_sort:
+        fallback_dir = "asc" if (raw_dir or "desc").strip().lower() == "asc" else "desc"
+        for token in clean_sort.split(","):
+            part = token.strip()
+            if not part:
+                continue
+            if ":" in part:
+                col_name, d_raw = part.split(":", 1)
+                col_name = col_name.strip()
+                dir_val = "asc" if d_raw.strip().lower() == "asc" else "desc"
+            else:
+                col_name = part
+                dir_val = fallback_dir
+            if col_name in allowed_sortable and col_name not in seen:
+                specs.append((col_name, dir_val))
+                seen.add(col_name)
+                if len(specs) >= max_levels:
+                    break
+    return specs
+
+
+def _resolve_sort_column(
+    meta: ModelMeta,
+    col_name: str,
+    *,
+    display_fields: Mapping[str, Any] | None = None,
+    joins: list[Any],
+    seen_joins: set[Any],
+) -> Any | None:
+    """Resolve scalar, dotted FK, or @display.ordering SQLAlchemy order expression safely."""
+    d_spec = display_fields.get(col_name) if display_fields is not None else None
+    target_spec: Any = d_spec.ordering if (d_spec is not None and d_spec.ordering is not None) else col_name
+    if callable(target_spec):
+        try:
+            return target_spec(meta.model)
+        except Exception:
+            return None
+    if isinstance(target_spec, str):
+        if "." in target_spec:
+            rel_name, target_col = target_spec.split(".", 1)
+            rel_meta = meta.relationships_by_name.get(rel_name)
+            if rel_meta is None or rel_meta.direction != "MANYTOONE":
+                return None
+            col_expr = getattr(rel_meta.target_model, target_col, None)
+            if col_expr is None:
+                return None
+            join_attr = getattr(meta.model, rel_name)
+            jkey = getattr(join_attr, "key", id(join_attr))
+            if jkey not in seen_joins:
+                joins.append(join_attr)
+                seen_joins.add(jkey)
+            return col_expr
+        if target_spec in meta.fields_by_name:
+            return getattr(meta.model, target_spec)
+    return None
+
+
 def _apply_filter_params(
     meta: ModelMeta,
     filter_params: Mapping[str, str] | Sequence[tuple[str, str]],
@@ -920,6 +1021,7 @@ def _apply_filter_params(
     views_by_model: Mapping[type[Any], Any] | None = None,
     user: Any = None,
     auth: Any = None,
+    where_by_field: dict[str, list[sa.ColumnElement[bool]]] | None = None,
 ) -> tuple[dict[str, str], list[tuple[str, str]]]:
     known_fields = frozenset(meta.fields_by_name.keys()) | set(filterable_columns)
     active_filters: dict[str, str] = {}
@@ -943,6 +1045,8 @@ def _apply_filter_params(
             )
             if cond is not None and join_attr is not None:
                 where_clauses.append(cond)
+                if where_by_field is not None:
+                    where_by_field.setdefault(fname, []).append(cond)
                 jkey = getattr(join_attr, "key", id(join_attr))
                 if jkey not in seen_joins:
                     joins.append(join_attr)
@@ -953,9 +1057,83 @@ def _apply_filter_params(
         cond = build_filter_condition(meta, fname, raw_val, op=op, dialect_name=dialect_name)
         if cond is not None:
             where_clauses.append(cond)
+            if where_by_field is not None:
+                where_by_field.setdefault(fname, []).append(cond)
             active_filters[raw_key] = raw_val
             applied_filter_pairs.append((raw_key, raw_val))
     return active_filters, applied_filter_pairs
+
+
+def prepare_scoped_clauses(
+    meta: ModelMeta,
+    *,
+    base_stmt: sa.Select[Any],
+    searchable_columns: Sequence[str] = (),
+    filterable_columns: frozenset[str] = frozenset(),
+    quick_tabs: Sequence[QuickTab] = (),
+    active_tab_key: str | None = None,
+    search_term: str = "",
+    filter_params: Mapping[str, str] | Sequence[tuple[str, str]] = (),
+    soft_delete_column: str | None = None,
+    trashed: bool = False,
+    dialect_name: str = "",
+    views_by_model: Mapping[type[Any], Any] | None = None,
+    user: Any = None,
+    auth: Any = None,
+    extra_where: Sequence[sa.ColumnElement[bool]] = (),
+) -> tuple[
+    list[sa.ColumnElement[bool]],
+    list[sa.ColumnElement[bool]],
+    dict[str, list[sa.ColumnElement[bool]]],
+    list[Any],
+]:
+    """Build deterministic ``(non_filter_where, all_where, filter_where_by_field, joins)``."""
+    non_filter_where: list[sa.ColumnElement[bool]] = list(base_stmt._where_criteria)
+    joins: list[Any] = []
+    seen_joins: set[Any] = set()
+
+    search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
+    if search_clause is not None:
+        non_filter_where.append(search_clause)
+        for j in search_joins:
+            jkey = getattr(j, "key", id(j))
+            if jkey not in seen_joins:
+                joins.append(j)
+                seen_joins.add(jkey)
+
+    sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=trashed)
+    if sd_pred is not None:
+        non_filter_where.append(sd_pred)
+    if extra_where:
+        non_filter_where.extend(extra_where)
+
+    known_fields = frozenset(meta.fields_by_name.keys())
+    if active_tab_key and not trashed:
+        for tab in quick_tabs:
+            if tab.key == active_tab_key:
+                for raw_fname, fval in tab.filters.items():
+                    fname, fop = parse_filter_key(raw_fname, known_fields)
+                    cond = build_filter_condition(meta, fname, fval, op=fop, dialect_name=dialect_name)
+                    if cond is not None:
+                        non_filter_where.append(cond)
+                break
+
+    all_where = list(non_filter_where)
+    where_by_field: dict[str, list[sa.ColumnElement[bool]]] = {}
+    _apply_filter_params(
+        meta,
+        filter_params,
+        filterable_columns,
+        dialect_name=dialect_name,
+        where_clauses=all_where,
+        joins=joins,
+        seen_joins=seen_joins,
+        views_by_model=views_by_model,
+        user=user,
+        auth=auth,
+        where_by_field=where_by_field,
+    )
+    return non_filter_where, all_where, where_by_field, joins
 
 
 def execute_list_query(
@@ -987,6 +1165,11 @@ def execute_list_query(
     views_by_model: Mapping[type[Any], Any] | None = None,
     user: Any = None,
     auth: Any = None,
+    sort_specs: Sequence[tuple[str, str]] = (),
+    display_fields: Mapping[str, Any] | None = None,
+    extra_where: Sequence[sa.ColumnElement[bool]] = (),
+    custom_filter_appliers: Sequence[Callable[[sa.Select[Any]], sa.Select[Any]]] = (),
+    extra_facet_exprs: Sequence[tuple[str, str, sa.ColumnElement[bool]]] = (),
 ) -> PageResult:
     """Execute an optimized, N+1-free, SQLi-safe paginated list query (Offset or Keyset Cursor)."""
     safe_page = max(1, page)
@@ -1012,9 +1195,10 @@ def execute_list_query(
     if count_mode == "none":
         tab_counts: dict[str, int] = {}
         trashed_count = 0
+        precomputed_facets: dict[str, dict[str, int]] = {}
     else:
-        # Single-pass conditional aggregation for ALL quick tabs + optional Trash count (1 SQL query!).
-        tab_counts, trashed_count = compute_quick_tab_counts(
+        # Single-pass conditional aggregation for ALL quick tabs + optional Trash + folded facets (1 SQL query!).
+        tab_counts, trashed_count, precomputed_facets = _compute_quick_tab_and_facet_counts(
             session,
             meta,
             base_conditions,
@@ -1022,12 +1206,15 @@ def execute_list_query(
             joins=joins,
             dialect_name=dialect_name,
             soft_delete_column=soft_delete_column,
+            extra_facet_exprs=extra_facet_exprs,
         )
 
     where_clauses: list[sa.ColumnElement[bool]] = list(base_conditions)
     sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=trashed)
     if sd_pred is not None:
         where_clauses.append(sd_pred)
+    if extra_where:
+        where_clauses.extend(extra_where)
 
     known_fields = frozenset(meta.fields_by_name.keys())
     if active_tab_key and not trashed:
@@ -1053,24 +1240,47 @@ def execute_list_query(
         auth=auth,
     )
 
-    # Strictly allowlisted sorting (zero SQL injection surface).
-    chosen_sort = sort_by if (sort_by and sort_by in sortable_columns) else None
-    chosen_dir = "desc" if sort_dir.lower() == "desc" else "asc"
-    if chosen_sort is None and default_sort is not None:
+    # Strictly allowlisted sorting supporting up to 3 multi-sort levels, dotted FKs & @display.ordering.
+    effective_sorts: list[tuple[str, str]] = [
+        (c, "asc" if d.lower() == "asc" else "desc")
+        for c, d in sort_specs
+        if c in sortable_columns
+    ][:3]
+    if not effective_sorts and sort_by and sort_by in sortable_columns:
+        effective_sorts = [(sort_by, "desc" if sort_dir.lower() == "desc" else "asc")]
+    if not effective_sorts and default_sort is not None:
         cand_col, cand_dir = default_sort
         if cand_col in sortable_columns:
-            chosen_sort = cand_col
-            chosen_dir = "desc" if cand_dir.lower() == "desc" else "asc"
-    if chosen_sort is None:
-        chosen_sort = meta.primary_keys[0].name
-        chosen_dir = "desc"
+            effective_sorts = [(cand_col, "desc" if cand_dir.lower() == "desc" else "asc")]
+    if not effective_sorts:
+        effective_sorts = [(meta.primary_keys[0].name, "desc")]
 
-    sort_field = meta.fields_by_name[chosen_sort]
+    resolved_sorts: list[tuple[str, str, Any]] = []
+    for s_col_name, s_dir in effective_sorts:
+        s_expr = _resolve_sort_column(
+            meta,
+            s_col_name,
+            display_fields=display_fields,
+            joins=joins,
+            seen_joins=seen_joins,
+        )
+        if s_expr is not None:
+            resolved_sorts.append((s_col_name, s_dir, s_expr))
+    if not resolved_sorts:
+        pk0 = meta.primary_keys[0].name
+        resolved_sorts = [(pk0, "desc", getattr(meta.model, pk0))]
+
+    chosen_sort, chosen_dir, sort_col = resolved_sorts[0]
     pk_field = meta.primary_keys[0]
-    sort_col: Any = getattr(meta.model, chosen_sort)
     pk_col: Any = getattr(meta.model, pk_field.name)
 
-    use_cursor_mode = pagination_mode == "cursor" and len(meta.primary_keys) == 1
+    use_cursor_mode = (
+        pagination_mode == "cursor"
+        and len(meta.primary_keys) == 1
+        and len(resolved_sorts) == 1
+        and chosen_sort in meta.fields_by_name
+        and not custom_filter_appliers
+    )
 
     # Resolve row count strategy (only skip COUNT when cursor mode is actually active)
     total = 0
@@ -1086,6 +1296,8 @@ def execute_list_query(
         not base_conditions
         and not active_filters
         and not has_active_tab_filter
+        and not extra_where
+        and not custom_filter_appliers
         and not trashed
     )
 
@@ -1096,13 +1308,15 @@ def execute_list_query(
         if est is not None:
             total = est
             total_is_estimated = True
-        elif trashed and not active_filters and soft_delete_column:
+        elif trashed and not active_filters and not extra_where and not custom_filter_appliers and soft_delete_column:
             total = trashed_count
-        elif not trashed and not active_filters and active_tab_key and active_tab_key in tab_counts:
+        elif not trashed and not active_filters and not extra_where and not custom_filter_appliers and active_tab_key and active_tab_key in tab_counts:
             total = tab_counts[active_tab_key]
         elif (
             not trashed
             and not active_filters
+            and not extra_where
+            and not custom_filter_appliers
             and not active_tab_key
             and quick_tabs
             and not quick_tabs[0].filters
@@ -1113,14 +1327,18 @@ def execute_list_query(
             count_stmt = sa.select(sa.func.count()).select_from(meta.model)
             if where_clauses:
                 count_stmt = count_stmt.where(*where_clauses)
+            for applier in custom_filter_appliers:
+                count_stmt = applier(count_stmt)
             total = int(session.execute(count_stmt).scalar_one() or 0)
-    elif trashed and not active_filters and soft_delete_column and count_mode != "none":
+    elif trashed and not active_filters and not extra_where and not custom_filter_appliers and soft_delete_column and count_mode != "none":
         total = trashed_count
-    elif not trashed and not active_filters and active_tab_key and active_tab_key in tab_counts:
+    elif not trashed and not active_filters and not extra_where and not custom_filter_appliers and active_tab_key and active_tab_key in tab_counts:
         total = tab_counts[active_tab_key]
     elif (
         not trashed
         and not active_filters
+        and not extra_where
+        and not custom_filter_appliers
         and not active_tab_key
         and quick_tabs
         and not quick_tabs[0].filters
@@ -1133,10 +1351,13 @@ def execute_list_query(
             count_stmt = count_stmt.outerjoin(rel_attr)
         if where_clauses:
             count_stmt = count_stmt.where(*where_clauses)
+        for applier in custom_filter_appliers:
+            count_stmt = applier(count_stmt)
         total = int(session.execute(count_stmt).scalar_one() or 0)
 
     # Keyset Cursor Mode (zero OFFSET, signed opaque cursors, deterministic PG/SQLite NULL order)
     if use_cursor_mode:
+        sort_field = meta.fields_by_name[chosen_sort]
         slice_digest = hashlib.sha256(
             json.dumps(
                 [
@@ -1261,6 +1482,7 @@ def execute_list_query(
             total_is_estimated=total_is_estimated,
             total_known=total_known,
             trashed_count=trashed_count,
+            precomputed_facets=precomputed_facets,
         )
 
     # Classic Offset Pagination
@@ -1273,11 +1495,16 @@ def execute_list_query(
         data_stmt = data_stmt.outerjoin(rel_attr)
     if where_clauses:
         data_stmt = data_stmt.where(*where_clauses)
+    for applier in custom_filter_appliers:
+        data_stmt = applier(data_stmt)
 
-    order_expr = sort_col.desc() if chosen_dir == "desc" else sort_col.asc()
-    offset_orders: list[Any] = [order_expr]
+    offset_orders: list[Any] = [
+        (s_expr.desc() if s_dir == "desc" else s_expr.asc())
+        for _, s_dir, s_expr in resolved_sorts
+    ]
+    used_order_cols = {s_name for s_name, _, _ in resolved_sorts}
     for pk_f in meta.primary_keys:
-        if pk_f.name != chosen_sort:
+        if pk_f.name not in used_order_cols:
             pcol = getattr(meta.model, pk_f.name)
             offset_orders.append(pcol.desc() if chosen_dir == "desc" else pcol.asc())
     data_stmt = data_stmt.order_by(*offset_orders)
@@ -1299,6 +1526,7 @@ def execute_list_query(
         total_is_estimated=total_is_estimated,
         total_known=total_known,
         trashed_count=trashed_count,
+        precomputed_facets=precomputed_facets,
     )
 
 
@@ -1352,6 +1580,8 @@ def compute_all_aggregates(
     views_by_model: Mapping[type[Any], Any] | None = None,
     user: Any = None,
     auth: Any = None,
+    extra_where: Sequence[sa.ColumnElement[bool]] = (),
+    custom_filter_appliers: Sequence[Callable[[sa.Select[Any]], sa.Select[Any]]] = (),
 ) -> dict[str, tuple[str, float]]:
     """Compute SQL aggregates (sum, avg, min, max) over the entire filtered dataset in 1 query."""
     if not column_aggregates:
@@ -1395,6 +1625,8 @@ def compute_all_aggregates(
     sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=trashed)
     if sd_pred is not None:
         where_clauses.append(sd_pred)
+    if extra_where:
+        where_clauses.extend(extra_where)
 
     known_fields = frozenset(meta.fields_by_name.keys())
     if active_tab_key and not trashed:
@@ -1425,6 +1657,8 @@ def compute_all_aggregates(
         stmt = stmt.outerjoin(rel_attr)
     if where_clauses:
         stmt = stmt.where(*where_clauses)
+    for applier in custom_filter_appliers:
+        stmt = applier(stmt)
     row = session.execute(stmt).first()
     if row is None:
         return {}

@@ -167,6 +167,7 @@
   const confirmBackdrop = document.getElementById("dk-confirm-backdrop");
   const confirmTitle = document.getElementById("dk-confirm-title");
   const confirmMsg = document.getElementById("dk-confirm-msg");
+  const confirmImpact = document.getElementById("dk-confirm-impact");
   const confirmFieldsHost = document.getElementById("dk-confirm-fields");
   const confirmPhraseWrap = document.getElementById("dk-confirm-phrase-wrap");
   const confirmPhraseLabel = document.getElementById("dk-confirm-phrase-label");
@@ -177,6 +178,7 @@
   const lbTitle = document.getElementById("dk-lightbox-title");
   const lbDl = document.getElementById("dk-lightbox-dl");
   let drawerAbort = null;
+  let impactAbort = null;
   let pendingConfirmFn = null;
   let lbPrevFocus = null;
 
@@ -290,13 +292,118 @@
       });
     }
     const phrase = opts.phrase || "";
+    let impactLoading = false;
+    let impactBlocked = false;
+    const syncConfirmBtn = () => {
+      if (!confirmGo) return;
+      const phraseMismatch = Boolean(phrase) && (!confirmInput || confirmInput.value.trim() !== phrase);
+      confirmGo.disabled = impactLoading || impactBlocked || phraseMismatch;
+    };
     if (confirmPhraseWrap && confirmInput && confirmPhraseLabel) {
       confirmPhraseWrap.hidden = !phrase;
       confirmInput.value = "";
       confirmPhraseLabel.textContent = phrase ? "Type " + phrase + " to confirm:" : "";
-      if (confirmGo) confirmGo.disabled = Boolean(phrase);
-      confirmInput.oninput = () => { if (confirmGo) confirmGo.disabled = confirmInput.value.trim() !== phrase; };
+      confirmInput.oninput = syncConfirmBtn;
     }
+    if (impactAbort) { impactAbort.abort(); impactAbort = null; }
+    if (confirmImpact) {
+      confirmImpact.replaceChildren();
+      confirmImpact.hidden = true;
+      if (opts.impactUrl && opts.impactBody) {
+        impactLoading = true;
+        confirmImpact.hidden = false;
+        const ld = document.createElement("div");
+        ld.className = "dk-subtle dk-mono";
+        ld.textContent = "Analyzing dependent records…";
+        confirmImpact.appendChild(ld);
+        impactAbort = new AbortController();
+        fetch(opts.impactUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Deck-CSRFToken": CSRF,
+            Accept: "application/json",
+          },
+          body: JSON.stringify(opts.impactBody),
+          signal: impactAbort.signal,
+        })
+          .then((r) => (r.ok ? r.json() : Promise.reject(new Error("impact"))))
+          .then((rep) => {
+            confirmImpact.replaceChildren();
+            if (rep.is_soft_delete) {
+              const info = document.createElement("div");
+              info.className = "dk-impact-note dk-mono";
+              info.textContent = "Soft delete — record moves to Trash safely without dropping DB rows.";
+              confirmImpact.appendChild(info);
+            }
+            const items = Array.isArray(rep.items) ? rep.items : [];
+            if (!items.length) {
+              const ok = document.createElement("div");
+              ok.className = "dk-subtle dk-mono";
+              ok.textContent = "No dependent records affected.";
+              confirmImpact.appendChild(ok);
+            } else {
+              const hdr = document.createElement("div");
+              hdr.className = "dk-impact-head dk-mono";
+              hdr.textContent = (rep.total_affected || 0) + " dependent record(s) across " + items.length + " relation(s):";
+              confirmImpact.appendChild(hdr);
+              items.forEach((it) => {
+                const row = document.createElement("div");
+                row.className = "dk-impact-row";
+                const b = document.createElement("span");
+                b.className = "dk-badge dk-badge-" + (it.action === "blocked" ? "danger" : (it.action === "cascade" ? "warn" : "info"));
+                b.textContent = it.action === "blocked" ? "BLOCKED" : (it.action === "cascade" ? "CASCADE" : "SET NULL");
+                const lbl = document.createElement("span");
+                lbl.className = "dk-impact-label";
+                lbl.textContent = it.model_label + " (" + it.fk_column + ") × " + it.count;
+                row.appendChild(b);
+                row.appendChild(lbl);
+                const samples = Array.isArray(it.samples) ? it.samples : [];
+                if (samples.length) {
+                  const sWrap = document.createElement("div");
+                  sWrap.className = "dk-impact-samples dk-mono";
+                  samples.forEach((s) => {
+                    if (s.url && (s.url.startsWith("/") || s.url.startsWith("https://") || s.url.startsWith("http://"))) {
+                      const a = document.createElement("a");
+                      a.href = s.url;
+                      a.className = "dk-impact-sample-link";
+                      a.textContent = s.label;
+                      sWrap.appendChild(a);
+                    } else {
+                      const sp = document.createElement("span");
+                      sp.className = "dk-impact-sample-link";
+                      sp.textContent = s.label;
+                      sWrap.appendChild(sp);
+                    }
+                  });
+                  row.appendChild(sWrap);
+                }
+                confirmImpact.appendChild(row);
+              });
+              if (rep.truncated) {
+                const tr = document.createElement("div");
+                tr.className = "dk-subtle dk-mono";
+                tr.textContent = "Tree truncated at limit.";
+                confirmImpact.appendChild(tr);
+              }
+            }
+            impactLoading = false;
+            impactBlocked = rep.can_proceed === false;
+            syncConfirmBtn();
+          })
+          .catch((err) => {
+            if (err && err.name === "AbortError") return;
+            confirmImpact.replaceChildren();
+            const warn = document.createElement("div");
+            warn.className = "dk-subtle dk-mono";
+            warn.textContent = "Unable to compute dependency preview.";
+            confirmImpact.appendChild(warn);
+            impactLoading = false;
+            syncConfirmBtn();
+          });
+      }
+    }
+    syncConfirmBtn();
     pendingConfirmFn = () => {
       const extras = {};
       for (const [k, { el, spec }] of Object.entries(fieldInputs)) {
@@ -312,7 +419,11 @@
     confirmBackdrop.hidden = false;
     if (phrase && confirmInput) confirmInput.focus();
   }
-  function closeConfirm() { if (confirmBackdrop) confirmBackdrop.hidden = true; pendingConfirmFn = null; }
+  function closeConfirm() {
+    if (impactAbort) { impactAbort.abort(); impactAbort = null; }
+    if (confirmBackdrop) confirmBackdrop.hidden = true;
+    pendingConfirmFn = null;
+  }
   if (confirmGo) confirmGo.addEventListener("click", () => { if (typeof pendingConfirmFn === "function") pendingConfirmFn(); });
 
   if (lbImg) {
@@ -488,10 +599,15 @@
       e.preventDefault();
       const form = confirmFormBtn.closest("form");
       if (!form) return;
+      const impactUrl = confirmFormBtn.getAttribute("data-impact-url") || "";
+      const impactPk = confirmFormBtn.getAttribute("data-impact-pk") || "";
+      const rawForce = confirmFormBtn.getAttribute("data-impact-force") || "";
       openConfirm({
         title: confirmFormBtn.getAttribute("data-confirm-title") || "Confirm Action",
         message: confirmFormBtn.getAttribute("data-confirm-msg") || "This action cannot be undone.",
         phrase: confirmFormBtn.getAttribute("data-confirm-phrase") || "",
+        impactUrl,
+        impactBody: impactUrl && impactPk ? { pks: [impactPk], force: rawForce === "1" || rawForce === "true" } : null,
         onConfirm: (txt) => {
           if (txt) {
             let inp = form.querySelector('input[name="confirm_text"]');
@@ -560,6 +676,7 @@
     openConfirm,
     closeConfirm,
     openDrawer,
+    closeDrawer,
     openLightbox,
     renderSafeMarkdown,
     hasOpenOverlay,

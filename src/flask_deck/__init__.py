@@ -42,6 +42,7 @@ from flask_deck.auth import (
     Role,
 )
 from flask_deck.branding import ACCENT_PRESETS, BrandConfig
+from flask_deck.cascade import DeleteImpactReport, DependentImpact, analyze_delete_impact
 from flask_deck.config import DeckConfig
 from flask_deck.dashboard import (
     ActivityWidget,
@@ -77,6 +78,7 @@ from flask_deck.exceptions import (
     SecurityConfigurationError,
     ValidationError,
 )
+from flask_deck.filters import ListFilter, PredicateListFilter, RangeListFilter
 from flask_deck.formatters import (
     AvatarFormatter,
     BadgeFormatter,
@@ -92,6 +94,7 @@ from flask_deck.formatters import (
     RelativeTimeFormatter,
 )
 from flask_deck.i18n import BabelTranslator, DictTranslator, Translator
+from flask_deck.iam import IAMGroupRecord, IAMUserRecord, SQLAlchemyAuthProvider
 from flask_deck.importer import (
     InMemoryPreviewStore,
     PreviewStore,
@@ -123,9 +126,12 @@ from flask_deck.mfa import (
 from flask_deck.model_view import (
     ActionField,
     ActionSpec,
+    DisplaySpec,
+    Fieldset,
     InlineModelView,
     ModelView,
     action,
+    display,
     pydantic_validator,
 )
 from flask_deck.passkeys import (
@@ -220,7 +226,11 @@ __all__ = [
     "DeckEventBus",
     "DeckMCPServer",
     "DeckUser",
+    "DeleteImpactReport",
+    "DependentImpact",
     "DictTranslator",
+    "DisplaySpec",
+    "Fieldset",
     "FileFieldConfig",
     "FileFormatter",
     "FlaskLoginAuthProvider",
@@ -229,6 +239,8 @@ __all__ = [
     "Formatter",
     "GaugeWidget",
     "HeatmapWidget",
+    "IAMGroupRecord",
+    "IAMUserRecord",
     "ImageFormatter",
     "ImportLimitError",
     "InMemoryAPIKeyStore",
@@ -251,6 +263,7 @@ __all__ = [
     "JobRecord",
     "KPIWidget",
     "LinkFormatter",
+    "ListFilter",
     "LocalFileStorage",
     "MFAEnrollment",
     "MFAStore",
@@ -266,12 +279,14 @@ __all__ = [
     "PasskeyCredential",
     "PasskeyStore",
     "PermissionDeniedError",
+    "PredicateListFilter",
     "PreviewStore",
     "ProgressBarFormatter",
     "PureSQLAlchemyAdapter",
     "QuickTab",
     "RBACAccount",
     "RBACAuthProvider",
+    "RangeListFilter",
     "RateLimitStore",
     "ReadOnlyError",
     "RecordNote",
@@ -284,6 +299,7 @@ __all__ = [
     "SQLAlchemyAPIKeyStore",
     "SQLAlchemyApprovalStore",
     "SQLAlchemyAuditStore",
+    "SQLAlchemyAuthProvider",
     "SQLAlchemyJobBackend",
     "SQLAlchemyMFAStore",
     "SQLAlchemyPasskeyStore",
@@ -320,6 +336,7 @@ __all__ = [
     "Widget",
     "__version__",
     "action",
+    "analyze_delete_impact",
     "api_key_allows",
     "api_key_to_user",
     "build_api_key_record",
@@ -329,6 +346,7 @@ __all__ = [
     "compute_audit_entry_hash",
     "compute_totp",
     "detect_flask_lens",
+    "display",
     "format_failed_rows_csv",
     "generate_api_key",
     "generate_totp_secret",

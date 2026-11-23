@@ -76,6 +76,8 @@ class AuthProvider(ABC):
 
     supports_login_form: bool = False
     supports_password_login: bool = True
+    supports_password_change: bool = False
+    supports_iam_management: bool = False
 
     @abstractmethod
     def get_current_user(
@@ -177,6 +179,53 @@ class AuthProvider(ABC):
         """Return candidate non-superuser accounts that ``actor`` may impersonate."""
         _ = actor
         return ()
+
+    def get_demo_accounts(self) -> Sequence[DeckUser]:
+        """Return candidate accounts for opt-in non-production demo role switching."""
+        return ()
+
+    def change_password(
+        self,
+        user_id: str,
+        current_password: str,
+        new_password: str,
+    ) -> tuple[bool, str]:
+        """Change password for ``user_id``; returns ``(ok, message)``."""
+        _ = (user_id, current_password, new_password)
+        return False, "Password change is not supported by this auth provider."
+
+
+def collect_role_field_rule(
+    roles: Sequence[Role],
+    user: DeckUser | None,
+    model_slug: str,
+    attr: str,
+) -> frozenset[str]:
+    """Compute effective hidden/readonly/masked field set across active roles."""
+    if user is None or user.is_superuser or not roles:
+        return frozenset()
+    if attr == "readonly_fields":
+        relevant = [
+            r
+            for r in roles
+            if r.grants(f"{model_slug}:edit") or r.grants(f"{model_slug}:create")
+        ]
+    else:
+        relevant = [r for r in roles if r.grants(f"{model_slug}:view")]
+    target_roles = relevant or list(roles)
+    sets: list[frozenset[str]] = []
+    for role in target_roles:
+        mapping: Mapping[str, frozenset[str]] = getattr(role, attr)
+        restricted = set(mapping.get("*", frozenset())) | set(
+            mapping.get(model_slug, frozenset())
+        )
+        sets.append(frozenset(restricted))
+    if not sets:
+        return frozenset()
+    result = set(sets[0])
+    for s in sets[1:]:
+        result &= s
+    return frozenset(result)
 
 
 class OpenAuthProvider(AuthProvider):
@@ -363,35 +412,7 @@ class RBACAuthProvider(AuthProvider):
         model_slug: str,
         attr: str,
     ) -> frozenset[str]:
-        if user is None or user.is_superuser:
-            return frozenset()
-        roles = self._user_roles(user)
-        if not roles:
-            return frozenset()
-        # Filter to roles that actually grant the relevant access on model_slug so an unrelated
-        # role (e.g. audit-only) never intersects empty restrictions and wipes out field guards.
-        if attr == "readonly_fields":
-            relevant = [
-                r
-                for r in roles
-                if r.grants(f"{model_slug}:edit") or r.grants(f"{model_slug}:create")
-            ]
-        else:
-            relevant = [r for r in roles if r.grants(f"{model_slug}:view")]
-        target_roles = relevant or roles
-        sets: list[frozenset[str]] = []
-        for role in target_roles:
-            mapping: Mapping[str, frozenset[str]] = getattr(role, attr)
-            restricted = set(mapping.get("*", frozenset())) | set(
-                mapping.get(model_slug, frozenset())
-            )
-            sets.append(frozenset(restricted))
-        if not sets:
-            return frozenset()
-        result = set(sets[0])
-        for s in sets[1:]:
-            result &= s
-        return frozenset(result)
+        return collect_role_field_rule(self._user_roles(user), user, model_slug, attr)
 
     def hidden_fields_for(self, user: DeckUser | None, model_slug: str) -> frozenset[str]:
         return self._collect_field_rule(user, model_slug, "hidden_fields")

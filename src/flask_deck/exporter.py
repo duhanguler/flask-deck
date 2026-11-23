@@ -4,7 +4,7 @@ import csv
 import enum
 import io
 import json
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
@@ -19,9 +19,9 @@ from flask_deck.auth import AuthProvider, DeckUser
 from flask_deck.introspection import introspect_model
 from flask_deck.model_view import ModelView
 from flask_deck.query import (
+    _apply_filter_params,
     build_filter_condition,
     build_search_clause,
-    iter_filter_items,
     parse_filter_key,
     soft_delete_predicate,
 )
@@ -55,6 +55,8 @@ def _build_export_statement(
     trashed: bool = False,
     searchable_columns: Sequence[str] | None = None,
     views_by_model: Mapping[type[Any], ModelView] | None = None,
+    extra_where: Sequence[sa.ColumnElement[bool]] = (),
+    custom_filter_appliers: Sequence[Callable[[sa.Select[Any]], sa.Select[Any]]] = (),
 ) -> tuple[sa.Select[Any], bool]:
     meta = view.meta
     stmt = view.scope_query(sa.select(view.model), user)
@@ -111,15 +113,25 @@ def _build_export_statement(
                         stmt = stmt.where(cond)
                 break
 
-    for raw_key, raw_val in iter_filter_items(filter_params):
-        if not raw_val:
-            continue
-        fname, op = parse_filter_key(raw_key, known_fields)
-        if fname not in allowed_filterable:
-            continue
-        cond = build_filter_condition(meta, fname, raw_val, op=op, dialect_name=dialect_name)
-        if cond is not None:
-            stmt = stmt.where(cond)
+    where_clauses: list[sa.ColumnElement[bool]] = []
+    extra_joins: list[Any] = []
+    seen_joins: set[Any] = {getattr(j, "key", id(j)) for j in search_joins}
+    _apply_filter_params(
+        meta,
+        filter_params,
+        allowed_filterable,
+        dialect_name=dialect_name,
+        where_clauses=where_clauses,
+        joins=extra_joins,
+        seen_joins=seen_joins,
+        views_by_model=views_by_model,
+        user=user,
+        auth=auth,
+    )
+    for rel_attr in extra_joins:
+        stmt = stmt.outerjoin(rel_attr)
+    if where_clauses:
+        stmt = stmt.where(*where_clauses)
 
     if selected_pks:
         if len(meta.primary_keys) == 1:
@@ -128,9 +140,13 @@ def _build_export_statement(
         else:
             pk_cols = [getattr(view.model, pk.name) for pk in meta.primary_keys]
             stmt = stmt.where(sa.tuple_(*pk_cols).in_(selected_pks))
+    if extra_where:
+        stmt = stmt.where(*extra_where)
+    for applier in custom_filter_appliers:
+        stmt = applier(stmt)
 
     pk_orders = [getattr(view.model, pk.name).asc() for pk in meta.primary_keys]
-    return stmt.order_by(*pk_orders), bool(search_joins)
+    return stmt.order_by(*pk_orders), bool(search_joins or extra_joins)
 
 
 def export_columns_for_user(
@@ -162,6 +178,8 @@ def iter_export_chunks(
     trashed: bool = False,
     searchable_columns: Sequence[str] | None = None,
     views_by_model: Mapping[type[Any], ModelView] | None = None,
+    extra_where: Sequence[sa.ColumnElement[bool]] = (),
+    custom_filter_appliers: Sequence[Callable[[sa.Select[Any]], sa.Select[Any]]] = (),
 ) -> tuple[Iterator[Any], str, str]:
     """Yield formatted export chunks in O(1) memory without requiring a Flask request context."""
     cols = export_columns_for_user(view, auth, user)
@@ -180,6 +198,8 @@ def iter_export_chunks(
         trashed=trashed,
         searchable_columns=searchable_columns,
         views_by_model=views_by_model,
+        extra_where=extra_where,
+        custom_filter_appliers=custom_filter_appliers,
     )
 
     def _iter_objects() -> Iterator[Any]:
@@ -306,6 +326,8 @@ def stream_export_response(
     trashed: bool = False,
     searchable_columns: Sequence[str] | None = None,
     views_by_model: Mapping[type[Any], ModelView] | None = None,
+    extra_where: Sequence[sa.ColumnElement[bool]] = (),
+    custom_filter_appliers: Sequence[Callable[[sa.Select[Any]], sa.Select[Any]]] = (),
 ) -> Response:
     """Stream filtered model records in O(1) memory as CSV, JSON, or JSONL."""
     gen, mimetype, filename = iter_export_chunks(
@@ -323,6 +345,8 @@ def stream_export_response(
         trashed=trashed,
         searchable_columns=searchable_columns,
         views_by_model=views_by_model,
+        extra_where=extra_where,
+        custom_filter_appliers=custom_filter_appliers,
     )
     resp = Response(stream_with_context(gen), mimetype=mimetype)
     resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'

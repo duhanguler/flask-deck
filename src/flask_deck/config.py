@@ -75,6 +75,10 @@ class DeckConfig:
     mcp_require_approval: bool = True
     api_rate_limit_max: int = 120
     api_rate_limit_window_seconds: int = 60
+    # v0.5.0 Beyond-Django operations
+    bulk_sync_limit: int = 500
+    max_select_across: int = 10000
+    enable_cascade_impact: bool = True
 
     def __post_init__(self) -> None:
         if self.page_size < 1 or self.page_size > self.max_page_size:

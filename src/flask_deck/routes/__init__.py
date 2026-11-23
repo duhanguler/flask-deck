@@ -8,6 +8,7 @@ from flask_deck.routes.api import register_api_routes
 from flask_deck.routes.auth import register_auth_routes
 from flask_deck.routes.crud import register_crud_routes
 from flask_deck.routes.governance import register_governance_routes
+from flask_deck.routes.iam import register_iam_routes
 from flask_deck.routes.jobs import register_job_routes
 from flask_deck.routes.ops import register_ops_routes
 
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 def register_all_routes(bp: Blueprint, deck: Deck) -> None:
     """Register all Flask-Deck route groups on the blueprint preserving exact endpoints."""
     register_auth_routes(bp, deck)
+    register_iam_routes(bp, deck)
     register_ops_routes(bp, deck)
     register_governance_routes(bp, deck)
     register_job_routes(bp, deck)

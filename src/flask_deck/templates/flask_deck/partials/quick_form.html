@@ -1,0 +1,86 @@
+<form method="post" action="{{ action_url }}" class="dk-content" data-deck-quick-form>
+  <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+
+  {% if errors.get('__all__') %}
+  <div class="dk-alert dk-alert-danger" role="alert">
+    {% for msg in errors['__all__'] %}<div>{{ msg }}</div>{% endfor %}
+  </div>
+  {% endif %}
+
+  {% for fs in fieldsets %}
+  {% for row_cols in fs.rows %}
+  <div class="dk-form-grid">
+    {% for col in row_cols %}
+    {% set spec = field_specs[col] %}
+    {% if spec.kind not in ['file', 'display_ro', 'm2m'] %}
+    <div class="dk-field{% if spec.kind in ['text', 'json', 'array'] %} dk-field-full{% endif %}">
+      <label for="qf_{{ spec.name }}">
+        <span>{{ spec.label }}</span>
+        {% if spec.required %}<span class="dk-req">*</span>{% endif %}
+        {% if spec.readonly %}<span class="dk-badge dk-badge-neutral dk-mono">read-only</span>{% endif %}
+      </label>
+
+      {% if spec.kind == 'boolean' %}
+      <label class="dk-switch-row">
+        <span class="dk-switch">
+          <input type="checkbox" id="qf_{{ spec.name }}" name="{{ spec.name }}" value="true"{% if spec.value %} checked{% endif %}{% if spec.readonly %} disabled{% endif %}>
+          <span class="dk-switch-track" aria-hidden="true"></span>
+        </span>
+        <span class="dk-muted" data-switch-label>{{ "Enabled" if spec.value else "Disabled" }}</span>
+      </label>
+
+      {% elif spec.kind == 'enum' %}
+      <select id="qf_{{ spec.name }}" name="{{ spec.name }}" class="dk-select"{% if spec.readonly %} disabled{% endif %}{% if spec.required %} required{% endif %}>
+        {% if not spec.required %}<option value="">— None —</option>{% endif %}
+        {% for val, lbl in spec.choices %}
+        <option value="{{ val }}"{% if spec.value|string == val %} selected{% endif %}>{{ lbl }}</option>
+        {% endfor %}
+      </select>
+
+      {% elif spec.kind == 'fk' %}
+      <select id="qf_{{ spec.name }}" name="{{ spec.name }}" class="dk-select"{% if spec.readonly %} disabled{% endif %}{% if spec.required %} required{% endif %}>
+        {% if not spec.required %}<option value="">— None —</option>{% endif %}
+        {% for opt in spec.fk_options %}
+        <option value="{{ opt.id }}"{% if spec.value|string == opt.id %} selected{% endif %}>{{ opt.label }}</option>
+        {% endfor %}
+      </select>
+
+      {% elif spec.kind in ['text', 'json'] %}
+      <textarea id="qf_{{ spec.name }}" name="{{ spec.name }}" rows="3" class="dk-textarea{% if spec.kind == 'json' %} dk-mono{% endif %}"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>{{ spec.value }}</textarea>
+
+      {% elif spec.kind in ['integer', 'float', 'decimal'] %}
+      <input type="number" step="{{ '1' if spec.kind == 'integer' else 'any' }}" id="qf_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
+      {% elif spec.kind == 'date' %}
+      <input type="date" id="qf_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
+      {% elif spec.kind == 'datetime' %}
+      <input type="datetime-local" id="qf_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
+      {% elif spec.kind == 'email' %}
+      <input type="email" id="qf_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
+      {% else %}
+      <input type="text" id="qf_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input"{% if spec.max_length %} maxlength="{{ spec.max_length }}"{% endif %}{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+      {% endif %}
+
+      {% if spec.help_text %}
+      <div class="dk-field-help">{{ spec.help_text }}</div>
+      {% endif %}
+      {% if errors.get(spec.name) %}
+      <div class="dk-field-err">{{ errors[spec.name] | join(' ') }}</div>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% endfor %}
+  </div>
+  {% endfor %}
+  {% endfor %}
+
+  <div class="dk-page-actions">
+    <button type="submit" class="dk-btn dk-btn-primary">
+      {{ deck_icon("check", 13) }} {{ "Create " ~ view.label if mode == 'create' else "Save " ~ view.label }}
+    </button>
+    <button type="button" class="dk-btn" data-deck-drawer-close>{{ _("Cancel") }}</button>
+  </div>
+</form>

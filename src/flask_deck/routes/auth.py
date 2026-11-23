@@ -22,7 +22,7 @@ from markupsafe import Markup
 
 from flask_deck.api_keys import build_api_key_record
 from flask_deck.audit import make_audit_entry
-from flask_deck.auth import DeckUser, RBACAuthProvider
+from flask_deck.auth import DeckUser
 from flask_deck.exceptions import PermissionDeniedError
 from flask_deck.mfa import (
     MFA_PENDING_AT_KEY,
@@ -751,14 +751,13 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
 
     @bp.route("/_demo/switch-role", methods=["POST"])
     def demo_switch_role() -> Any:
-        if (
-            not deck.config.demo_role_switcher
-            or deck.config.environment == "production"
-            or not isinstance(deck.auth, RBACAuthProvider)
-        ):
+        if not deck.config.demo_role_switcher or deck.config.environment == "production":
+            abort(404)
+        demo_accounts = deck.auth.get_demo_accounts()
+        if not demo_accounts:
             abort(404)
         target_id = request.form.get("account_id", "").strip()
-        target_user = deck.auth.get_account_by_id(target_id)
+        target_user = next((acc for acc in demo_accounts if acc.id == target_id), None)
         if target_user is None:
             abort(404)
         deck.auth.login_user(target_user)

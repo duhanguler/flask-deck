@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import enum
 import hmac
 import os
@@ -26,7 +27,7 @@ from werkzeug.security import generate_password_hash
 from flask_deck.api_keys import build_api_key_record
 from flask_deck.approvals import ApprovalRequest
 from flask_deck.audit import SQLAlchemyAuditStore, make_audit_entry
-from flask_deck.auth import AUTH_USER_KEY, DeckUser, RBACAccount, RBACAuthProvider, Role
+from flask_deck.auth import AUTH_USER_KEY
 from flask_deck.branding import BrandConfig
 from flask_deck.dashboard import (
     ActivityWidget,
@@ -43,6 +44,7 @@ from flask_deck.dashboard import (
 )
 from flask_deck.deck import Deck
 from flask_deck.events import WebhookDeliveryRecord
+from flask_deck.filters import ListFilter, RangeListFilter
 from flask_deck.formatters import (
     AvatarFormatter,
     BadgeFormatter,
@@ -54,8 +56,16 @@ from flask_deck.formatters import (
     ProgressBarFormatter,
     RelativeTimeFormatter,
 )
+from flask_deck.iam import SQLAlchemyAuthProvider
 from flask_deck.jobs import JobContext, JobRecord, ThreadPoolJobBackend
-from flask_deck.model_view import ActionField, InlineModelView, ModelView, action
+from flask_deck.model_view import (
+    ActionField,
+    Fieldset,
+    InlineModelView,
+    ModelView,
+    action,
+    display,
+)
 from flask_deck.query import QuickTab
 from flask_deck.saved_views import RecordNote, SavedViewRecord
 from flask_deck.sessions import DECK_SID_SESSION_KEY, SessionRecord, SQLAlchemySessionStore
@@ -360,14 +370,63 @@ class InfrastructureNode(DemoBase):
 # ---- Declarative ModelViews ----
 
 
+class OrderValueTierFilter(ListFilter):
+    """Demo custom ListFilter with 1-query conditional facet predicates."""
+
+    parameter_name = "value_tier"
+    title = "Deal Size"
+
+    def lookups(self, session: Session, view: Any, user: Any) -> list[tuple[str, str]]:
+        _ = (session, view, user)
+        return [
+            ("small", "Standard (<$500)"),
+            ("mid", "Growth ($500-$2K)"),
+            ("whale", "Enterprise ($2K+)"),
+        ]
+
+    def facet_predicate(self, value: str, model: Any) -> sa.ColumnElement[bool] | None:
+        if model is not Order:
+            return None
+        col = model.total_cents
+        if value == "small":
+            return col < 50000
+        if value == "mid":
+            return sa.and_(col >= 50000, col < 200000)
+        if value == "whale":
+            return col >= 200000
+        return None
+
+    def apply(
+        self,
+        stmt: sa.Select[Any],
+        value: str,
+        session: Session,
+        view: Any,
+        user: Any,
+    ) -> sa.Select[Any]:
+        _ = (session, user)
+        pred = self.facet_predicate(value, view.model)
+        return stmt.where(pred) if pred is not None else stmt
+
+
 class OrganizationView(ModelView):
     model = Organization
     icon = "building"
     category = "Customers"
-    columns = ("name", "slug", "plan", "mrr_cents", "seats_used", "is_active", "created_at")
+    columns = ("name", "slug", "plan", "mrr_cents", "seats_used", "seat_health", "is_active", "created_at")
     searchable_columns = ("name", "slug")
+    search_help_text = "Search by organization name or URL slug"
     filterable_columns = ("plan", "is_active", "created_at")
     inline_editable_columns = ("is_active", "plan")
+    readonly_fields = ("created_at",)
+    prepopulated_fields = MappingProxyType({"slug": ("name",)})
+    view_on_site = "https://status.acme.dev/orgs/{slug}"
+    field_help_texts = MappingProxyType(
+        {
+            "slug": "Auto-generated URL identifier (kebab-case).",
+            "mrr_cents": "Monthly recurring revenue stored in USD cents.",
+        }
+    )
     column_labels = MappingProxyType({"mrr_cents": "MRR", "seats_used": "Seats"})
     column_aggregates = MappingProxyType({"mrr_cents": "sum", "seats_used": "sum"})
     aggregate_scope = "all"
@@ -378,8 +437,16 @@ class OrganizationView(ModelView):
         ("Paused Orgs", "?f_is_active=false"),
     )
     fieldsets = (
-        ("Organization Identity", ("name", "slug", "plan", "is_active")),
-        ("Billing & Quotas", ("mrr_cents", "seats_used", "seats_limit")),
+        Fieldset(
+            "Organization Identity",
+            (("name", "slug"), "plan", "is_active"),
+            description="Tenant branding, slug routing, and commercial plan.",
+        ),
+        Fieldset(
+            "Billing & Quotas",
+            ("mrr_cents", ("seats_used", "seats_limit"), "created_at"),
+            collapsible=True,
+        ),
     )
     quick_tabs = (
         QuickTab("all", "All"),
@@ -396,6 +463,11 @@ class OrganizationView(ModelView):
             "created_at": RelativeTimeFormatter(),
         }
     )
+
+    @display(label="Seat Health", ordering="seats_used")
+    def seat_health(self, obj: Organization) -> str:
+        pct = int((obj.seats_used / max(1, obj.seats_limit)) * 100)
+        return f"{obj.seats_used}/{obj.seats_limit} ({pct}%)"
 
 
 class UserView(ModelView):
@@ -429,9 +501,29 @@ class ProductView(ModelView):
     category = "Commerce"
     columns = ("thumbnail_path", "sku", "name", "category", "price_cents", "stock_pct", "spec_sheet_path", "is_active")
     searchable_columns = ("sku", "name")
+    search_help_text = "Search by SKU identifier or catalog product name"
     filterable_columns = ("category", "is_active", "price_cents", "metadata_json")
+    custom_filters = (
+        RangeListFilter(
+            parameter_name="price_band",
+            title="Price Band",
+            column="price_cents",
+            bands=(
+                ("under500", "Under $500", None, 50000),
+                ("mid", "$500 - $2,000", 50000, 200000),
+                ("enterprise", "$2,000+", 200000, None),
+            ),
+        ),
+    )
+    show_facets = "auto"
     inline_editable_columns = ("is_active",)
     import_key_columns = ("sku",)
+    field_help_texts = MappingProxyType(
+        {
+            "sku": "Unique catalog SKU code used as upsert key during CSV imports.",
+            "price_cents": "Monthly list price billed in USD cents.",
+        }
+    )
     column_labels = MappingProxyType(
         {
             "thumbnail_path": "Preview",
@@ -481,15 +573,28 @@ class OrderItemInline(InlineModelView):
     label = "Line Items"
     columns = ("product_id", "quantity", "unit_price_cents")
     order_by = "id"
+    extra = 1
+    show_change_link = True
+    field_help_texts = MappingProxyType(
+        {
+            "quantity": "Provisioned unit quantity.",
+            "unit_price_cents": "Unit price locked at invoice time (USD cents).",
+        }
+    )
 
 
 class OrderView(ModelView):
     model = Order
     icon = "shopping-bag"
     category = "Commerce"
-    columns = ("order_number", "organization", "customer", "status", "total_cents", "created_at")
+    columns = ("order_number", "organization", "customer", "status", "total_cents", "est_margin", "created_at")
     searchable_columns = ("order_number", "organization.name", "customer.email")
+    search_help_text = "Search by order #, organization name, or customer email"
     filterable_columns = ("status", "organization_id", "organization.plan", "total_cents", "created_at")
+    custom_filters = (OrderValueTierFilter,)
+    date_hierarchy = "created_at"
+    show_facets = "auto"
+    save_as = True
     inline_editable_columns = ("status",)
     inlines = (OrderItemInline,)
     kanban_column = "status"
@@ -522,9 +627,13 @@ class OrderView(ModelView):
         }
     )
     fieldsets = (
-        ("Order Summary", ("order_number", "organization_id", "customer_id", "status")),
+        ("Order Summary", (("order_number", "status"), ("organization_id", "customer_id"))),
         ("Billing & Markdown Notes", ("total_cents", "notes")),
     )
+
+    @display(label="Est. Margin", ordering="total_cents")
+    def est_margin(self, obj: Order) -> str:
+        return f"${(obj.total_cents * 0.82) / 100:,.2f}"
 
     @action("mark_shipped", label="Mark Shipped", icon="truck", confirm=True)
     def mark_shipped(self, records: list[Order], form_data: Any, user: Any) -> str:
@@ -561,9 +670,12 @@ class SupportTicketView(ModelView):
     soft_delete_column = "deleted_at"
     exclude_columns = ("deleted_at",)
     form_excluded_columns = ("deleted_at",)
-    columns = ("ticket_key", "subject", "organization", "priority", "status", "sla_health", "created_at")
+    columns = ("ticket_key", "subject", "organization", "priority", "status", "sla_health", "sla_tier", "created_at")
     searchable_columns = ("ticket_key", "subject")
+    search_help_text = "Search by ticket key (e.g. OPS-412) or issue summary"
     filterable_columns = ("priority", "status", "organization_id", "organization.plan", "created_at")
+    date_hierarchy = "created_at"
+    show_facets = "auto"
     inline_editable_columns = ("status", "priority")
     kanban_column = "status"
     kanban_card_fields = ("ticket_key", "organization", "priority", "sla_health")
@@ -596,6 +708,14 @@ class SupportTicketView(ModelView):
             "created_at": RelativeTimeFormatter(),
         }
     )
+
+    @display(label="SLA Tier", ordering="sla_health")
+    def sla_tier(self, obj: SupportTicket) -> str:
+        if obj.sla_health <= 25:
+            return "Breached"
+        if obj.sla_health <= 50:
+            return "At Risk"
+        return "Healthy"
 
     @action(
         "escalate",
@@ -1692,6 +1812,90 @@ def _seed_showcase_control_plane(
                 deck.job_backend._jobs[job.id] = job
 
 
+def _seed_demo_iam(auth: SQLAlchemyAuthProvider) -> None:
+    """Ensure the three curated DB-backed demo groups and accounts exist idempotently."""
+    def _ensure_group(
+        *,
+        name: str,
+        label: str,
+        description: str,
+        permissions: frozenset[str],
+        readonly_fields: dict[str, frozenset[str]] | None = None,
+        masked_fields: dict[str, frozenset[str]] | None = None,
+    ) -> str:
+        existing = auth.get_group_by_name(name)
+        if existing is not None:
+            return existing.id
+        try:
+            return auth.create_group(
+                name=name,
+                label=label,
+                description=description,
+                permissions=permissions,
+                readonly_fields=readonly_fields,
+                masked_fields=masked_fields,
+            ).id
+        except ValueError:
+            found = auth.get_group_by_name(name)
+            assert found is not None
+            return found.id
+
+    g_super_id = _ensure_group(
+        name="superadmin",
+        label="Superadmin",
+        description="Unrestricted platform operations, dry-run imports, and audit revert.",
+        permissions=frozenset({"*"}),
+    )
+    g_sup_id = _ensure_group(
+        name="support",
+        label="Support Engineer",
+        description="Customer operations with PII email masking and read-only financials.",
+        permissions=frozenset(
+            {
+                "*:view",
+                "tickets:create",
+                "tickets:edit",
+                "orders:edit",
+                "orders:action:mark_shipped",
+                "orders:export",
+                "audit:view",
+                "rbac:view",
+            }
+        ),
+        masked_fields={"users": frozenset({"email"})},
+        readonly_fields={
+            "orders": frozenset({"total_cents", "organization_id"}),
+            "organizations": frozenset({"mrr_cents", "plan"}),
+        },
+    )
+    g_aud_id = _ensure_group(
+        name="auditor",
+        label="Compliance Auditor",
+        description="Strict read-only inspection across models, exports, and audit ledger.",
+        permissions=frozenset({"*:view", "*:export", "audit:view", "rbac:view"}),
+        masked_fields={"users": frozenset({"email"})},
+    )
+
+    accounts = (
+        ("admin", "admin@acme.dev", "Duhan Güler", "admin@acme.dev", True, [g_super_id]),
+        ("support", "support@acme.dev", "Maya Chen", "support@acme.dev", False, [g_sup_id]),
+        ("viewer", "viewer@acme.dev", "Alex Rivera", "viewer@acme.dev", False, [g_aud_id]),
+    )
+    for uid, uname, disp, email, is_super, gids in accounts:
+        if auth.get_user_record(uid) is None:
+            with contextlib.suppress(ValueError):
+                auth.create_user(
+                    user_id=uid,
+                    username=uname,
+                    display_name=disp,
+                    email=email,
+                    is_active=True,
+                    is_superuser=is_super,
+                    group_ids=gids,
+                    password_hash=_DEMO_PASSWORD_HASH,
+                )
+
+
 def create_demo_app(
     db_uri: str = "sqlite:///:memory:",
     *,
@@ -1725,81 +1929,13 @@ def create_demo_app(
     audit_store = SQLAlchemyAuditStore(engine, hash_chain=True)
     _seed_demo_data(session_factory, audit_store, seed_profile=seed_profile)
 
-    roles = [
-        Role(
-            name="superadmin",
-            label="Superadmin",
-            description="Unrestricted platform operations, dry-run imports, and audit revert.",
-            permissions=frozenset({"*"}),
-        ),
-        Role(
-            name="support",
-            label="Support Engineer",
-            description="Customer operations with PII email masking and read-only financials.",
-            permissions=frozenset(
-                {
-                    "*:view",
-                    "tickets:create",
-                    "tickets:edit",
-                    "orders:edit",
-                    "orders:action:mark_shipped",
-                    "orders:export",
-                    "audit:view",
-                    "rbac:view",
-                }
-            ),
-            masked_fields={"users": frozenset({"email"})},
-            readonly_fields={
-                "orders": frozenset({"total_cents", "organization_id"}),
-                "organizations": frozenset({"mrr_cents", "plan"}),
-            },
-        ),
-        Role(
-            name="auditor",
-            label="Compliance Auditor",
-            description="Strict read-only inspection across models, exports, and audit ledger.",
-            permissions=frozenset({"*:view", "*:export", "audit:view", "rbac:view"}),
-            masked_fields={"users": frozenset({"email"})},
-        ),
-    ]
-
     demo_pwd = "deck-demo-2026"
-    auth = RBACAuthProvider(
-        roles=roles,
-        accounts=[
-            RBACAccount(
-                user=DeckUser(
-                    id="admin",
-                    username="admin@acme.dev",
-                    display_name="Duhan Güler",
-                    email="admin@acme.dev",
-                    roles=("superadmin",),
-                    is_superuser=True,
-                ),
-                password_hash=_DEMO_PASSWORD_HASH,
-            ),
-            RBACAccount(
-                user=DeckUser(
-                    id="support",
-                    username="support@acme.dev",
-                    display_name="Maya Chen",
-                    email="support@acme.dev",
-                    roles=("support",),
-                ),
-                password_hash=_DEMO_PASSWORD_HASH,
-            ),
-            RBACAccount(
-                user=DeckUser(
-                    id="viewer",
-                    username="viewer@acme.dev",
-                    display_name="Alex Rivera",
-                    email="viewer@acme.dev",
-                    roles=("auditor",),
-                ),
-                password_hash=_DEMO_PASSWORD_HASH,
-            ),
-        ],
+    auth = SQLAlchemyAuthProvider(
+        engine,
+        password_min_length=8,
+        demo_account_ids=("admin", "support", "viewer"),
     )
+    _seed_demo_iam(auth)
 
     ephemeral_session_store = (
         _EphemeralServerlessSessionStore(engine)
@@ -2293,6 +2429,8 @@ def create_demo_app(
                 with deck.job_backend._lock:
                     deck.job_backend._jobs.clear()
 
+            auth.reset_all()
+            _seed_demo_iam(auth)
             _seed_demo_data(session_factory, audit_store, seed_profile=seed_profile)
             if seed_profile == "showcase":
                 _seed_showcase_control_plane(deck, session_factory, datetime.now(timezone.utc))
@@ -2339,11 +2477,11 @@ def create_demo_app(
             uid = flask_session.get(AUTH_USER_KEY)
             sid = flask_session.get(DECK_SID_SESSION_KEY)
             if isinstance(uid, str) and uid and isinstance(sid, str) and sid:
-                acc = auth._accounts_by_id.get(uid)
+                u = auth.get_user_by_id(uid)
                 ephemeral_session_store.ensure_session(
                     session_id=sid,
                     user_id=uid,
-                    username=acc.user.username if acc is not None else uid,
+                    username=u.username if u is not None else uid,
                     ip_address=str(request.remote_addr or "127.0.0.1"),
                     user_agent=str(request.headers.get("User-Agent", "")),
                 )

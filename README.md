@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/Python-3.10%20--%203.13-18181b?style=flat-square&logo=python&logoColor=white" alt="Python 3.10-3.13" />
   <img src="https://img.shields.io/badge/Flask-2.3%2B%20%7C%203.x-18181b?style=flat-square&logo=flask&logoColor=white" alt="Flask" />
   <img src="https://img.shields.io/badge/SQLAlchemy-2.0%2B-18181b?style=flat-square&logo=sqlalchemy&logoColor=white" alt="SQLAlchemy 2.0+" />
-  <img src="https://img.shields.io/badge/Assets-15.6%20KB%20core%20gz-18181b?style=flat-square" alt="15.6 KB core gzip" />
+  <img src="https://img.shields.io/badge/Assets-17.3%20KB%20core%20gz-18181b?style=flat-square" alt="17.3 KB core gzip" />
   <img src="https://img.shields.io/badge/CSP-Strict%20Nonce-18181b?style=flat-square" alt="Strict Nonce CSP" />
   <a href="https://github.com/duhanguler/flask-deck/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-18181b?style=flat-square" alt="MIT License" /></a>
 </p>
@@ -17,13 +17,13 @@
 
 **A precision, fail-closed Enterprise & AI-Agent Operations Control Plane for Flask and SQLAlchemy 2.0** — engineered for teams that want the visual craft of **Django-Unfold / Filament / Linear** plus enterprise IAM (SSO, Passkeys, encrypted TOTP), four-eyes Maker-Checker approvals, hash-chained audit ledgers, headless REST API v1, HITL MCP agent tooling, media storage, i18n/RTL, and SQL BI charts on WSGI — without shipping Bootstrap, jQuery, Node build pipelines, or external CDNs.
 
-- **Zero Node Build · Zero External CDN · `< 18 KB` Core / `< 24 KB` Route gzip budgets** (`9.22 KB` CSS + `6.41 KB` core JS = `15.63 KB` gzip core; modular grid/form/ops route totals `18.12–20.89 KB` gzip + pure SSR SVG visualizations & QR codes). Runs out of the box in air-gapped enterprise environments.
+- **Zero Node Build · Zero External CDN · `< 22 KB` Core / `< 32 KB` Route gzip budgets** (`9.81 KB` CSS + `7.46 KB` core JS = `17.26 KB` gzip core; modular grid/form/ops route totals `19.76–25.34 KB` gzip + pure SSR SVG visualizations & QR codes). Runs out of the box in air-gapped enterprise environments.
 - **Carbon Dark, Swiss Light & Strict-CSP Brand Themes**: `1px` hairline grids, `tabular-nums`, CSS Logical Properties for native **RTL**, custom `#RRGGBB` brand accents served over external `/_theme.css` (auto WCAG 2.1 contrast, **0 `'unsafe-inline'`**), and 7 allowlisted extension slots.
-- **Enterprise Control Plane & AI-Agent Platform (`v0.4.0`)**:
-  1. **Enterprise IAM 2.0 & Tamper-Evident Audit**: Encrypted TOTP 2FA (`SecretCipher`), WebAuthn **Passkeys**, PKCE OIDC SSO, Session Registry (`/_security/sessions`), Four-Eyes **Approval Workflows (`/_approvals`)**, 3-way **OCC**, Server-Side **Saved Views & Notes**, and Hash-Chained **Audit Ledger (`verify_chain()`)**.
-  2. **Headless REST API v1 & HITL MCP Server**: Scoped Bearer **API Keys** (`dk_live_...`, CIDR allowlist, sliding-window rate limiting), OpenAPI 3.1.0 `/_api/v1/...`, and JSON-RPC 2.0 **MCP Server** (`POST /_mcp` & `flask deck mcp`) with savepoint-validated agent proposals.
-  3. **Workspace 2.0 & SQL Workbench 2.0 BI**: **Table, Kanban Board, Calendar, Gallery & Cycle-Safe Tree** views, universal scalar inline edits, clickable FK badges, 1-to-N sub-tables, whole-dataset currency aggregates (`aggregate_scope="all"`), dotted FK filters, `__in`/`__not_in`/`__fts`, multi-bind Schema Browser, `EXPLAIN`, SVG Bar/Line charts & pinned Dashboard BI tiles.
-  4. **Import/Export 2.0, ORM Introspection 2.0 & CLI**: Interactive column-mapping wizard, failed-rows CSV download, async background imports, optional **XLSX** (`flask-deck[excel]`), `TypeDecorator`/`hybrid_property`/`column_property`/Joined-Table Inheritance, typed `widgets.py`, clickable zoomable SVG ERD, `flask deck scaffold`, `flask deck audit --format sarif`, and `flask-lens` auto-detection.
+- **Beyond Django Admin — Precision Operations & Control Plane (`v0.5.0`)**:
+  1. **Declarative ModelView & Form Craft**: SQL-sortable `@display` columns, collapsible/horizontal `Fieldset` grids, strict `readonly_fields` mass-assignment barriers, `prepopulated_fields`, `view_on_site`, `field_help_texts`, Slide-Over Related Drawer (`+`/`✏️`/`👁️`) without losing parent edits, adaptive M2M (`pills` / `dual` / `async`), stacked & tabular rich inlines (`min_num` / `extra` / `show_change_link`), `save_as`, `save & continue`, `preserve_filters`, and dirty-form `⌘S` guards.
+  2. **Query Intelligence & Safe Mass Operations**: Single-query SARGable `date_hierarchy`, declarative `ListFilter` / `RangeListFilter` / `PredicateListFilter`, lazy & QuickTab-folded faceted counts (`show_facets="auto"`), `Shift+Click` 3-level multi-column sort, inline FK quick-edit, `page_size=all`, O(tables) SQL **Cascade Delete Impact Analyzer**, and HMAC-signed cross-page **`select_across`** with automatic 200-row chunked background job offload.
+  3. **Optional DB-Backed 4-Level RBAC IAM & Enterprise Governance**: `SQLAlchemyAuthProvider` (`/_security/users`, `/_security/groups`, `/_security/password`) with last-active-superuser protection and visual permission matrix, alongside encrypted TOTP 2FA (`SecretCipher`), WebAuthn **Passkeys**, PKCE OIDC SSO, Session Registry (`/_security/sessions`), Four-Eyes **Approval Workflows (`/_approvals`)**, 3-way **OCC**, Server-Side **Saved Views & Notes**, and Hash-Chained **Audit Ledger (`verify_chain()`)**.
+  4. **Headless REST API v1, HITL MCP Server & BI SQL**: Scoped Bearer **API Keys** (`dk_live_...`, CIDR allowlist, sliding-window throttling), OpenAPI 3.1.0 `/_api/v1/...`, JSON-RPC 2.0 **MCP Server**, multi-mode **Table / Kanban / Calendar / Gallery / Tree** views, **DRY-RUN Savepoint CSV/JSON/XLSX Import**, multi-bind SQL BI Workbench, and `flask-lens` diagnostics.
 
 ---
 
@@ -36,8 +36,8 @@ pip install flask-deck && flask-deck demo
 ```
 
 Open `http://127.0.0.1:5055/admin/` and explore the **`showcase`** control-plane seed (32 orgs, 48 users, 18 products with thumbnails, 120 orders across 90 days, 42 tickets, 22 infrastructure tree nodes, 36 hash-chained audit entries, pending AI-agent/human approvals, saved SQL BI queries, API keys, webhooks & jobs):
-- **Live RBAC Switching**: Bottom-left **SESSION ROLE** switcher (`Admin` / `Support` with live email PII masking / `Viewer` read-only) plus **Impersonate User**.
-- **Workspace 2.0 Multi-Views & Media**: Browse `/admin/infrastructure/?view=tree`, `/admin/products/?view=gallery` (with Image Lightbox), `/admin/orders/?view=calendar`, `/admin/tickets/?view=board`, and Trash restore (`?trashed=1`).
+- **Live DB-Backed IAM & Role Switching**: Powered by `SQLAlchemyAuthProvider` — use the bottom-left **SESSION ROLE** switcher (`Admin` / `Support` with live email PII masking / `Viewer` read-only), manage DB users & visual permission groups on `/admin/_security/users` and `/admin/_security/groups`, or rotate passwords on `/admin/_security/password`.
+- **Workspace & Query Intelligence**: Try `date_hierarchy` drilldowns, `RangeListFilter` / `ListFilter` with lazy facets, `Shift+Click` multi-column sorting, Slide-Over Related Drawer (`+`/`✏️`) inside `/admin/orders/`, and Cascade Delete Impact previews before deleting records.
 - **Four-Eyes Approvals, Hash-Chained Audit & BI SQL**: Review pending AI-agent (`mcp-agent`) & human requests on `/admin/_approvals`, verify ledger integrity on `/admin/_audit`, or chart & pin BI queries on `/admin/_sql`.
 - **IAM, Headless APIs, Jobs & Arabic RTL**: Visit `/admin/_security/mfa`, `/admin/_security/passkeys`, `/admin/_security/sessions`, `/admin/_security/api-keys`, `/admin/_webhooks`, `/admin/_jobs`, or switch to **العربية (AR)** + `Europe/Istanbul` in the topbar Globe popover.
 
@@ -298,25 +298,67 @@ Run the local stdio MCP server for desktop AI clients with `flask --app yourapp 
 
 ---
 
+## Beyond Django Admin: Query Intelligence, Cascade Safety & DB-Backed IAM (`v0.5.0`)
+
+```python
+from types import MappingProxyType
+from flask_deck import (
+    Deck,
+    Fieldset,
+    ModelView,
+    RangeListFilter,
+    SQLAlchemyAuthProvider,
+    display,
+)
+
+class OrderView(ModelView):
+    model = Order
+    date_hierarchy = "created_at"        # 1-query Year -> Month -> Day SARGable drilldown
+    show_facets = "auto"                 # Zero overhead when closed; batched when open
+    save_as = True                       # Clone parent + inlines safely in one click
+    readonly_fields = ("created_at",)    # Strictly rejected from POST mass assignment
+    prepopulated_fields = MappingProxyType({"slug": ("name",)})
+    view_on_site = "https://app.example.com/orders/{order_number}"
+    custom_filters = (
+        RangeListFilter(
+            parameter_name="amount_tier",
+            title="Amount Tier",
+            column="total_cents",
+            bands=(("mid", "$500-$2K", 50000, 200000), ("enterprise", "$2K+", 200000, None)),
+        ),
+    )
+    fieldsets = (
+        Fieldset("Order Summary", (("order_number", "status"), ("organization_id", "customer_id"))),
+        Fieldset("Notes & Billing", ("total_cents", "notes"), collapsible=True),
+    )
+
+    @display(label="Est. Margin", ordering="total_cents")
+    def est_margin(self, obj: Order) -> str:
+        return f"${(obj.total_cents * 0.82) / 100:,.2f}"
+
+# Optional DB-backed 4-level RBAC IAM with /_security/users, /_security/groups & /_security/password
+auth = SQLAlchemyAuthProvider(engine)
+deck = Deck(app, db, auth=auth, enable_sql_console=True, enable_rest_api=True, enable_mcp=True)
+```
+
+---
+
 ## Ecosystem Comparison
 
-| Capability | **flask-deck `v0.4`** | `flask-admin` v2.2 | `flask-appbuilder` | `sqladmin` | `django-unfold` |
+| Capability | **flask-deck `v0.5`** | `flask-admin` v2.2 | `flask-appbuilder` | `sqladmin` | `django-unfold` |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Flask / WSGI Native** | **Yes** | Yes | Yes | No (ASGI) | No (Django) |
 | **Pure SQLAlchemy 2.0 + Multi-Bind DBs** | **Yes** | Partial | No | Yes | N/A |
-| **Zero Node Build & Zero CDN** | **Yes (`15.6 KB` core / ≤`20.9 KB` route gz)** | Partial | Partial | No | Partial |
-| **Media Upload (Local + S3/R2/MinIO + Lightbox)** | **Yes (Magic-byte + Bomb guard)** | Local only | Partial | Via lib | Via Django |
-| **Built-In i18n, Native RTL & Per-User TZ** | **Yes (CSS Logical Props)** | Babel | Babel | No | Yes |
-| **Strict-CSP Dynamic Brand Theme & Slots** | **Yes (`/_theme.css`)** | Manual | Manual | Manual | Tailwind |
-| **TOTP 2FA (Encrypted), Passkeys & OIDC SSO** | **Yes (Pure SVG QR + WebAuthn)** | No | OAuth only | No | Via plugins |
-| **Active Sessions Registry + Audited Impersonation** | **Yes** | No | No | No | Via plugin |
+| **Zero Node Build & Zero CDN** | **Yes (`17.3 KB` core / ≤`25.3 KB` route gz)** | Partial | Partial | No | Partial |
+| **Declarative `@display` (SQL Sort) & Collapsible `Fieldset`s** | **Yes** | Partial | Partial | No | Partial |
+| **Slide-Over Related Drawer (`+`/`✏️`/`👁️`) & Dual/Async M2M** | **Yes (Strict-CSP)** | No | No | No | Popup only |
+| **Single-Query `date_hierarchy`, `ListFilter` & Batched Facets** | **Yes** | No | No | No | Yes |
+| **O(tables) SQL Cascade Delete Impact Tree & Signed `select_across`** | **Yes (Chunked async)** | No | No | No | Yes |
+| **Optional DB-Backed IAM UI (`/users`, `/groups`, `/password`)** | **Yes** | Manual | Yes | No | Yes |
+| **TOTP 2FA (Encrypted), Passkeys, OIDC SSO & Session Registry** | **Yes (Pure SVG QR + WebAuthn)** | No | OAuth only | No | Via plugins |
 | **Four-Eyes Approvals & 3-Way OCC Locking** | **Yes (`ETag` / `If-Match`)** | No | No | No | No |
-| **Headless REST API v1 + Scoped API Keys** | **Yes (`OpenAPI 3.1.0` + CIDR/RL)** | No | Partial | No | DRF / Ninja |
-| **HITL MCP Server for AI Agents** | **Yes (`/_mcp` + `flask deck mcp`)** | No | No | No | No |
-| **Keyset Cursor Pagination + PG `JSONB`/`ARRAY`** | **Yes (HMAC cursor + `__fts`)** | No | No | No | Partial |
-| **Calendar / Gallery / Tree + Kanban + BI SQL Charts** | **Yes (`EXPLAIN` + pinned SVG tiles)** | No | No | No | Partial |
-| **Column-Map Wizard CSV/XLSX + Diff Revert** | **Yes (Hash-chained audit + XLSX)** | CSV only | No | No | Via plugin |
-| **4-Level RBAC + Field Masking + Matrix UI** | **Yes** | Manual | Partial | Manual | Via Django |
+| **Headless REST API v1 + Scoped API Keys & HITL MCP Server** | **Yes (`OpenAPI 3.1.0` + `/_mcp`)** | No | Partial | No | DRF / Ninja |
+| **Keyset Cursor Pagination + PG `JSONB`/`ARRAY` + BI SQL Charts** | **Yes (HMAC cursor + `__fts`)** | No | No | No | Partial |
 | **Strict Nonce CSP (`0 unsafe-inline`)** | **Yes** | No | No | No | No |
 
 ---
@@ -327,11 +369,13 @@ Measured on Python 3.13 + SQLAlchemy + SQLite via `uv run python benchmarks/benc
 
 | Workload | Result | Engineering Mechanism |
 | :--- | :--- | :--- |
-| **Frontend Asset Payload** | **`15.63 KB` core gzip** (`9.22 KB` CSS + `6.41 KB` core JS) · **`18.12–20.89 KB`** per-route total | Modular vanilla ES6 (`deck.js` + route-scoped `deck-grid.js` / `deck-form.js` / `deck-ops.js`), zero icon fonts, zero chart or QR libraries; SHA-256 immutable caching (`?v=<hash>`). |
-| **Offset List View (50 / 2,000 rows + FK + 4 Tabs)** | **`6.36 ms` p50 · `4` SQL queries** | Auto `joinedload`/`selectinload` (zero N+1), single-pass `CASE` Quick Tab & Trash aggregation, `defer()` heavy blobs, single-query sidebar counts. |
-| **Keyset Cursor List (50 / 2,000 rows, `count=none`)** | **`6.16 ms` p50 · `4` SQL queries** | HMAC-signed opaque cursor (`LIMIT N+1`, no `OFFSET` table scan, zero `COUNT(*)` overhead). |
-| **Streaming CSV Export (2,000 rows)** | **`60.2 ms` (`33,238 rows/s`) · `2.8 MB` peak** | `session.scalars(stmt).yield_per(500)` + generator streaming (`O(1)` RAM) shared with Background CSV Jobs; CSV/XLSX formula neutralization. |
-| **Dry-Run Savepoint Import (1,000 rows)** | **`194.5 ms` · `0` leaked mutations** | Chunked `IN (...)` batch preload (`batch_size=500`) + released `SAVEPOINT` validation + unconditional `finally: rollback()`; auto-async job above `max_sync_import_rows`. |
+| **Frontend Asset Payload** | **`17.26 KB` core gzip** (`9.81 KB` CSS + `7.46 KB` core JS) · **`19.76–25.34 KB`** per-route total | Modular vanilla ES6 (`deck.js` + route-scoped `deck-grid.js` / `deck-form.js` / `deck-ops.js`), zero icon fonts, zero chart or QR libraries; SHA-256 immutable caching (`?v=<hash>`). |
+| **Offset List View (50 / 2,000 rows + FK + 4 Tabs)** | **`6.11 ms` p50 · `4` SQL queries** | Auto `joinedload`/`selectinload` (zero N+1), single-pass `CASE` Quick Tab & Trash aggregation, `defer()` heavy blobs, single-query sidebar counts. |
+| **Keyset Cursor List (50 / 2,000 rows, `count=none`)** | **`5.86 ms` p50 · `4` SQL queries** | HMAC-signed opaque cursor (`LIMIT N+1`, no `OFFSET` table scan, zero `COUNT(*)` overhead). |
+| **Enriched List View (`date_hierarchy` + `RangeListFilter` + Eager Facets)** | **`7.71 ms` p50 · `6` SQL queries** | SARGable `date_hierarchy` range predicate + shared conditional facets folded right into the single-pass QuickTab aggregation query. |
+| **SQL Cascade Delete Impact Analyzer (Parent + 80 Children)** | **`1.80 ms` · `1` SQL query** | O(tables) BFS over `mapper.registry.mappers` running pure SQL `COUNT(*)` + authorized `LIMIT 5` samples without hydrating child tables. |
+| **Streaming CSV Export (2,000 rows)** | **`71.4 ms` (`28,008 rows/s`) · `2,894 KiB` peak** | `session.scalars(stmt).yield_per(500)` + generator streaming (`O(1)` RAM) shared with Background CSV Jobs; CSV/XLSX formula neutralization. |
+| **Dry-Run Savepoint Import (1,000 rows)** | **`181.8 ms` · `0` leaked mutations** | Chunked `IN (...)` batch preload (`batch_size=500`) + released `SAVEPOINT` validation + unconditional `finally: rollback()`; auto-async job above `max_sync_import_rows`. |
 
 Every page footer displays live request telemetry (`SQLAlchemy 2.0 · 4 queries · 0.3 ms SQL · 8.1 ms`) measured via lightweight request-scoped SQLAlchemy event listeners.
 

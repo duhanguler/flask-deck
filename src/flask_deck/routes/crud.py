@@ -23,12 +23,18 @@ from flask import (
     url_for,
 )
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from werkzeug.datastructures import MultiDict
 
 from flask_deck.adapters.sqlalchemy import decode_pk, encode_pk, extract_pk
 from flask_deck.approvals import make_approval_request
 from flask_deck.audit import AuditEntry, compute_diff
-from flask_deck.exceptions import ImportLimitError, ValidationError
+from flask_deck.exceptions import ImportLimitError, PermissionDeniedError, ValidationError
 from flask_deck.exporter import iter_export_chunks, stream_export_response
+from flask_deck.filters import (
+    collect_shared_facet_exprs,
+    compute_date_hierarchy,
+    compute_filter_facets,
+)
 from flask_deck.formatters import CurrencyFormatter
 from flask_deck.i18n import to_user_timezone
 from flask_deck.importer import (
@@ -38,15 +44,17 @@ from flask_deck.importer import (
     parse_import_payload,
     run_dry_run_import,
 )
-from flask_deck.introspection import introspect_model
 from flask_deck.jobs import JobContext, JobRecord
 from flask_deck.query import (
+    build_filter_condition,
     compute_all_aggregates,
     compute_page_aggregates,
     execute_calendar_query,
     execute_kanban_query,
     execute_list_query,
     execute_tree_query,
+    parse_sort_specs,
+    prepare_scoped_clauses,
     soft_delete_predicate,
 )
 from flask_deck.saved_views import SavedViewRecord, render_safe_markdown
@@ -105,17 +113,23 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         active_tab = eff_single.get("tab", "").strip() or (
             view.quick_tabs[0].key if view.quick_tabs else ""
         )
-        sort_by = eff_single.get("sort", "").strip() or None
-        sort_dir = eff_single.get("dir", "desc").strip()
+        raw_sort = eff_single.get("sort", "").strip() or None
+        raw_dir = eff_single.get("dir", "desc").strip()
         try:
             page = int(eff_single.get("page", "1"))
         except ValueError:
             page = 1
         default_ps = view.page_size or deck.config.page_size
-        try:
-            page_size = int(eff_single.get("page_size", str(default_ps)))
-        except ValueError:
-            page_size = default_ps
+        raw_ps = eff_single.get("page_size", "").strip().lower()
+        effective_max_ps = deck.config.max_page_size
+        if raw_ps == "all":
+            page_size = view.list_max_show_all
+            effective_max_ps = max(deck.config.max_page_size, view.list_max_show_all)
+        else:
+            try:
+                page_size = int(raw_ps) if raw_ps else default_ps
+            except ValueError:
+                page_size = default_ps
 
         filter_pairs: list[tuple[str, str]] = []
         filter_params: dict[str, str] = {}
@@ -129,14 +143,89 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         allowed_searchable, allowed_filterable, allowed_sortable = deck._allowed_query_fields(
             view, user
         )
+        sort_specs = parse_sort_specs(
+            raw_sort, raw_dir, allowed_sortable=allowed_sortable, max_levels=3
+        )
+        hidden_fields = deck.auth.hidden_fields_for(user, slug)
+        masked_fields = deck.auth.masked_fields_for(user, slug)
+
+        custom_filter_specs, appliers_by_param, active_custom_filters, dh_pred = (
+            deck._resolve_custom_filters_and_dh(view, eff_multi_items, user)
+        )
+        custom_appliers = list(appliers_by_param.values())
+
         pag_mode = view.pagination_mode or deck.config.default_pagination_mode
         after_cursor = eff_single.get("after", "").strip() or None
         before_cursor = eff_single.get("before", "").strip() or None
         trashed = bool(view.soft_delete_column and eff_single.get("trashed") == "1")
 
+        sess = deck.get_session(view.bind_key)
+        dialect_name = sess.get_bind().dialect.name if sess.get_bind() is not None else ""
         base_stmt = view.scope_query(sa.select(view.model), user)
+
+        date_hierarchy_data = None
+        if (
+            view.date_hierarchy
+            and not trashed
+            and view.date_hierarchy not in hidden_fields
+            and view.date_hierarchy not in masked_fields
+        ):
+            _, dh_all_where, _, dh_joins = prepare_scoped_clauses(
+                view.meta,
+                base_stmt=base_stmt,
+                searchable_columns=allowed_searchable,
+                filterable_columns=allowed_filterable,
+                quick_tabs=view.quick_tabs,
+                active_tab_key=active_tab or None,
+                search_term=search_term,
+                filter_params=filter_pairs,
+                soft_delete_column=view.soft_delete_column,
+                trashed=trashed,
+                dialect_name=dialect_name,
+                views_by_model=deck._views_by_model,
+                user=user,
+                auth=deck.auth,
+            )
+            date_hierarchy_data, dh_pred = compute_date_hierarchy(
+                sess,
+                view.meta,
+                column_name=view.date_hierarchy,
+                field_label=view.get_column_label(view.date_hierarchy),
+                dh_value=eff_single.get("dh", ""),
+                where_clauses=dh_all_where,
+                joins=dh_joins,
+                custom_appliers=custom_appliers,
+            )
+
+        filter_specs = deck._build_filter_specs(view, allowed_filterable, filter_params, user)
+        filter_panel_open = bool(filter_pairs or active_custom_filters)
+        want_facets = view.show_facets == "always" or (
+            view.show_facets == "auto" and filter_panel_open
+        )
+        active_tab_has_filters = any(t.key == active_tab and t.filters for t in view.quick_tabs)
+        folded_facet_exprs: list[tuple[str, str, sa.ColumnElement[bool]]] = []
+        if (
+            want_facets
+            and not trashed
+            and not filter_pairs
+            and not custom_appliers
+            and dh_pred is None
+            and not active_tab_has_filters
+            and view.count_mode != "none"
+            and (view.quick_tabs or view.soft_delete_column)
+        ):
+            folded_facet_exprs = collect_shared_facet_exprs(
+                sess,
+                view,
+                filter_specs=filter_specs,
+                custom_filters=view.resolved_custom_filters,
+                build_condition_fn=build_filter_condition,
+                user=user,
+                dialect_name=dialect_name,
+            )
+
         result = execute_list_query(
-            deck.get_session(view.bind_key),
+            sess,
             view.meta,
             base_stmt=base_stmt,
             displayed_columns=visible_cols,
@@ -147,12 +236,12 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             active_tab_key=active_tab or None,
             search_term=search_term,
             filter_params=filter_pairs,
-            sort_by=sort_by,
-            sort_dir=sort_dir,
+            sort_by=sort_specs[0][0] if sort_specs else None,
+            sort_dir=sort_specs[0][1] if sort_specs else raw_dir,
             default_sort=view.default_sort,
             page=page,
             page_size=page_size,
-            max_page_size=deck.config.max_page_size,
+            max_page_size=effective_max_ps,
             pagination_mode=pag_mode,
             count_mode=view.count_mode,
             after_cursor=after_cursor,
@@ -163,65 +252,47 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             views_by_model=deck._views_by_model,
             user=user,
             auth=deck.auth,
+            sort_specs=sort_specs,
+            display_fields=view.display_fields,
+            extra_where=[dh_pred] if dh_pred is not None else (),
+            custom_filter_appliers=custom_appliers,
+            extra_facet_exprs=folded_facet_exprs,
         )
 
-        hidden_fields = deck.auth.hidden_fields_for(user, slug)
-        masked_fields = deck.auth.masked_fields_for(user, slug)
-        filter_specs: list[dict[str, Any]] = []
-        for fname in sorted(allowed_filterable):
-            if "." in fname:
-                rel_name, target_col = fname.split(".", 1)
-                if rel_name in hidden_fields or rel_name in masked_fields:
-                    continue
-                rel_meta = view.meta.relationships_by_name.get(rel_name)
-                if rel_meta is None or rel_meta.direction != "MANYTOONE":
-                    continue
-                t_view = deck._views_by_model.get(rel_meta.target_model)
-                t_meta = t_view.meta if t_view is not None else introspect_model(rel_meta.target_model)
-                fm = t_meta.fields_by_name.get(target_col)
-                if fm is None or fm.is_sensitive:
-                    continue
-                filter_specs.append(
-                    {
-                        "name": fname,
-                        "label": f"{rel_meta.label} · {fm.label}",
-                        "type": fm.field_type,
-                        "choices": fm.choices,
-                        "value": filter_params.get(fname, ""),
-                        "gte": filter_params.get(f"{fname}__gte", ""),
-                        "lte": filter_params.get(f"{fname}__lte", ""),
-                        "preset": filter_params.get(f"{fname}__preset", ""),
-                        "has_key": filter_params.get(f"{fname}__has_key", ""),
-                        "path": filter_params.get(f"{fname}__path", ""),
-                        "array_contains": filter_params.get(f"{fname}__array_contains", ""),
-                        "array_any": filter_params.get(f"{fname}__array_any", ""),
-                    }
-                )
-                continue
-            if fname in hidden_fields or fname in masked_fields:
-                continue
-            fm = view.meta.fields_by_name.get(fname)
-            if fm is None:
-                continue
-            spec: dict[str, Any] = {
-                "name": fname,
-                "label": view.get_column_label(fname),
-                "type": "fk" if fm.fk_target_model is not None else fm.field_type,
-                "choices": fm.choices,
-                "value": filter_params.get(fname, ""),
-                "gte": filter_params.get(f"{fname}__gte", ""),
-                "lte": filter_params.get(f"{fname}__lte", ""),
-                "preset": filter_params.get(f"{fname}__preset", ""),
-                "has_key": filter_params.get(f"{fname}__has_key", ""),
-                "path": filter_params.get(f"{fname}__path", ""),
-                "array_contains": filter_params.get(f"{fname}__array_contains", ""),
-                "array_any": filter_params.get(f"{fname}__array_any", ""),
-            }
-            if fm.fk_target_model is not None:
-                spec["fk_options"] = deck._fk_options_for_field(
-                    fm.fk_target_model, limit=40, fallback_bind_key=view.bind_key
-                )
-            filter_specs.append(spec)
+        filter_panel_open = bool(result.active_filters or active_custom_filters)
+        facets_data: dict[str, dict[str, int]] = {}
+        if view.show_facets == "always" or (view.show_facets == "auto" and filter_panel_open):
+            nf_where, _, fw_by_field, f_joins = prepare_scoped_clauses(
+                view.meta,
+                base_stmt=base_stmt,
+                searchable_columns=allowed_searchable,
+                filterable_columns=allowed_filterable,
+                quick_tabs=view.quick_tabs,
+                active_tab_key=active_tab or None,
+                search_term=search_term,
+                filter_params=filter_pairs,
+                soft_delete_column=view.soft_delete_column,
+                trashed=trashed,
+                dialect_name=dialect_name,
+                views_by_model=deck._views_by_model,
+                user=user,
+                auth=deck.auth,
+                extra_where=[dh_pred] if dh_pred is not None else (),
+            )
+            facets_data = compute_filter_facets(
+                sess,
+                view,
+                base_where=nf_where,
+                joins=f_joins,
+                filter_specs=filter_specs,
+                custom_filters=view.resolved_custom_filters,
+                custom_appliers_by_param=appliers_by_param,
+                filter_where_by_field=fw_by_field,
+                build_condition_fn=build_filter_condition,
+                user=user,
+                dialect_name=dialect_name,
+                precomputed_facets=result.precomputed_facets,
+            )
 
         can_create = (
             view.can_create
@@ -250,12 +321,25 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             and deck.auth.has_permission(user, f"{slug}:import", model_slug=slug)
         )
 
-        readonly_fields = deck.auth.readonly_fields_for(user, slug)
+        readonly_fields = deck.auth.readonly_fields_for(user, slug) | view.resolved_readonly_fields
         inline_editable = (
             (view.resolved_inline_editable - readonly_fields - hidden_fields)
             if can_edit
             else frozenset()
         )
+        inline_fk_options: dict[str, list[dict[str, str]]] = {}
+        if inline_editable:
+            cached_fk_by_name = {
+                fs["name"]: fs["fk_options"]
+                for fs in filter_specs
+                if fs.get("type") == "fk" and "fk_options" in fs
+            }
+            for col in inline_editable:
+                fm = view.meta.fields_by_name.get(col)
+                if fm is not None and fm.fk_target_model is not None:
+                    inline_fk_options[col] = cached_fk_by_name.get(col) or deck._fk_options_for_field(
+                        fm.fk_target_model, limit=40, fallback_bind_key=view.bind_key
+                    )
 
         bulk_actions = [
             spec
@@ -397,7 +481,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         if view_mode in {"table", "tree"} and allowed_agg_spec:
             if view.aggregate_scope == "all":
                 page_aggregates = compute_all_aggregates(
-                    deck.get_session(view.bind_key),
+                    sess,
                     view.meta,
                     base_stmt=base_stmt,
                     column_aggregates=allowed_agg_spec,
@@ -412,6 +496,8 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     views_by_model=deck._views_by_model,
                     user=user,
                     auth=deck.auth,
+                    extra_where=[dh_pred] if dh_pred is not None else (),
+                    custom_filter_appliers=custom_appliers,
                 )
             else:
                 page_aggregates = compute_page_aggregates(result.items, allowed_agg_spec)
@@ -442,6 +528,26 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             user is not None
             and (user.is_superuser or deck.auth.has_permission(user, "saved_views:manage"))
         )
+        eff_sorts = sort_specs or [
+            (
+                view.default_sort[0] if view.default_sort else view.meta.primary_keys[0].name,
+                view.default_sort[1] if view.default_sort else "desc",
+            )
+        ]
+        sort_rank_map = {col: (idx + 1, direction) for idx, (col, direction) in enumerate(eff_sorts)}
+        sort_param_value = ",".join(f"{c}:{d}" for c, d in sort_specs)
+        current_qs_raw = _qs().lstrip("?")
+        return_qs = deck._sanitize_return_qs(current_qs_raw) if view.preserve_filters else ""
+        select_across_token = deck._sign_select_across_token(
+            slug,
+            user,
+            {"items": [[k, v] for k, v in eff_multi_items], "trashed": trashed},
+        )
+        facets_url = (
+            url_for(f"{bp_name}.api_facets", slug=slug)
+            if view.show_facets != "never"
+            else ""
+        )
 
         return render_template(
             "flask_deck/model_list.html",
@@ -453,9 +559,19 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 visible_cols=visible_cols,
                 search_term=search_term,
                 active_tab=active_tab,
-                sort_by=sort_by or (view.default_sort[0] if view.default_sort else view.meta.primary_keys[0].name),
-                sort_dir=sort_dir,
+                sort_by=eff_sorts[0][0],
+                sort_dir=eff_sorts[0][1],
+                sort_specs=sort_specs,
+                sort_rank_map=sort_rank_map,
+                sort_param_value=sort_param_value,
                 filter_specs=filter_specs,
+                custom_filter_specs=custom_filter_specs,
+                active_custom_filters=active_custom_filters,
+                filter_panel_open=filter_panel_open,
+                facets_data=facets_data,
+                facets_url=facets_url,
+                date_hierarchy_data=date_hierarchy_data,
+                inline_fk_options=inline_fk_options,
                 can_create=can_create,
                 can_edit=can_edit,
                 can_delete=can_delete,
@@ -492,7 +608,11 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 can_manage_shared_views=can_manage_shared_views,
                 current_user_id=user.id if user else "",
                 is_superuser=bool(user and user.is_superuser),
-                current_query_string=_qs().lstrip("?"),
+                current_query_string=current_qs_raw,
+                return_qs=return_qs,
+                select_across_token=select_across_token,
+                active_dh=eff_single.get("dh", ""),
+                raw_page_size=raw_ps,
                 qs=_qs,
             ),
         )
@@ -506,6 +626,12 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
 
         errors: dict[str, list[str]] = {}
         submitted: Mapping[str, Any] | None = None
+        return_qs = (
+            deck._sanitize_return_qs(request.values.get("_return_qs", ""))
+            if view.preserve_filters
+            else ""
+        )
+        list_return_url = deck._list_url_with_return(slug, return_qs)
         clone_pk = request.args.get("clone", "").strip()
         if request.method == "GET" and clone_pk:
             deck._require_perm(f"{slug}:view", model_slug=slug)
@@ -657,7 +783,25 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     payload={"repr": safe_repr},
                 )
                 flash(f"Created {view.label} ({safe_repr}).", "ok")
-                return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+                save_action = request.form.get("_save_action", "save").strip()
+                if save_action == "continue":
+                    return redirect(
+                        url_for(
+                            f"{bp_name}.model_edit",
+                            slug=slug,
+                            raw_pk=pk_str,
+                            _return_qs=return_qs or None,
+                        )
+                    )
+                if save_action == "add_another":
+                    return redirect(
+                        url_for(
+                            f"{bp_name}.model_create",
+                            slug=slug,
+                            _return_qs=return_qs or None,
+                        )
+                    )
+                return redirect(list_return_url)
             except ValidationError as exc:
                 sess.rollback()
                 deck._delete_orphan_files_best_effort(newly_stored)
@@ -688,6 +832,11 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 page_title=f"New {view.label}",
                 active_nav=slug,
                 requires_approval_hint=requires_approval_hint,
+                return_qs=return_qs,
+                list_return_url=list_return_url,
+                can_add_another=True,
+                can_save_as=False,
+                view_on_site_url=None,
                 **form_ctx,
             ),
         )
@@ -706,6 +855,16 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
 
         media_builder = deck._media_url_builder(view)
         rel_url_builder = deck._rel_url_builder(user)
+        return_qs = (
+            deck._sanitize_return_qs(request.args.get("_return_qs", ""))
+            if view.preserve_filters
+            else ""
+        )
+        list_return_url = (
+            url_for(f"{bp_name}.model_list", slug=slug)
+            + (f"?{return_qs}" if return_qs else "")
+        )
+        view_on_site_url = view.get_view_on_site_url(obj)
         fields_display = []
         for f in view.meta.fields:
             if f.name in hidden or f.is_sensitive:
@@ -718,6 +877,25 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     "label": view.get_column_label(f.name),
                     "formatted": view.format_cell(
                         col_key,
+                        obj,
+                        auth=deck.auth,
+                        user=user,
+                        media_url_builder=media_builder,
+                        rel_repr=deck._rel_repr,
+                        rel_url_builder=rel_url_builder,
+                    ),
+                }
+            )
+        seen_disp_names = {d["name"] for d in fields_display}
+        for disp_name in view.display_fields:
+            if disp_name in hidden or disp_name in seen_disp_names:
+                continue
+            fields_display.append(
+                {
+                    "name": disp_name,
+                    "label": view.get_column_label(disp_name),
+                    "formatted": view.format_cell(
+                        disp_name,
                         obj,
                         auth=deck.auth,
                         user=user,
@@ -871,6 +1049,9 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 can_delete=can_delete,
                 can_force_delete=can_force_delete,
                 is_soft_deleted=is_soft_deleted,
+                return_qs=return_qs,
+                list_return_url=list_return_url,
+                view_on_site_url=view_on_site_url,
             ),
         )
 
@@ -964,6 +1145,18 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=encode_pk(pk_vals)))
         pk_str = encode_pk(pk_vals)
         cur_user = deck._current_user()
+        return_qs = (
+            deck._sanitize_return_qs(request.values.get("_return_qs", ""))
+            if view.preserve_filters
+            else ""
+        )
+        list_return_url = deck._list_url_with_return(slug, return_qs)
+        can_add_another = bool(
+            view.can_create
+            and not deck.config.read_only
+            and deck.auth.has_permission(cur_user, f"{slug}:create", model_slug=slug)
+        )
+        can_save_as = bool(view.save_as and can_add_another)
 
         errors: dict[str, list[str]] = {}
         submitted: Mapping[str, Any] | None = None
@@ -971,234 +1164,397 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         if request.method == "POST":
             submitted = request.form
             sess = deck.get_session(view.bind_key)
-            current_ver = view.compute_version_token(obj, auth=deck.auth, user=cur_user)
-            submitted_ver = request.form.get("_deck_version")
-            force_overwrite = request.form.get("_deck_force_overwrite", "").strip() == "1"
-            if (
-                submitted_ver is not None
-                and not force_overwrite
-                and submitted_ver.strip() != current_ver
-            ):
-                conflicts: list[dict[str, Any]] = []
-                writable_fields = view.allowed_form_fields(deck.auth, cur_user, mode="edit")
-                masked = deck.auth.masked_fields_for(cur_user, slug)
-                for col in writable_fields:
-                    if col in masked or col in view.file_fields:
-                        continue
-                    fmeta = view.meta.fields_by_name.get(col)
-                    if fmeta is None or fmeta.primary_key:
-                        continue
-                    cur_val = getattr(obj, col, None)
-                    if isinstance(cur_val, enum.Enum):
-                        cur_val = cur_val.value
-                    sub_raw = request.form.get(col)
-                    cur_str = "" if cur_val is None else str(cur_val)
-                    if fmeta.field_type == "boolean":
-                        sub_bool = str(sub_raw or "").strip().lower() in {
-                            "1",
-                            "true",
-                            "yes",
-                            "on",
-                        }
-                        cur_bool = bool(cur_val)
-                        if sub_bool != cur_bool:
+            save_action = request.form.get("_save_action", "save").strip()
+            if save_action == "save_as":
+                if not can_save_as:
+                    raise PermissionDeniedError(f"Save as new is not allowed on {slug}.")
+                clone_pairs: list[tuple[str, str]] = []
+                for fk_name, fv_val in request.form.items(multi=True):
+                    if fk_name.startswith("inline__") and fk_name.endswith("___pk"):
+                        clone_pairs.append((fk_name, ""))
+                    else:
+                        clone_pairs.append((fk_name, fv_val))
+                clone_md = MultiDict(clone_pairs)
+                new_obj = view.model()
+                newly_stored_as: list[tuple[Any, str]] = []
+
+                def _scope_m2m_as(target_cls: type[Any], s: sa.Select[Any]) -> sa.Select[Any]:
+                    tv = deck._views_by_model.get(target_cls)
+                    return tv.scope_query(s, cur_user) if tv is not None else s
+
+                try:
+                    view.apply_form_data(
+                        sess,
+                        new_obj,
+                        clone_md,
+                        auth=deck.auth,
+                        user=cur_user,
+                        mode="create",
+                        max_json_depth=deck.config.max_json_depth,
+                        m2m_getter=clone_md.getlist,
+                        m2m_scope=_scope_m2m_as,
+                    )
+                    newly_stored_as, _ = view.apply_file_uploads(
+                        new_obj,
+                        request.files,
+                        clone_md,
+                        auth=deck.auth,
+                        user=cur_user,
+                        mode="create",
+                        default_max_bytes=deck.config.max_upload_bytes,
+                    )
+                    view.on_model_change(new_obj, is_created=True, user=cur_user)
+                    sess.add(new_obj)
+                    sess.flush()
+                    inline_diffs_as = view.apply_inline_forms(
+                        sess,
+                        new_obj,
+                        clone_md,
+                        auth=deck.auth,
+                        user=cur_user,
+                        max_json_depth=deck.config.max_json_depth,
+                    )
+                    if deck.approval_store is not None and view.requires_approval(
+                        cur_user, "create", payload=dict(clone_md)
+                    ):
+                        safe_repr = view.format_record_repr(new_obj, auth=deck.auth, user=cur_user)
+                        diff = compute_diff(
+                            {},
+                            view.extract_snapshot(new_obj),
+                            sensitive_fields=view.meta.sensitive_fields,
+                            extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+                        )
+                        sess.rollback()
+                        deck._delete_orphan_files_best_effort(newly_stored_as)
+                        req = make_approval_request(
+                            model_slug=slug,
+                            model_label=view.label,
+                            operation="create",
+                            record_pk="pending",
+                            record_repr=safe_repr,
+                            payload={
+                                "form_items": [[k, v] for k, v in clone_md.items(multi=True)],
+                                "_actor_roles": list(cur_user.roles) if cur_user else [],
+                                "_actor_superuser": bool(cur_user.is_superuser) if cur_user else False,
+                            },
+                            diff=diff,
+                            reason=request.form.get("approval_reason", "").strip(),
+                            requester_id=cur_user.id if cur_user else "system",
+                            requester_name=cur_user.label if cur_user else "System",
+                            actor_type="human",
+                        )
+                        saved_req = deck.approval_store.create(req)
+                        flash(
+                            f"Save-as-new request queued for four-eyes approval (#{saved_req.id}).",
+                            "ok",
+                        )
+                        return redirect(list_return_url)
+                    sess.commit()
+                    new_pk_str = encode_pk(extract_pk(new_obj, view.meta))
+                    safe_repr = view.format_record_repr(new_obj, auth=deck.auth, user=cur_user)
+                    diff = compute_diff(
+                        {},
+                        view.extract_snapshot(new_obj),
+                        sensitive_fields=view.meta.sensitive_fields,
+                        extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+                    )
+                    deck._record_audit(
+                        action_name="create",
+                        view=view,
+                        record_pk=new_pk_str,
+                        record_repr=safe_repr,
+                        changes=diff,
+                        metadata={"saved_as_from": pk_str},
+                    )
+                    deck._record_inline_audits(
+                        view=view,
+                        parent_pk=new_pk_str,
+                        inline_diffs=inline_diffs_as,
+                    )
+                    deck._emit_event(
+                        "record.created",
+                        model_slug=slug,
+                        record_pk=new_pk_str,
+                        payload={"repr": safe_repr, "saved_as_from": pk_str},
+                    )
+                    flash(f"Saved as new {view.label} ({safe_repr}).", "ok")
+                    return redirect(
+                        url_for(
+                            f"{bp_name}.model_edit",
+                            slug=slug,
+                            raw_pk=new_pk_str,
+                            _return_qs=return_qs or None,
+                        )
+                    )
+                except ValidationError as exc:
+                    sess.rollback()
+                    deck._delete_orphan_files_best_effort(newly_stored_as)
+                    errors = exc.errors
+                except IntegrityError as exc:
+                    sess.rollback()
+                    deck._delete_orphan_files_best_effort(newly_stored_as)
+                    errors = {"__all__": [f"Database integrity constraint failed: {exc.orig}"]}
+                except SQLAlchemyError as exc:
+                    sess.rollback()
+                    deck._delete_orphan_files_best_effort(newly_stored_as)
+                    errors = {"__all__": [f"Database error: {exc.__class__.__name__}"]}
+                except Exception:
+                    sess.rollback()
+                    deck._delete_orphan_files_best_effort(newly_stored_as)
+                    raise
+            else:
+                current_ver = view.compute_version_token(obj, auth=deck.auth, user=cur_user)
+                submitted_ver = request.form.get("_deck_version")
+                force_overwrite = request.form.get("_deck_force_overwrite", "").strip() == "1"
+                if (
+                    submitted_ver is not None
+                    and not force_overwrite
+                    and submitted_ver.strip() != current_ver
+                ):
+                    conflicts: list[dict[str, Any]] = []
+                    writable_fields = view.allowed_form_fields(deck.auth, cur_user, mode="edit")
+                    masked = deck.auth.masked_fields_for(cur_user, slug)
+                    for col in writable_fields:
+                        if col in masked or col in view.file_fields:
+                            continue
+                        fmeta = view.meta.fields_by_name.get(col)
+                        if fmeta is None or fmeta.primary_key:
+                            continue
+                        cur_val = getattr(obj, col, None)
+                        if isinstance(cur_val, enum.Enum):
+                            cur_val = cur_val.value
+                        sub_raw = request.form.get(col)
+                        cur_str = "" if cur_val is None else str(cur_val)
+                        if fmeta.field_type == "boolean":
+                            sub_bool = str(sub_raw or "").strip().lower() in {
+                                "1",
+                                "true",
+                                "yes",
+                                "on",
+                            }
+                            cur_bool = bool(cur_val)
+                            if sub_bool != cur_bool:
+                                conflicts.append(
+                                    {
+                                        "field": col,
+                                        "label": view.get_column_label(col),
+                                        "submitted": str(sub_bool),
+                                        "current": str(cur_bool),
+                                    }
+                                )
+                        elif sub_raw is not None and sub_raw != cur_str:
                             conflicts.append(
                                 {
                                     "field": col,
                                     "label": view.get_column_label(col),
-                                    "submitted": str(sub_bool),
-                                    "current": str(cur_bool),
+                                    "submitted": sub_raw,
+                                    "current": cur_str,
                                 }
                             )
-                    elif sub_raw is not None and sub_raw != cur_str:
+                    if not conflicts:
                         conflicts.append(
                             {
-                                "field": col,
-                                "label": view.get_column_label(col),
-                                "submitted": sub_raw,
-                                "current": cur_str,
+                                "field": "__version__",
+                                "label": "Record Version",
+                                "submitted": submitted_ver.strip() or "(stale)",
+                                "current": current_ver,
                             }
                         )
-                if not conflicts:
-                    conflicts.append(
-                        {
-                            "field": "__version__",
-                            "label": "Record Version",
-                            "submitted": submitted_ver.strip() or "(stale)",
-                            "current": current_ver,
-                        }
+                    sess.rollback()
+                    form_ctx = deck._build_form_context(
+                        view,
+                        obj=obj,
+                        mode="edit",
+                        errors={
+                            "__all__": [
+                                "Concurrent modification detected (409). Another user updated this record since you opened it."
+                            ]
+                        },
+                        submitted=submitted,
                     )
-                sess.rollback()
-                form_ctx = deck._build_form_context(
-                    view,
-                    obj=obj,
-                    mode="edit",
-                    errors={
-                        "__all__": [
-                            "Concurrent modification detected (409). Another user updated this record since you opened it."
-                        ]
-                    },
-                    submitted=submitted,
-                )
-                return (
-                    render_template(
-                        "flask_deck/model_form.html",
-                        **deck._base_context(
-                            page_title=f"Edit {view.format_record_repr(obj, auth=deck.auth, user=cur_user)}",
-                            active_nav=slug,
-                            pk_str=pk_str,
-                            occ_conflict=conflicts,
-                            requires_approval_hint=(
-                                deck.approval_store is not None
-                                and view.requires_approval(cur_user, "edit", obj=obj)
+                    return (
+                        render_template(
+                            "flask_deck/model_form.html",
+                            **deck._base_context(
+                                page_title=f"Edit {view.format_record_repr(obj, auth=deck.auth, user=cur_user)}",
+                                active_nav=slug,
+                                pk_str=pk_str,
+                                occ_conflict=conflicts,
+                                return_qs=return_qs,
+                                list_return_url=list_return_url,
+                                can_add_another=can_add_another,
+                                can_save_as=can_save_as,
+                                view_on_site_url=view.get_view_on_site_url(obj),
+                                requires_approval_hint=(
+                                    deck.approval_store is not None
+                                    and view.requires_approval(cur_user, "edit", obj=obj)
+                                ),
+                                **form_ctx,
                             ),
-                            **form_ctx,
                         ),
-                    ),
-                    409,
-                )
+                        409,
+                    )
 
-            before_snap = view.extract_snapshot(obj)
-            newly_stored: list[tuple[Any, str]] = []
-            orphans: list[tuple[Any, str]] = []
+                before_snap = view.extract_snapshot(obj)
+                newly_stored: list[tuple[Any, str]] = []
+                orphans: list[tuple[Any, str]] = []
 
-            def _scope_m2m(target_cls: type[Any], s: sa.Select[Any]) -> sa.Select[Any]:
-                tv = deck._views_by_model.get(target_cls)
-                return tv.scope_query(s, cur_user) if tv is not None else s
+                def _scope_m2m(target_cls: type[Any], s: sa.Select[Any]) -> sa.Select[Any]:
+                    tv = deck._views_by_model.get(target_cls)
+                    return tv.scope_query(s, cur_user) if tv is not None else s
 
-            try:
-                needs_approval = deck.approval_store is not None and view.requires_approval(
-                    cur_user, "edit", obj=obj, payload=dict(request.form)
-                )
-                view.apply_form_data(
-                    sess,
-                    obj,
-                    request.form,
-                    auth=deck.auth,
-                    user=cur_user,
-                    mode="edit",
-                    max_json_depth=deck.config.max_json_depth,
-                    m2m_getter=request.form.getlist,
-                    m2m_scope=_scope_m2m,
-                )
-                newly_stored, orphans = view.apply_file_uploads(
-                    obj,
-                    request.files,
-                    request.form,
-                    auth=deck.auth,
-                    user=cur_user,
-                    mode="edit",
-                    default_max_bytes=deck.config.max_upload_bytes,
-                )
-                if not needs_approval and view.version_column:
-                    vf = view.meta.fields_by_name.get(view.version_column)
-                    if vf is not None and vf.field_type == "integer":
-                        setattr(
-                            obj,
-                            view.version_column,
-                            int(before_snap.get(view.version_column) or 0) + 1,
+                try:
+                    needs_approval = deck.approval_store is not None and view.requires_approval(
+                        cur_user, "edit", obj=obj, payload=dict(request.form)
+                    )
+                    view.apply_form_data(
+                        sess,
+                        obj,
+                        request.form,
+                        auth=deck.auth,
+                        user=cur_user,
+                        mode="edit",
+                        max_json_depth=deck.config.max_json_depth,
+                        m2m_getter=request.form.getlist,
+                        m2m_scope=_scope_m2m,
+                    )
+                    newly_stored, orphans = view.apply_file_uploads(
+                        obj,
+                        request.files,
+                        request.form,
+                        auth=deck.auth,
+                        user=cur_user,
+                        mode="edit",
+                        default_max_bytes=deck.config.max_upload_bytes,
+                    )
+                    if not needs_approval and view.version_column:
+                        vf = view.meta.fields_by_name.get(view.version_column)
+                        if vf is not None and vf.field_type == "integer":
+                            setattr(
+                                obj,
+                                view.version_column,
+                                int(before_snap.get(view.version_column) or 0) + 1,
+                            )
+                    view.on_model_change(obj, is_created=False, user=cur_user)
+                    sess.flush()
+                    inline_diffs = view.apply_inline_forms(
+                        sess,
+                        obj,
+                        request.form,
+                        auth=deck.auth,
+                        user=cur_user,
+                        max_json_depth=deck.config.max_json_depth,
+                    )
+                    if needs_approval and deck.approval_store is not None:
+                        safe_repr = view.format_record_repr(obj, auth=deck.auth, user=cur_user)
+                        diff = compute_diff(
+                            before_snap,
+                            view.extract_snapshot(obj),
+                            sensitive_fields=view.meta.sensitive_fields,
+                            extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
                         )
-                view.on_model_change(obj, is_created=False, user=cur_user)
-                sess.flush()
-                inline_diffs = view.apply_inline_forms(
-                    sess,
-                    obj,
-                    request.form,
-                    auth=deck.auth,
-                    user=cur_user,
-                    max_json_depth=deck.config.max_json_depth,
-                )
-                if needs_approval and deck.approval_store is not None:
+                        if inline_diffs:
+                            diff["__inlines__"] = {
+                                "old": None,
+                                "new": f"{len(inline_diffs)} inline item(s)",
+                            }
+                        sess.rollback()
+                        deck._delete_orphan_files_best_effort(newly_stored)
+                        req = make_approval_request(
+                            model_slug=slug,
+                            model_label=view.label,
+                            operation="edit",
+                            record_pk=pk_str,
+                            record_repr=safe_repr,
+                            payload={
+                                "form_items": [[k, v] for k, v in request.form.items(multi=True)],
+                                "_actor_roles": list(cur_user.roles) if cur_user else [],
+                                "_actor_superuser": bool(cur_user.is_superuser) if cur_user else False,
+                            },
+                            diff=diff,
+                            reason=request.form.get("approval_reason", "").strip(),
+                            requester_id=cur_user.id if cur_user else "system",
+                            requester_name=cur_user.label if cur_user else "System",
+                            actor_type="human",
+                        )
+                        saved_req = deck.approval_store.create(req)
+                        deck._emit_event(
+                            "approval.requested",
+                            model_slug=slug,
+                            record_pk=pk_str,
+                            payload={"approval_id": saved_req.id, "operation": "edit"},
+                        )
+                        flash(
+                            f"Edit request queued for four-eyes approval (#{saved_req.id}).",
+                            "ok",
+                        )
+                        return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=pk_str))
+                    sess.commit()
+                    deck._delete_orphan_files_best_effort(orphans)
+                    after_snap = view.extract_snapshot(obj)
                     safe_repr = view.format_record_repr(obj, auth=deck.auth, user=cur_user)
                     diff = compute_diff(
                         before_snap,
-                        view.extract_snapshot(obj),
+                        after_snap,
                         sensitive_fields=view.meta.sensitive_fields,
                         extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
                     )
-                    if inline_diffs:
-                        diff["__inlines__"] = {
-                            "old": None,
-                            "new": f"{len(inline_diffs)} inline item(s)",
-                        }
+                    if diff:
+                        deck._record_audit(
+                            action_name="update",
+                            view=view,
+                            record_pk=pk_str,
+                            record_repr=safe_repr,
+                            changes=diff,
+                        )
+                        deck._emit_event(
+                            "record.updated",
+                            model_slug=slug,
+                            record_pk=pk_str,
+                            payload={"fields": sorted(diff.keys())},
+                        )
+                    deck._record_inline_audits(
+                        view=view,
+                        parent_pk=pk_str,
+                        inline_diffs=inline_diffs,
+                    )
+                    flash(f"Saved changes to {safe_repr}.", "ok")
+                    if save_action == "continue":
+                        return redirect(
+                            url_for(
+                                f"{bp_name}.model_edit",
+                                slug=slug,
+                                raw_pk=pk_str,
+                                _return_qs=return_qs or None,
+                            )
+                        )
+                    if save_action == "add_another" and can_add_another:
+                        return redirect(
+                            url_for(
+                                f"{bp_name}.model_create",
+                                slug=slug,
+                                _return_qs=return_qs or None,
+                            )
+                        )
+                    if return_qs:
+                        return redirect(list_return_url)
+                    return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=pk_str))
+                except ValidationError as exc:
                     sess.rollback()
                     deck._delete_orphan_files_best_effort(newly_stored)
-                    req = make_approval_request(
-                        model_slug=slug,
-                        model_label=view.label,
-                        operation="edit",
-                        record_pk=pk_str,
-                        record_repr=safe_repr,
-                        payload={
-                            "form_items": [[k, v] for k, v in request.form.items(multi=True)],
-                            "_actor_roles": list(cur_user.roles) if cur_user else [],
-                            "_actor_superuser": bool(cur_user.is_superuser) if cur_user else False,
-                        },
-                        diff=diff,
-                        reason=request.form.get("approval_reason", "").strip(),
-                        requester_id=cur_user.id if cur_user else "system",
-                        requester_name=cur_user.label if cur_user else "System",
-                        actor_type="human",
-                    )
-                    saved_req = deck.approval_store.create(req)
-                    deck._emit_event(
-                        "approval.requested",
-                        model_slug=slug,
-                        record_pk=pk_str,
-                        payload={"approval_id": saved_req.id, "operation": "edit"},
-                    )
-                    flash(
-                        f"Edit request queued for four-eyes approval (#{saved_req.id}).",
-                        "ok",
-                    )
-                    return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=pk_str))
-                sess.commit()
-                deck._delete_orphan_files_best_effort(orphans)
-                after_snap = view.extract_snapshot(obj)
-                safe_repr = view.format_record_repr(obj, auth=deck.auth, user=cur_user)
-                diff = compute_diff(
-                    before_snap,
-                    after_snap,
-                    sensitive_fields=view.meta.sensitive_fields,
-                    extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
-                )
-                if diff:
-                    deck._record_audit(
-                        action_name="update",
-                        view=view,
-                        record_pk=pk_str,
-                        record_repr=safe_repr,
-                        changes=diff,
-                    )
-                    deck._emit_event(
-                        "record.updated",
-                        model_slug=slug,
-                        record_pk=pk_str,
-                        payload={"fields": sorted(diff.keys())},
-                    )
-                deck._record_inline_audits(
-                    view=view,
-                    parent_pk=pk_str,
-                    inline_diffs=inline_diffs,
-                )
-                flash(f"Saved changes to {safe_repr}.", "ok")
-                return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=pk_str))
-            except ValidationError as exc:
-                sess.rollback()
-                deck._delete_orphan_files_best_effort(newly_stored)
-                errors = exc.errors
-            except IntegrityError as exc:
-                sess.rollback()
-                deck._delete_orphan_files_best_effort(newly_stored)
-                errors = {"__all__": [f"Database integrity constraint failed: {exc.orig}"]}
-            except SQLAlchemyError as exc:
-                sess.rollback()
-                deck._delete_orphan_files_best_effort(newly_stored)
-                errors = {"__all__": [f"Database error: {exc.__class__.__name__}"]}
-            except Exception:
-                sess.rollback()
-                deck._delete_orphan_files_best_effort(newly_stored)
-                raise
+                    errors = exc.errors
+                except IntegrityError as exc:
+                    sess.rollback()
+                    deck._delete_orphan_files_best_effort(newly_stored)
+                    errors = {"__all__": [f"Database integrity constraint failed: {exc.orig}"]}
+                except SQLAlchemyError as exc:
+                    sess.rollback()
+                    deck._delete_orphan_files_best_effort(newly_stored)
+                    errors = {"__all__": [f"Database error: {exc.__class__.__name__}"]}
+                except Exception:
+                    sess.rollback()
+                    deck._delete_orphan_files_best_effort(newly_stored)
+                    raise
 
         form_ctx = deck._build_form_context(
             view, obj=obj, mode="edit", errors=errors, submitted=submitted
@@ -1210,6 +1566,11 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 active_nav=slug,
                 pk_str=pk_str,
                 occ_conflict=occ_conflict,
+                return_qs=return_qs,
+                list_return_url=list_return_url,
+                can_add_another=can_add_another,
+                can_save_as=can_save_as,
+                view_on_site_url=view.get_view_on_site_url(obj),
                 requires_approval_hint=(
                     deck.approval_store is not None
                     and view.requires_approval(cur_user, "edit", obj=obj)
@@ -1233,6 +1594,12 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         pk_str = encode_pk(pk_vals)
         repr_str = view.format_record_repr(obj, auth=deck.auth, user=cur_user)
         before_snap = view.extract_snapshot(obj)
+        return_qs = (
+            deck._sanitize_return_qs(request.values.get("_return_qs", ""))
+            if view.preserve_filters
+            else ""
+        )
+        list_return_url = deck._list_url_with_return(slug, return_qs)
 
         sess = deck.get_session(view.bind_key)
         if deck.approval_store is not None and view.requires_approval(
@@ -1317,7 +1684,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     payload={"soft": True, "repr": repr_str},
                 )
                 flash(f"Moved {view.label} ({repr_str}) to Trash.", "ok")
-                return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+                return redirect(list_return_url)
 
         if view.soft_delete_column and force_delete:
             deck._require_perm(f"{slug}:force_delete", model_slug=slug, obj=obj)
@@ -1355,7 +1722,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             payload={"soft": False, "repr": repr_str},
         )
         flash(f"Deleted {view.label} ({repr_str}).", "ok")
-        return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+        return redirect(list_return_url)
 
     @bp.route("/<slug>/<raw_pk>/restore", methods=["POST"])
     def model_restore(slug: str, raw_pk: str) -> Any:
@@ -1373,6 +1740,12 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         pk_str = encode_pk(pk_vals)
         cur_user = deck._current_user()
         repr_str = view.format_record_repr(obj, auth=deck.auth, user=cur_user)
+        return_qs = (
+            deck._sanitize_return_qs(request.values.get("_return_qs", ""))
+            if view.preserve_filters
+            else ""
+        )
+        list_return_url = deck._list_url_with_return(slug, return_qs)
         if not deck._is_soft_deleted(view, obj):
             flash(f"{view.label} ({repr_str}) is already active.", "neutral")
             return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=pk_str))
@@ -1406,40 +1779,312 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             payload={"repr": repr_str},
         )
         flash(f"Restored {view.label} ({repr_str}) from Trash.", "ok")
-        return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+        return redirect(list_return_url)
 
     @bp.route("/<slug>/action/<action_name>", methods=["POST"])
     def model_action(slug: str, action_name: str) -> Any:
         view = deck.get_view(slug)
         user = deck._current_user()
-        raw_pks = [p for p in request.form.getlist("selected_pks") if p.strip()]
-        if not raw_pks:
-            flash("Select at least one record.", "warn")
-            return redirect(url_for(f"{bp_name}.model_list", slug=slug))
-
-        decoded_pks = [decode_pk(p, view.meta) for p in raw_pks]
+        return_qs = (
+            deck._sanitize_return_qs(request.form.get("_return_qs", ""))
+            if view.preserve_filters
+            else ""
+        )
+        list_return_url = deck._list_url_with_return(slug, return_qs)
+        trash_return_url = (
+            list_return_url
+            if return_qs
+            else url_for(f"{bp_name}.model_list", slug=slug, trashed="1")
+        )
         is_trash_bulk = action_name in {"restore", "force_delete"}
-        stmt = view.scope_query(sa.select(view.model), user)
         sd_pred = (
             soft_delete_predicate(view.meta, view.soft_delete_column, trashed=is_trash_bulk)
             if view.soft_delete_column
             else None
         )
-        if sd_pred is not None:
-            stmt = stmt.where(sd_pred)
-        if len(view.meta.primary_keys) == 1:
-            pk_col = getattr(view.model, view.meta.primary_keys[0].name)
-            stmt = stmt.where(pk_col.in_([pk[0] for pk in decoded_pks]))
-        else:
+        sess = deck.get_session(view.bind_key)
+
+        select_across = request.form.get("select_across") == "1"
+        if select_across:
+            slice_token = request.form.get("slice_token", "").strip()
+            token_state = deck._verify_select_across_token(
+                slice_token, expected_slug=slug, user=user
+            )
+            if token_state is None:
+                abort(403)
+            if view.soft_delete_column and bool(token_state.get("trashed")) != is_trash_bulk:
+                abort(403)
+            raw_items = token_state.get("items", [])
+            eff_items = [
+                (str(pair[0]), str(pair[1]))
+                for pair in raw_items
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+            ]
+            scoped_pk_stmt, _ = deck._build_filtered_pk_statement(
+                view, eff_items, user=user, trashed_override=is_trash_bulk if view.soft_delete_column else None
+            )
             pk_cols = [getattr(view.model, pk.name) for pk in view.meta.primary_keys]
-            stmt = stmt.where(sa.tuple_(*pk_cols).in_(decoded_pks))
-        records = list(deck.get_session(view.bind_key).scalars(stmt).all())
+            pk_rows = sess.execute(
+                scoped_pk_stmt.with_only_columns(*pk_cols).limit(deck.config.max_select_across + 1)
+            ).all()
+            if len(pk_rows) > deck.config.max_select_across:
+                flash(
+                    f"Selection exceeds maximum select-across limit ({deck.config.max_select_across:,}). Refine filters first.",
+                    "danger",
+                )
+                return redirect(trash_return_url if is_trash_bulk else list_return_url)
+            decoded_pks = [tuple(row) for row in pk_rows]
+            raw_pks = [encode_pk(pk) for pk in decoded_pks]
+            if not decoded_pks:
+                flash("No matching authorized records found.", "warn")
+                return redirect(trash_return_url if is_trash_bulk else list_return_url)
+        else:
+            raw_pks = [p for p in request.form.getlist("selected_pks") if p.strip()]
+            if not raw_pks:
+                flash("Select at least one record.", "warn")
+                return redirect(list_return_url)
+            decoded_pks = [decode_pk(p, view.meta) for p in raw_pks]
+
+        def _load_pk_batch(session_obj: Any, pk_batch: list[tuple[Any, ...]]) -> list[Any]:
+            q = view.scope_query(sa.select(view.model), user)
+            if sd_pred is not None:
+                q = q.where(sd_pred)
+            if len(view.meta.primary_keys) == 1:
+                pk_c = getattr(view.model, view.meta.primary_keys[0].name)
+                q = q.where(pk_c.in_([p[0] for p in pk_batch]))
+            else:
+                pk_cs = [getattr(view.model, pk.name) for pk in view.meta.primary_keys]
+                q = q.where(sa.tuple_(*pk_cs).in_(pk_batch))
+            return list(session_obj.scalars(q).all())
+
+        # Large select-across / bulk mutations automatically offload to chunked background jobs
+        if (
+            len(decoded_pks) > deck.config.bulk_sync_limit
+            and deck.job_backend is not None
+        ):
+            target_total = len(decoded_pks)
+            if action_name == "restore":
+                if not view.soft_delete_column:
+                    abort(404)
+                if not view.can_edit:
+                    abort(403)
+                deck._require_perm(f"{slug}:edit", model_slug=slug)
+                if view.meta.fields_by_name.get(view.soft_delete_column) is None:
+                    abort(404)
+                bulk_label = f"Bulk Restore ({target_total:,} {view.plural_label})"
+                bulk_perm = f"{slug}:edit"
+                bulk_spec = None
+                form_snap: dict[str, str] = {}
+            elif action_name == "force_delete":
+                if not view.soft_delete_column:
+                    abort(404)
+                if not view.can_delete:
+                    abort(403)
+                deck._require_perm(f"{slug}:delete", model_slug=slug)
+                deck._require_perm(f"{slug}:force_delete", model_slug=slug)
+                if deck.approval_store is not None and view.requires_approval(
+                    user, "delete", payload={"force": True, "count": target_total}
+                ):
+                    flash(
+                        "Deletions on this model require four-eyes approval; delete records individually to submit for review.",
+                        "warn",
+                    )
+                    return redirect(trash_return_url)
+                if (
+                    deck.config.environment == "production"
+                    and deck.config.require_confirm_text_in_prod
+                    and request.form.get("confirm_text", "").strip() != f"DELETE {target_total}"
+                ):
+                    flash(
+                        f"Production safeguard: enter 'DELETE {target_total}' to confirm permanent deletion.",
+                        "danger",
+                    )
+                    return redirect(trash_return_url)
+                bulk_label = f"Bulk Force Delete ({target_total:,} {view.plural_label})"
+                bulk_perm = f"{slug}:force_delete"
+                bulk_spec = None
+                form_snap = {}
+            elif action_name == "delete":
+                if not view.can_delete:
+                    abort(403)
+                deck._require_perm(f"{slug}:delete", model_slug=slug)
+                if deck.approval_store is not None and view.requires_approval(
+                    user, "delete", payload={"count": target_total}
+                ):
+                    flash(
+                        "Deletions on this model require four-eyes approval; delete records individually to submit for review.",
+                        "warn",
+                    )
+                    return redirect(list_return_url)
+                if (
+                    deck.config.environment == "production"
+                    and deck.config.require_confirm_text_in_prod
+                    and request.form.get("confirm_text", "").strip() != f"DELETE {target_total}"
+                ):
+                    flash(
+                        f"Production safeguard: enter 'DELETE {target_total}' to confirm bulk delete.",
+                        "danger",
+                    )
+                    return redirect(list_return_url)
+                bulk_label = f"Bulk Delete ({target_total:,} {view.plural_label})"
+                bulk_perm = f"{slug}:delete"
+                bulk_spec = None
+                form_snap = {}
+            else:
+                bulk_spec = view.actions.get(action_name)
+                if bulk_spec is None:
+                    abort(404)
+                bulk_perm = bulk_spec.permission or f"{slug}:action:{action_name}"
+                deck._require_perm(bulk_perm, model_slug=slug)
+                if (
+                    bulk_spec.require_confirm_text
+                    and deck.config.environment == "production"
+                    and deck.config.require_confirm_text_in_prod
+                    and request.form.get("confirm_text", "").strip() != f"CONFIRM {target_total}"
+                ):
+                    flash(f"Production safeguard: enter 'CONFIRM {target_total}' to confirm.", "danger")
+                    return redirect(list_return_url)
+                form_snap = {}
+                for af in bulk_spec.fields:
+                    raw_v = request.form.get(af.name, "").strip()
+                    if af.required and not raw_v:
+                        flash(f"Action '{bulk_spec.label}' requires '{af.display_label}'.", "danger")
+                        return redirect(list_return_url)
+                    if raw_v and af.choices and raw_v not in {str(c[0]) for c in af.choices}:
+                        flash(f"Invalid value for '{af.display_label}'.", "danger")
+                        return redirect(list_return_url)
+                    form_snap[af.name] = raw_v
+                if deck.approval_store is not None and (
+                    bulk_spec.require_approval
+                    or view.requires_approval(
+                        user,
+                        "action",
+                        payload={"action_name": action_name, "count": target_total, **form_snap},
+                    )
+                ):
+                    flash(
+                        "Large bulk actions requiring four-eyes approval must be submitted in smaller batches.",
+                        "warn",
+                    )
+                    return redirect(list_return_url)
+                bulk_label = f"{bulk_spec.label} ({target_total:,} {view.plural_label})"
+
+            pk_chunks_all = [decoded_pks[i : i + 200] for i in range(0, len(decoded_pks), 200)]
+
+            def _run_chunked_bulk(job_ctx: JobContext) -> str:
+                job_sess = deck.get_session(view.bind_key)
+                processed = 0
+                orphan_queue: list[tuple[Any, str]] = []
+                sd_col_name = view.soft_delete_column
+                sd_f = view.meta.fields_by_name.get(sd_col_name) if sd_col_name else None
+                for idx_c, chunk in enumerate(pk_chunks_all, start=1):
+                    if job_ctx.is_cancelled():
+                        return f"Cancelled after {processed} record(s)."
+                    recs_c = _load_pk_batch(job_sess, chunk)
+                    if action_name == "restore" and sd_col_name and sd_f is not None:
+                        for r in recs_c:
+                            if not deck.auth.has_permission(user, bulk_perm, model_slug=slug, obj=r):
+                                raise PermissionDeniedError(f"Missing permission: {bulk_perm}")
+                            setattr(r, sd_col_name, False if sd_f.field_type == "boolean" else None)
+                            view.on_model_change(r, is_created=False, user=user)
+                    elif action_name == "force_delete":
+                        for r in recs_c:
+                            if not (
+                                deck.auth.has_permission(
+                                    user, f"{slug}:delete", model_slug=slug, obj=r
+                                )
+                                and deck.auth.has_permission(
+                                    user, f"{slug}:force_delete", model_slug=slug, obj=r
+                                )
+                            ):
+                                raise PermissionDeniedError(f"Missing permission: {slug}:force_delete")
+                            orphan_queue.extend(deck._collect_orphan_files(view, r))
+                            view.on_model_delete(r, user=user)
+                            job_sess.delete(r)
+                    elif action_name == "delete":
+                        for r in recs_c:
+                            if not deck.auth.has_permission(
+                                user, f"{slug}:delete", model_slug=slug, obj=r
+                            ):
+                                raise PermissionDeniedError(f"Missing permission: {slug}:delete")
+                            if sd_col_name and sd_f is not None:
+                                view.on_model_delete(r, user=user)
+                                setattr(
+                                    r,
+                                    sd_col_name,
+                                    True
+                                    if sd_f.field_type == "boolean"
+                                    else datetime.now(timezone.utc),
+                                )
+                            else:
+                                orphan_queue.extend(deck._collect_orphan_files(view, r))
+                                view.on_model_delete(r, user=user)
+                                job_sess.delete(r)
+                    elif bulk_spec is not None:
+                        for r in recs_c:
+                            if not deck.auth.has_permission(
+                                user, bulk_perm, model_slug=slug, obj=r
+                            ):
+                                raise PermissionDeniedError(f"Missing permission: {bulk_perm}")
+                        h_fn = getattr(view, bulk_spec.handler_name)
+                        if bulk_spec.async_job:
+                            h_fn(recs_c, form_snap, user, job_ctx)
+                        else:
+                            h_fn(recs_c, form_snap, user)
+                    job_sess.commit()
+                    processed += len(recs_c)
+                    pct = int((idx_c / max(1, len(pk_chunks_all))) * 100)
+                    job_ctx.set_progress(pct, f"Processed {processed:,}/{target_total:,} records")
+                deck._delete_orphan_files_best_effort(orphan_queue)
+                return f"Processed {processed:,} {view.plural_label}."
+
+            def _on_chunk_done(rec: JobRecord) -> None:
+                ev_name = (
+                    "job.completed"
+                    if rec.status == "succeeded"
+                    else ("job.cancelled" if rec.status == "cancelled" else "job.failed")
+                )
+                deck._emit_event(
+                    ev_name,
+                    model_slug=slug,
+                    record_pk=rec.id,
+                    payload={"label": rec.label, "status": rec.status, "error": rec.error},
+                    actor=user,
+                )
+
+            sess.close()
+            job = deck.job_backend.submit(
+                name=f"{slug}:{action_name}:bulk",
+                label=bulk_label,
+                actor_id=user.id if user else "system",
+                actor_name=user.label if user else "System",
+                model_slug=slug,
+                fn=_run_chunked_bulk,
+                app=deck.app,
+                on_complete=_on_chunk_done,
+            )
+            deck._record_audit(
+                action_name="async_job",
+                view=view,
+                record_pk=job.id,
+                record_repr=job.label,
+                metadata={
+                    "action": action_name,
+                    "count": target_total,
+                    "job_id": job.id,
+                    "select_across": select_across,
+                },
+            )
+            flash(f"Large selection ({target_total:,} rows) offloaded to background job #{job.id}.", "ok")
+            return redirect(url_for(f"{bp_name}.jobs_list", focus=job.id))
+
+        records: list[Any] = []
+        for i in range(0, len(decoded_pks), 200):
+            records.extend(_load_pk_batch(sess, decoded_pks[i : i + 200]))
 
         if not records:
             flash("No matching authorized records found.", "warn")
-            return redirect(url_for(f"{bp_name}.model_list", slug=slug))
-
-        sess = deck.get_session(view.bind_key)
+            return redirect(trash_return_url if is_trash_bulk else list_return_url)
 
         if action_name == "restore":
             if not view.soft_delete_column:
@@ -1528,7 +2173,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             except IntegrityError:
                 sess.rollback()
                 flash("Bulk force delete failed due to foreign key references.", "danger")
-                return redirect(url_for(f"{bp_name}.model_list", slug=slug, trashed="1"))
+                return redirect(trash_return_url)
             deck._delete_orphan_files_best_effort(orphan_files)
             deck._record_audit(
                 action_name="bulk_action",
@@ -1550,7 +2195,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 payload={"action": "force_delete", "count": len(records), "async": False},
             )
             flash(f"Permanently deleted {len(records)} {view.plural_label}.", "ok")
-            return redirect(url_for(f"{bp_name}.model_list", slug=slug, trashed="1"))
+            return redirect(trash_return_url)
 
         if action_name == "delete":
             if not view.can_delete:
@@ -1566,7 +2211,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     "Deletions on this model require four-eyes approval; delete records individually to submit for review.",
                     "warn",
                 )
-                return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+                return redirect(list_return_url)
             if (
                 deck.config.environment == "production"
                 and deck.config.require_confirm_text_in_prod
@@ -1578,7 +2223,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                         f"Production safeguard: enter '{expected_phrase}' to confirm bulk delete.",
                         "danger",
                     )
-                    return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+                    return redirect(list_return_url)
             orphan_files = []
             try:
                 sd_col = view.soft_delete_column
@@ -1599,7 +2244,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             except IntegrityError:
                 sess.rollback()
                 flash("Bulk delete failed due to foreign key references.", "danger")
-                return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+                return redirect(list_return_url)
 
             deck._delete_orphan_files_best_effort(orphan_files)
             deck._record_audit(
@@ -1627,7 +2272,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 else f"Deleted {len(records)} {view.plural_label}.",
                 "ok",
             )
-            return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+            return redirect(list_return_url)
 
         spec = view.actions.get(action_name)
         if spec is None:
@@ -1799,7 +2444,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         except (ValueError, ValidationError, SQLAlchemyError) as exc:
             sess.rollback()
             flash(f"Action '{spec.label}' failed: {exc}", "danger")
-            return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+            return redirect(list_return_url)
         meta_payload: dict[str, Any] = {"action": action_name, "count": len(records)}
         if action_params:
             meta_payload["params"] = action_params
@@ -1817,7 +2462,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             payload={"action": action_name, "count": len(records), "async": False},
         )
         flash(str(msg or f"Executed '{spec.label}' on {len(records)} records."), "ok")
-        return redirect(url_for(f"{bp_name}.model_list", slug=slug))
+        return redirect(list_return_url)
 
     @bp.route("/<slug>/export.<fmt>")
     def model_export(slug: str, fmt: str) -> Response:
@@ -1830,14 +2475,42 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
 
         user = deck._current_user()
         allowed_searchable, _, _ = deck._allowed_query_fields(view, user)
-        filter_pairs = [
-            (k[2:], v.strip())
-            for k, v in request.args.items(multi=True)
-            if k.startswith("f_") and v.strip()
-        ]
-        raw_ids = [p for p in request.args.get("ids", "").split(",") if p.strip()]
-        selected_pks = [decode_pk(p, view.meta) for p in raw_ids]
-        trashed = bool(view.soft_delete_column and request.args.get("trashed") == "1")
+        select_across = request.args.get("select_across") == "1"
+        if select_across:
+            slice_token = request.args.get("slice_token", "").strip()
+            token_state = deck._verify_select_across_token(
+                slice_token, expected_slug=slug, user=user
+            )
+            if token_state is None:
+                abort(403)
+            raw_items = token_state.get("items", [])
+            eff_items = [
+                (str(pair[0]), str(pair[1]))
+                for pair in raw_items
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+            ]
+            trashed = bool(view.soft_delete_column and token_state.get("trashed"))
+            selected_pks: list[tuple[Any, ...]] = []
+        else:
+            eff_items = list(request.args.items(multi=True))
+            trashed = bool(view.soft_delete_column and request.args.get("trashed") == "1")
+            raw_ids = [p for p in request.args.get("ids", "").split(",") if p.strip()]
+            selected_pks = [decode_pk(p, view.meta) for p in raw_ids]
+
+        eff_single: dict[str, str] = {}
+        filter_pairs: list[tuple[str, str]] = []
+        for k, v in eff_items:
+            eff_single.setdefault(k, v)
+            if k.startswith("f_") and v.strip():
+                filter_pairs.append((k[2:], v.strip()))
+
+        search_term = eff_single.get("q", "").strip()
+        active_tab = eff_single.get("tab", "").strip() or (
+            view.quick_tabs[0].key if view.quick_tabs else None
+        )
+        _, appliers_by_param, _, dh_pred = deck._resolve_custom_filters_and_dh(
+            view, eff_items, user
+        )
 
         try:
             resp = stream_export_response(
@@ -1846,14 +2519,16 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 fmt=fmt,
                 auth=deck.auth,
                 user=user,
-                search_term=request.args.get("q", "").strip(),
+                search_term=search_term,
                 filter_params=filter_pairs,
-                active_tab_key=request.args.get("tab", "").strip() or None,
+                active_tab_key=active_tab,
                 selected_pks=selected_pks,
                 sanitize_csv=deck.config.sanitize_csv,
                 trashed=trashed,
                 searchable_columns=allowed_searchable,
                 views_by_model=deck._views_by_model,
+                extra_where=[dh_pred] if dh_pred is not None else (),
+                custom_filter_appliers=list(appliers_by_param.values()),
             )
         except ImportError as exc:
             return Response(str(exc), status=501, mimetype="text/plain; charset=utf-8")
@@ -1866,6 +2541,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             metadata={
                 "format": fmt.lower(),
                 "selected": len(selected_pks),
+                "select_across": select_across,
                 "trashed": trashed,
             },
         )
@@ -1887,11 +2563,17 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         search_q = request.form.get("q", "").strip()
         active_tab = request.form.get("tab", "").strip() or None
         trashed = bool(view.soft_delete_column and request.form.get("trashed") == "1")
+        form_items = list(request.form.items(multi=True))
         filter_pairs = [
             (k[2:], v.strip())
-            for k, v in request.form.items(multi=True)
+            for k, v in form_items
             if k.startswith("f_") and v.strip()
         ]
+        _, appliers_by_param, _, dh_pred = deck._resolve_custom_filters_and_dh(
+            view, form_items, user
+        )
+        extra_where_tuple = (dh_pred,) if dh_pred is not None else ()
+        custom_appliers_list = list(appliers_by_param.values())
 
         def _run_export(job_ctx: JobContext) -> str:
             job_ctx.set_progress(15, f"Streaming {view.plural_label} as {fmt.upper()}…")
@@ -1908,6 +2590,8 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 trashed=trashed,
                 searchable_columns=allowed_searchable,
                 views_by_model=deck._views_by_model,
+                extra_where=extra_where_tuple,
+                custom_filter_appliers=custom_appliers_list,
             )
             mime_base = mimetype.split(";", 1)[0].strip()
             key = build_storage_key(f"exports/{slug}", mime_base)

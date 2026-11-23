@@ -120,91 +120,210 @@
     });
   });
 
-  document.querySelectorAll("[data-deck-fk]").forEach((wrap) => {
-    const searchInput = wrap.querySelector("[data-fk-search]");
-    const hiddenInput = wrap.querySelector("[data-fk-value]");
-    const dropdown = wrap.querySelector("[data-fk-dropdown]");
-    const apiUrl = wrap.getAttribute("data-fk-url") || "";
-    let depSpec = null;
-    try { const rawDep = wrap.getAttribute("data-dependent"); if (rawDep) depSpec = JSON.parse(rawDep); } catch (_) {}
-    if (!searchInput || !hiddenInput || !dropdown) return;
-    let fkAbort = null;
-    const ownerForm = wrap.closest("form") || document;
-    const initialOpts = Array.from(dropdown.querySelectorAll(".dk-fk-opt")).map((el) => ({
-      id: el.getAttribute("data-id") || "",
-      label: el.getAttribute("data-label") || "",
-    }));
-    function readParentVal(name) {
-      const r = ownerForm.querySelector('input[type="radio"][name="' + name + '"]:checked');
-      if (r) return r.value;
-      const el = ownerForm.querySelector('[name="' + name + '"]');
-      if (!el || el.type === "radio") return "";
-      return el.type === "checkbox" ? (el.checked ? "true" : "false") : el.value;
-    }
-    function renderOpts(items) {
-      dropdown.replaceChildren();
-      if (!items.length) { const e = document.createElement("div"); e.className = "dk-fk-opt dk-muted"; e.textContent = "No matches"; dropdown.appendChild(e); return; }
-      items.forEach((it) => {
-        const row = document.createElement("div");
-        row.className = "dk-fk-opt";
-        const lbl = document.createElement("span"); lbl.textContent = it.label;
-        const idEl = document.createElement("span"); idEl.className = "dk-mono dk-subtle"; idEl.textContent = "#" + it.id;
-        row.appendChild(lbl); row.appendChild(idEl);
-        row.addEventListener("mousedown", (e) => {
-          e.preventDefault();
-          hiddenInput.value = it.id;
-          searchInput.value = it.label;
-          dropdown.hidden = true;
-          hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
-        });
-        dropdown.appendChild(row);
-      });
-    }
-    function fetchRemote(q) {
-      if (searchInput.readOnly) return;
-      if (!apiUrl) { renderOpts(initialOpts.filter((o) => o.label.toLowerCase().includes(q.toLowerCase()))); dropdown.hidden = false; return; }
-      let url = apiUrl + (apiUrl.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(q);
-      if (depSpec && depSpec.parent && depSpec.filter_col) {
-        const pVal = readParentVal(depSpec.parent);
-        if (pVal) url += "&dep_col=" + encodeURIComponent(depSpec.filter_col) + "&dep_val=" + encodeURIComponent(pVal);
+  function initFkWidgets(rootEl) {
+    (rootEl || document).querySelectorAll("[data-deck-fk]").forEach((wrap) => {
+      if (wrap.hasAttribute("data-fk-bound")) return;
+      wrap.setAttribute("data-fk-bound", "1");
+      const searchInput = wrap.querySelector("[data-fk-search]");
+      const hiddenInput = wrap.querySelector("[data-fk-value]");
+      const dropdown = wrap.querySelector("[data-fk-dropdown]");
+      const apiUrl = wrap.getAttribute("data-fk-url") || "";
+      let depSpec = null;
+      try { const rawDep = wrap.getAttribute("data-dependent"); if (rawDep) depSpec = JSON.parse(rawDep); } catch (_) {}
+      if (!searchInput || !hiddenInput || !dropdown) return;
+      let fkAbort = null;
+      const ownerForm = wrap.closest("form") || document;
+      const initialOpts = Array.from(dropdown.querySelectorAll(".dk-fk-opt")).map((el) => ({
+        id: el.getAttribute("data-id") || "",
+        label: el.getAttribute("data-label") || "",
+      }));
+      function readParentVal(name) {
+        const r = ownerForm.querySelector('input[type="radio"][name="' + name + '"]:checked');
+        if (r) return r.value;
+        const el = ownerForm.querySelector('[name="' + name + '"]');
+        if (!el || el.type === "radio") return "";
+        return el.type === "checkbox" ? (el.checked ? "true" : "false") : el.value;
       }
-      if (fkAbort) fkAbort.abort();
-      fkAbort = new AbortController();
-      fetch(url, { headers: { Accept: "application/json" }, signal: fkAbort.signal })
+      function renderOpts(items) {
+        dropdown.replaceChildren();
+        if (!items.length) { const e = document.createElement("div"); e.className = "dk-fk-opt dk-muted"; e.textContent = "No matches"; dropdown.appendChild(e); return; }
+        items.forEach((it) => {
+          const row = document.createElement("div");
+          row.className = "dk-fk-opt";
+          const lbl = document.createElement("span"); lbl.textContent = it.label;
+          const idEl = document.createElement("span"); idEl.className = "dk-mono dk-subtle"; idEl.textContent = "#" + it.id;
+          row.appendChild(lbl); row.appendChild(idEl);
+          row.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            hiddenInput.value = it.id;
+            searchInput.value = it.label;
+            dropdown.hidden = true;
+            hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
+          });
+          dropdown.appendChild(row);
+        });
+      }
+      function fetchRemote(q) {
+        if (searchInput.readOnly) return;
+        if (!apiUrl) { renderOpts(initialOpts.filter((o) => o.label.toLowerCase().includes(q.toLowerCase()))); dropdown.hidden = false; return; }
+        let url = apiUrl + (apiUrl.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(q);
+        if (depSpec && depSpec.parent && depSpec.filter_col) {
+          const pVal = readParentVal(depSpec.parent);
+          if (pVal) url += "&dep_col=" + encodeURIComponent(depSpec.filter_col) + "&dep_val=" + encodeURIComponent(pVal);
+        }
+        if (fkAbort) fkAbort.abort();
+        fkAbort = new AbortController();
+        fetch(url, { headers: { Accept: "application/json" }, signal: fkAbort.signal })
+          .then((r) => (r.ok ? r.json() : { items: [] }))
+          .then((d) => {
+            if (document.activeElement !== searchInput) return;
+            renderOpts(Array.isArray(d.items) ? d.items : []);
+            dropdown.hidden = false;
+          })
+          .catch(() => {});
+      }
+      if (depSpec && depSpec.parent) {
+        ownerForm.addEventListener("change", (ev) => {
+          if (ev.target && ev.target.name === depSpec.parent) {
+            hiddenInput.value = "";
+            searchInput.value = "";
+            hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        });
+      }
+      searchInput.addEventListener("focus", () => {
+        if (searchInput.readOnly) return;
+        if (depSpec && apiUrl) fetchRemote("");
+        else { renderOpts(initialOpts); dropdown.hidden = false; }
+      });
+      searchInput.addEventListener("blur", () => { window.setTimeout(() => { dropdown.hidden = true; }, 140); });
+      let fkTimer = null;
+      searchInput.addEventListener("input", () => {
+        if (searchInput.readOnly) return;
+        const q = searchInput.value.trim();
+        if (!q && hiddenInput.value) {
+          hiddenInput.value = "";
+          hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        window.clearTimeout(fkTimer);
+        fkTimer = window.setTimeout(() => fetchRemote(q), 140);
+      });
+    });
+  }
+  initFkWidgets(document);
+
+  /* ---------- Dual-Pane & Async M2M Widgets ---------- */
+  function syncDualPane(dualEl) {
+    const fname = dualEl.getAttribute("data-field-name");
+    const selList = dualEl.querySelector("[data-dual-sel]");
+    const hidHost = dualEl.querySelector("[data-dual-hidden]");
+    const cntEl = dualEl.querySelector("[data-dual-count]");
+    if (!selList || !hidHost || !fname) return;
+    const items = Array.from(selList.querySelectorAll("[data-dual-id]"));
+    hidHost.replaceChildren();
+    items.forEach((btn) => {
+      const inp = document.createElement("input");
+      inp.type = "hidden"; inp.name = fname; inp.value = btn.getAttribute("data-dual-id") || "";
+      hidHost.appendChild(inp);
+    });
+    if (cntEl) cntEl.textContent = String(items.length);
+  }
+  document.querySelectorAll("[data-deck-m2m-dual]").forEach((dual) => {
+    const avList = dual.querySelector("[data-dual-avail]");
+    const selList = dual.querySelector("[data-dual-sel]");
+    const avF = dual.querySelector("[data-dual-avail-filter]");
+    const selF = dual.querySelector("[data-dual-sel-filter]");
+    const addAll = dual.querySelector("[data-dual-add-all]");
+    const rmAll = dual.querySelector("[data-dual-rm-all]");
+    const isRo = Boolean(addAll && addAll.disabled);
+    function filterPane(list, q) {
+      if (!list) return;
+      const ql = (q || "").trim().toLowerCase();
+      list.querySelectorAll("[data-dual-id]").forEach((b) => { b.hidden = Boolean(ql) && !(b.getAttribute("data-dual-label") || "").includes(ql); });
+    }
+    if (avF) avF.addEventListener("input", () => filterPane(avList, avF.value));
+    if (selF) selF.addEventListener("input", () => filterPane(selList, selF.value));
+    dual.addEventListener("click", (ev) => {
+      if (isRo) return;
+      const item = ev.target instanceof Element ? ev.target.closest(".dk-dual-item") : null;
+      if (!item || !avList || !selList) return;
+      const toSel = item.parentElement === avList;
+      item.classList.toggle("is-selected", toSel);
+      (toSel ? selList : avList).appendChild(item);
+      syncDualPane(dual);
+      dual.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    if (addAll && avList && selList) addAll.addEventListener("click", () => {
+      Array.from(avList.querySelectorAll(".dk-dual-item")).filter((b) => !b.hidden).forEach((b) => { b.classList.add("is-selected"); selList.appendChild(b); });
+      syncDualPane(dual);
+      dual.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    if (rmAll && avList && selList) rmAll.addEventListener("click", () => {
+      Array.from(selList.querySelectorAll(".dk-dual-item")).filter((b) => !b.hidden).forEach((b) => { b.classList.remove("is-selected"); avList.appendChild(b); });
+      syncDualPane(dual);
+      dual.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  });
+
+  function addAsyncM2mChip(wrap, id, label) {
+    const fname = wrap.getAttribute("data-field-name");
+    const host = wrap.querySelector("[data-async-chips]");
+    const cnt = wrap.querySelector("[data-async-count]");
+    if (!fname || !host) return;
+    if (host.querySelector('[data-async-chip="' + CSS.escape(String(id)) + '"]')) return;
+    const chip = document.createElement("span");
+    chip.className = "dk-filter-chip";
+    chip.setAttribute("data-async-chip", String(id));
+    const sp = document.createElement("span"); sp.textContent = label;
+    const rm = document.createElement("button"); rm.type = "button"; rm.className = "dk-subtle"; rm.setAttribute("data-async-rm", String(id)); rm.textContent = "×";
+    const hid = document.createElement("input"); hid.type = "hidden"; hid.name = fname; hid.value = String(id);
+    chip.appendChild(sp); chip.appendChild(rm); chip.appendChild(hid);
+    host.appendChild(chip);
+    if (cnt) cnt.textContent = host.querySelectorAll("[data-async-chip]").length + " selected";
+    wrap.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+  document.querySelectorAll("[data-deck-m2m-async]").forEach((wrap) => {
+    const inp = wrap.querySelector("[data-async-search]");
+    const dd = wrap.querySelector("[data-async-dropdown]");
+    const url = wrap.getAttribute("data-search-url") || "";
+    const host = wrap.querySelector("[data-async-chips]");
+    const cnt = wrap.querySelector("[data-async-count]");
+    let abortCtrl = null;
+    let timer = null;
+    wrap.addEventListener("click", (ev) => {
+      const rmBtn = ev.target instanceof Element ? ev.target.closest("[data-async-rm]") : null;
+      if (rmBtn && host) {
+        rmBtn.closest("[data-async-chip]")?.remove();
+        if (cnt) cnt.textContent = host.querySelectorAll("[data-async-chip]").length + " selected";
+        wrap.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    });
+    if (!inp || !dd || inp.readOnly) return;
+    function fetchOpts(q) {
+      if (!url) return;
+      if (abortCtrl) abortCtrl.abort();
+      abortCtrl = new AbortController();
+      fetch(url + (url.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(q), { headers: { Accept: "application/json" }, signal: abortCtrl.signal })
         .then((r) => (r.ok ? r.json() : { items: [] }))
         .then((d) => {
-          if (document.activeElement !== searchInput) return;
-          renderOpts(Array.isArray(d.items) ? d.items : []);
-          dropdown.hidden = false;
+          dd.replaceChildren();
+          const items = Array.isArray(d.items) ? d.items : [];
+          if (!items.length) { const em = document.createElement("div"); em.className = "dk-fk-opt dk-muted"; em.textContent = "No matches"; dd.appendChild(em); }
+          else items.forEach((it) => {
+            const row = document.createElement("div"); row.className = "dk-fk-opt";
+            const s1 = document.createElement("span"); s1.textContent = it.label;
+            const s2 = document.createElement("span"); s2.className = "dk-mono dk-subtle"; s2.textContent = "#" + it.id;
+            row.appendChild(s1); row.appendChild(s2);
+            row.addEventListener("mousedown", (e) => { e.preventDefault(); addAsyncM2mChip(wrap, it.id, it.label); inp.value = ""; dd.hidden = true; });
+            dd.appendChild(row);
+          });
+          dd.hidden = false;
         })
         .catch(() => {});
     }
-    if (depSpec && depSpec.parent) {
-      ownerForm.addEventListener("change", (ev) => {
-        if (ev.target && ev.target.name === depSpec.parent) {
-          hiddenInput.value = "";
-          searchInput.value = "";
-          hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-      });
-    }
-    searchInput.addEventListener("focus", () => {
-      if (searchInput.readOnly) return;
-      if (depSpec && apiUrl) fetchRemote("");
-      else { renderOpts(initialOpts); dropdown.hidden = false; }
-    });
-    searchInput.addEventListener("blur", () => { window.setTimeout(() => { dropdown.hidden = true; }, 140); });
-    let fkTimer = null;
-    searchInput.addEventListener("input", () => {
-      if (searchInput.readOnly) return;
-      const q = searchInput.value.trim();
-      if (!q && hiddenInput.value) {
-        hiddenInput.value = "";
-        hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-      window.clearTimeout(fkTimer);
-      fkTimer = window.setTimeout(() => fetchRemote(q), 140);
-    });
+    inp.addEventListener("focus", () => fetchOpts(inp.value.trim()));
+    inp.addEventListener("blur", () => { window.setTimeout(() => { dd.hidden = true; }, 140); });
+    inp.addEventListener("input", () => { window.clearTimeout(timer); timer = window.setTimeout(() => fetchOpts(inp.value.trim()), 140); });
   });
 
   document.querySelectorAll("[data-deck-dropzone]").forEach((dz) => {
@@ -305,8 +424,49 @@
     sync();
   });
 
+  function toSlug(raw) {
+    const trMap = { "ğ": "g", "Ğ": "g", "ş": "s", "Ş": "s", "ı": "i", "İ": "i", "ö": "o", "Ö": "o", "ü": "u", "Ü": "u", "ç": "c", "Ç": "c" };
+    return String(raw || "")
+      .replace(/[ğĞşŞıİöÖüÜçÇ]/g, (ch) => trMap[ch] || ch)
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  }
+
+  let activeRelTarget = null;
   const formRoot = document.querySelector("[data-deck-form-root]");
   if (formRoot) {
+    let isDirty = false;
+    const dirtyBadge = formRoot.querySelector("[data-deck-dirty-badge]");
+    const markDirty = () => {
+      if (!isDirty) { isDirty = true; if (dirtyBadge) dirtyBadge.hidden = false; }
+    };
+    window.addEventListener("beforeunload", (ev) => {
+      if (isDirty) { ev.preventDefault(); ev.returnValue = ""; }
+    });
+    formRoot.addEventListener("submit", () => { isDirty = false; });
+
+    formRoot.querySelectorAll("[data-prepopulate-from]").forEach((tgt) => {
+      if (tgt.readOnly || tgt.disabled) return;
+      let sources = [];
+      try { sources = JSON.parse(tgt.getAttribute("data-prepopulate-from") || "[]"); } catch (_) {}
+      if (!Array.isArray(sources) || !sources.length) return;
+      let touched = Boolean(String(tgt.value || "").trim());
+      tgt.addEventListener("input", () => { touched = true; });
+      sources.forEach((srcName) => {
+        const srcEl = formRoot.querySelector('[name="' + srcName + '"]');
+        if (srcEl) {
+          srcEl.addEventListener("input", () => {
+            if (touched) return;
+            const joined = sources.map((n) => (formRoot.querySelector('[name="' + n + '"]')?.value || "").trim()).filter(Boolean).join(" ");
+            tgt.value = toSlug(joined);
+          });
+        }
+      });
+    });
+
     function getFieldVal(name) {
       const radio = formRoot.querySelector('input[type="radio"][name="' + name + '"]:checked');
       if (radio) return radio.value;
@@ -338,9 +498,19 @@
         });
       });
     }
-    formRoot.addEventListener("change", evalShowWhen);
-    formRoot.addEventListener("input", evalShowWhen);
+    formRoot.addEventListener("change", () => { markDirty(); evalShowWhen(); });
+    formRoot.addEventListener("input", () => { markDirty(); evalShowWhen(); });
     evalShowWhen();
+
+    document.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && !D.hasOpenOverlay()) {
+        e.preventDefault();
+        const kind = e.shiftKey ? "continue" : "save";
+        const btn = formRoot.querySelector('[data-save-btn="' + kind + '"]') || formRoot.querySelector('[data-save-btn="save"]');
+        isDirty = false;
+        if (btn) btn.click(); else formRoot.submit();
+      }
+    });
 
     const panels = Array.from(formRoot.querySelectorAll("[data-deck-form-panel]"));
     const tabBtns = Array.from(formRoot.querySelectorAll("[data-deck-form-tab]"));
@@ -352,6 +522,7 @@
       const prevBtn = formRoot.querySelector("[data-wiz-prev]");
       const nextBtn = formRoot.querySelector("[data-wiz-next]");
       const subBtn = formRoot.querySelector("[data-wiz-submit]");
+      const contBtn = formRoot.querySelector('[data-save-btn="continue"]');
       let curStep = 0;
       const errPanelIdx = panels.findIndex((p) => p.querySelector(".dk-field-err"));
       if (errPanelIdx > 0) curStep = errPanelIdx;
@@ -372,6 +543,7 @@
         if (prevBtn) prevBtn.hidden = curStep === 0;
         if (nextBtn) nextBtn.hidden = curStep >= panels.length - 1;
         if (subBtn) subBtn.hidden = curStep < panels.length - 1;
+        if (contBtn) contBtn.hidden = curStep < panels.length - 1;
       }
       showPanelAt = showStep;
       steps.forEach((b, i) => b.addEventListener("click", () => { if (i <= curStep || validateStep(curStep)) showStep(i); }));
@@ -405,9 +577,94 @@
     }
   }
 
+  document.addEventListener("submit", (e) => {
+    const qf = e.target instanceof Element ? e.target.closest("[data-deck-quick-form]") : null;
+    if (!qf) return;
+    e.preventDefault();
+    const drawerBody = document.getElementById("dk-drawer-body");
+    fetch(qf.action, { method: "POST", body: new FormData(qf), headers: { "X-Requested-With": "Flask-Deck", "X-Deck-CSRFToken": D.CSRF } })
+      .then(async (r) => {
+        const ct = r.headers.get("content-type") || "";
+        if (ct.includes("application/json")) {
+          const d = await r.json();
+          if (!r.ok || !d.ok) { D.showToast(d.error || "Save failed", "danger"); return; }
+          if (activeRelTarget && activeRelTarget.fkInputId) {
+            const srch = document.getElementById(activeRelTarget.fkInputId);
+            const wrap = srch && srch.closest("[data-deck-fk]");
+            const hid = wrap && wrap.querySelector("[data-fk-value]");
+            if (hid) { hid.value = d.id; hid.dispatchEvent(new Event("change", { bubbles: true })); }
+            if (srch) srch.value = d.label;
+          } else if (activeRelTarget && activeRelTarget.m2mField) {
+            const fname = activeRelTarget.m2mField;
+            const dual = document.querySelector('[data-deck-m2m-dual][data-field-name="' + fname + '"]');
+            const asyncEl = document.querySelector('[data-deck-m2m-async][data-field-name="' + fname + '"]');
+            const pillsEl = document.querySelector('[data-deck-m2m][data-field-name="' + fname + '"]');
+            if (dual) {
+              const selList = dual.querySelector("[data-dual-sel]");
+              if (selList) {
+                const btn = document.createElement("button");
+                btn.type = "button"; btn.className = "dk-dual-item is-selected";
+                btn.setAttribute("data-dual-id", d.id); btn.setAttribute("data-dual-label", String(d.label).toLowerCase());
+                btn.textContent = d.label;
+                selList.appendChild(btn);
+                syncDualPane(dual);
+              }
+            } else if (asyncEl) {
+              addAsyncM2mChip(asyncEl, d.id, d.label);
+            } else if (pillsEl) {
+              const box = pillsEl.querySelector("[data-m2m-pills]");
+              if (box) {
+                const lbl = document.createElement("label"); lbl.className = "dk-m2m-pill"; lbl.setAttribute("data-m2m-item", String(d.label).toLowerCase());
+                const cb = document.createElement("input"); cb.type = "checkbox"; cb.name = fname; cb.value = d.id; cb.checked = true; cb.setAttribute("data-m2m-check", "");
+                const sp = document.createElement("span"); sp.textContent = d.label;
+                lbl.appendChild(cb); lbl.appendChild(sp); box.appendChild(lbl);
+                pillsEl.dispatchEvent(new Event("change", { bubbles: true }));
+              }
+            }
+          }
+          if (typeof D.closeDrawer === "function") D.closeDrawer();
+          D.showToast("Saved: " + d.label, "ok");
+        } else {
+          const html = await r.text();
+          if (drawerBody) {
+            const doc = new DOMParser().parseFromString(html, "text/html");
+            drawerBody.replaceChildren(...Array.from(doc.body.childNodes));
+          }
+        }
+      })
+      .catch(() => D.showToast("Network error saving related record", "danger"));
+  });
+
   document.addEventListener("click", (e) => {
     const t = e.target;
     if (!(t instanceof Element)) return;
+
+    const relAdd = t.closest("[data-deck-rel-add]");
+    if (relAdd) {
+      const url = relAdd.getAttribute("data-deck-rel-add");
+      const title = relAdd.getAttribute("data-rel-title") || "New Record";
+      activeRelTarget = {
+        fkInputId: relAdd.getAttribute("data-rel-target") || "",
+        m2mField: relAdd.getAttribute("data-rel-m2m-target") || "",
+      };
+      if (url) D.openDrawer(url, title);
+      return;
+    }
+
+    const relEditOrPeek = t.closest("[data-deck-rel-edit], [data-deck-rel-peek]");
+    if (relEditOrPeek) {
+      const targetId = relEditOrPeek.getAttribute("data-rel-target") || "";
+      const srch = document.getElementById(targetId);
+      const wrap = srch && srch.closest("[data-deck-fk]");
+      const hid = wrap && wrap.querySelector("[data-fk-value]");
+      const pk = hid ? String(hid.value || "").trim() : "";
+      if (!pk) { D.showToast("Select a related record first", "warn"); return; }
+      const tpl = relEditOrPeek.getAttribute("data-deck-rel-edit") || relEditOrPeek.getAttribute("data-deck-rel-peek") || "";
+      const url = tpl.replace("__PK__", encodeURIComponent(pk));
+      activeRelTarget = { fkInputId: targetId, m2mField: "" };
+      D.openDrawer(url, relEditOrPeek.getAttribute("data-rel-title") || "Related Record");
+      return;
+    }
 
     const formTabBtn = t.closest("[data-deck-form-tab]");
     if (formTabBtn) {
@@ -424,27 +681,28 @@
     if (addInlineBtn) {
       const slug = addInlineBtn.getAttribute("data-deck-add-inline");
       const tpl = document.querySelector('template[data-inline-template="' + slug + '"]');
-      const tbody = document.querySelector('tbody[data-inline-body="' + slug + '"]');
-      if (tpl && tbody) {
-        const nextIdx = Number(tbody.getAttribute("data-next-index") || "0");
-        tbody.setAttribute("data-next-index", String(nextIdx + 1));
+      const host = document.querySelector('[data-inline-body="' + slug + '"]');
+      if (tpl && host) {
+        const nextIdx = Number(host.getAttribute("data-next-index") || "0");
+        host.setAttribute("data-next-index", String(nextIdx + 1));
         const frag = tpl.content.cloneNode(true);
         frag.querySelectorAll("[name]").forEach((el) => el.setAttribute("name", el.getAttribute("name").replace("__INDEX__", String(nextIdx))));
-        tbody.appendChild(frag);
+        host.appendChild(frag);
+        initFkWidgets(host);
       }
       return;
     }
 
     const delInlineBtn = t.closest("[data-deck-del-inline]");
     if (delInlineBtn) {
-      const tr = delInlineBtn.closest("tr");
-      if (!tr) return;
-      const delInput = tr.querySelector("[data-inline-del-flag]");
+      const row = delInlineBtn.closest("[data-inline-row]") || delInlineBtn.closest("tr");
+      if (!row) return;
+      const delInput = row.querySelector("[data-inline-del-flag]");
       if (delInput) {
         const isMarked = delInput.value === "1";
         delInput.value = isMarked ? "0" : "1";
-        tr.classList.toggle("dk-inline-deleted", !isMarked);
-      } else tr.remove();
+        row.classList.toggle("dk-inline-deleted", !isMarked);
+      } else row.remove();
       return;
     }
 

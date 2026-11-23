@@ -178,7 +178,7 @@
       </div>
       {% endfor %}
 
-      {% if can_view_audit or can_view_rbac or can_view_schema or can_view_sql or can_view_diagnostics or can_view_jobs or can_manage_mfa %}
+      {% if can_view_audit or can_view_rbac or can_view_schema or can_view_sql or can_view_diagnostics or can_view_jobs or can_manage_mfa or can_manage_iam or can_change_password or can_manage_sessions or can_manage_passkeys or can_manage_api_keys or can_view_webhooks or can_view_approvals %}
       <div>
         <div class="dk-rail-group-title">{{ _("Governance") }}</div>
         <nav class="dk-nav-list">
@@ -258,6 +258,25 @@
              class="dk-nav-item{% if active_nav == '_api_keys' %} is-active{% endif %}"
              data-deck-quick-nav data-title="{{ _('API Keys') }}" data-subtitle="Scoped REST v1 &amp; MCP Bearer tokens">
             <span class="dk-nav-left">{{ deck_icon("key", 14) }}<span class="dk-nav-label">{{ _("API Keys") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_manage_iam %}
+          <a href="{{ url_for(bp_name ~ '.security_iam_users') }}"
+             class="dk-nav-item{% if active_nav == '_iam_users' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Users') }}" data-subtitle="DB-backed operator accounts &amp; role memberships">
+            <span class="dk-nav-left">{{ deck_icon("users", 14) }}<span class="dk-nav-label">{{ _("Users") }}</span></span>
+          </a>
+          <a href="{{ url_for(bp_name ~ '.security_iam_groups') }}"
+             class="dk-nav-item{% if active_nav == '_iam_groups' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Groups & Roles') }}" data-subtitle="Visual permission matrix &amp; field-level guards">
+            <span class="dk-nav-left">{{ deck_icon("shield", 14) }}<span class="dk-nav-label">{{ _("Groups & Roles") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_change_password %}
+          <a href="{{ url_for(bp_name ~ '.security_change_password') }}"
+             class="dk-nav-item{% if active_nav == '_password' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Change Password') }}" data-subtitle="Rotate password &amp; sign out other sessions">
+            <span class="dk-nav-left">{{ deck_icon("key", 14) }}<span class="dk-nav-label">{{ _("Change Password") }}</span></span>
           </a>
           {% endif %}
           {% if can_view_diagnostics %}
@@ -447,6 +466,7 @@
     </div>
     <div class="dk-panel-body">
       <p id="dk-confirm-msg" class="dk-muted"></p>
+      <div id="dk-confirm-impact" class="dk-impact-tree" hidden="hidden"></div>
       <div id="dk-confirm-fields" class="dk-diff-list" hidden="hidden"></div>
       <div id="dk-confirm-phrase-wrap" class="dk-field" hidden="hidden">
         <label for="dk-confirm-input" id="dk-confirm-phrase-label" class="dk-mono"></label>
