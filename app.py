@@ -4,6 +4,7 @@ import hashlib
 import os
 import sys
 from pathlib import Path
+from typing import Literal
 
 _SRC_DIR = str(Path(__file__).resolve().parent / "src")
 if _SRC_DIR not in sys.path:
@@ -29,7 +30,16 @@ def _resolve_secret_key() -> str:
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
-app = create_demo_app(db_uri=_resolve_db_uri(), secret_key=_resolve_secret_key())
+def _resolve_seed_profile() -> Literal["standard", "showcase"]:
+    raw = os.environ.get("FLASK_DECK_DEMO_PROFILE", "showcase").strip().lower()
+    return "standard" if raw == "standard" else "showcase"
+
+
+app = create_demo_app(
+    db_uri=_resolve_db_uri(),
+    secret_key=_resolve_secret_key(),
+    seed_profile=_resolve_seed_profile(),
+)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)  # type: ignore[method-assign]
 if os.environ.get("VERCEL"):
     app.config["SESSION_COOKIE_SECURE"] = True

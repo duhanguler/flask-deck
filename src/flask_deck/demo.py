@@ -5,12 +5,14 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 import sqlalchemy as sa
 from flask import Flask, redirect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
+from flask_deck.api_keys import build_api_key_record
+from flask_deck.approvals import ApprovalRequest
 from flask_deck.audit import SQLAlchemyAuditStore, make_audit_entry
 from flask_deck.auth import DeckUser, RBACAuthProvider, Role
 from flask_deck.branding import BrandConfig
@@ -28,6 +30,7 @@ from flask_deck.dashboard import (
     Widget,
 )
 from flask_deck.deck import Deck
+from flask_deck.events import WebhookDeliveryRecord
 from flask_deck.formatters import (
     AvatarFormatter,
     BadgeFormatter,
@@ -39,10 +42,17 @@ from flask_deck.formatters import (
     ProgressBarFormatter,
     RelativeTimeFormatter,
 )
-from flask_deck.jobs import JobContext
+from flask_deck.jobs import JobContext, JobRecord, ThreadPoolJobBackend
 from flask_deck.model_view import ActionField, InlineModelView, ModelView, action
 from flask_deck.query import QuickTab
+from flask_deck.saved_views import RecordNote, SavedViewRecord
+from flask_deck.sql_console import (
+    SavedQueryRecord,
+    execute_readonly_sql,
+    extract_sql_chart_data,
+)
 from flask_deck.storage import FileFieldConfig, MemoryFileStorage, make_demo_png
+from flask_deck.widgets import CodeWidget, ColorWidget, SliderWidget, TagInputWidget
 
 DEMO_MEDIA_STORAGE = MemoryFileStorage()
 
@@ -229,6 +239,41 @@ class SupportTicket(DemoBase):
         return f"{self.ticket_key} · {self.subject}"
 
 
+class InfraNodeType(enum.Enum):
+    GLOBAL = "global"
+    REGION = "region"
+    ZONE = "zone"
+    CLUSTER = "cluster"
+    GPU_POD = "gpu_pod"
+
+
+class InfrastructureNode(DemoBase):
+    __tablename__ = "demo_infrastructure_nodes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(sa.String(40), unique=True, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(sa.String(140), index=True, nullable=False)
+    node_type: Mapped[InfraNodeType] = mapped_column(
+        sa.Enum(InfraNodeType), default=InfraNodeType.CLUSTER, index=True
+    )
+    parent_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("demo_infrastructure_nodes.id"), nullable=True, index=True
+    )
+    accent_color: Mapped[str] = mapped_column(sa.String(16), default="#3b82f6", nullable=False)
+    health_pct: Mapped[int] = mapped_column(sa.Integer, default=99, nullable=False)
+    labels: Mapped[list[str] | None] = mapped_column(sa.JSON, nullable=True)
+    topology_yaml: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    parent: Mapped[InfrastructureNode | None] = relationship(remote_side=[id])
+
+    def __str__(self) -> str:
+        return f"{self.code} · {self.name}"
+
+
 # ---- Declarative ModelViews ----
 
 
@@ -242,6 +287,7 @@ class OrganizationView(ModelView):
     inline_editable_columns = ("is_active", "plan")
     column_labels = MappingProxyType({"mrr_cents": "MRR", "seats_used": "Seats"})
     column_aggregates = MappingProxyType({"mrr_cents": "sum", "seats_used": "sum"})
+    aggregate_scope = "all"
     form_layout = "tabs"
     field_widgets = MappingProxyType({"plan": "segmented"})
     saved_views = (
@@ -360,7 +406,7 @@ class OrderView(ModelView):
     category = "Commerce"
     columns = ("order_number", "organization", "customer", "status", "total_cents", "created_at")
     searchable_columns = ("order_number", "organization.name", "customer.email")
-    filterable_columns = ("status", "organization_id", "total_cents", "created_at")
+    filterable_columns = ("status", "organization_id", "organization.plan", "total_cents", "created_at")
     inline_editable_columns = ("status",)
     inlines = (OrderItemInline,)
     kanban_column = "status"
@@ -434,7 +480,7 @@ class SupportTicketView(ModelView):
     form_excluded_columns = ("deleted_at",)
     columns = ("ticket_key", "subject", "organization", "priority", "status", "sla_health", "created_at")
     searchable_columns = ("ticket_key", "subject")
-    filterable_columns = ("priority", "status", "organization_id", "created_at")
+    filterable_columns = ("priority", "status", "organization_id", "organization.plan", "created_at")
     inline_editable_columns = ("status", "priority")
     kanban_column = "status"
     kanban_card_fields = ("ticket_key", "organization", "priority", "sla_health")
@@ -498,8 +544,93 @@ class SupportTicketView(ModelView):
         return f"Escalated {len(records)} ticket(s) to {target.value} ({reason})."
 
 
-def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyAuditStore) -> None:
+class InfrastructureNodeView(ModelView):
+    model = InfrastructureNode
+    slug = "infrastructure"
+    name = "Infra Node"
+    plural_name = "Fleet Topology"
+    icon = "cpu"
+    category = "Operations"
+    tree_parent_field = "parent_id"
+    tree_title_field = "name"
+    columns = ("code", "name", "node_type", "health_pct", "accent_color", "is_active")
+    searchable_columns = ("code", "name")
+    filterable_columns = ("node_type", "is_active", "parent_id")
+    inline_editable_columns = ("is_active", "health_pct")
+    form_excluded_columns = ("created_at",)
+    saved_views = (
+        ("Tree Hierarchy", "?view=tree"),
+        ("Degraded (<80% Health)", "?f_health_pct__lt=80"),
+    )
+    field_widgets = MappingProxyType(
+        {
+            "node_type": "segmented",
+            "accent_color": ColorWidget(),
+            "health_pct": SliderWidget(min_value=0, max_value=100, step=1, unit="%"),
+            "labels": TagInputWidget(),
+            "topology_yaml": CodeWidget(language="yaml", rows=6),
+        }
+    )
+    fieldsets = (
+        ("Node Topology", ("code", "name", "node_type", "parent_id", "is_active")),
+        ("Capacity & Telemetry", ("health_pct", "accent_color", "labels", "topology_yaml")),
+    )
+    column_formatters = MappingProxyType(
+        {
+            "code": CodeFormatter(copyable=True),
+            "node_type": BadgeFormatter(
+                {
+                    "global": "info",
+                    "region": "ok",
+                    "zone": "neutral",
+                    "cluster": "warn",
+                    "gpu_pod": "ok",
+                }
+            ),
+            "health_pct": ProgressBarFormatter(max_value=100, warn_below=75, danger_below=45),
+            "accent_color": CodeFormatter(copyable=True),
+            "is_active": BooleanIconFormatter(true_label="Online", false_label="Cordoned"),
+        }
+    )
+
+
+def _ensure_demo_media(*, count: int) -> list[str]:
+    sample_pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
+    DEMO_MEDIA_STORAGE.save(
+        sample_pdf,
+        key="products/specs/acme-cloud-datasheet.pdf",
+        content_type="application/pdf",
+    )
+    palette = [
+        (96, 165, 250),
+        (74, 222, 128),
+        (251, 191, 36),
+        (244, 244, 245),
+        (248, 113, 113),
+        (56, 189, 248),
+        (167, 139, 250),
+        (52, 211, 153),
+        (251, 146, 60),
+    ]
+    thumb_keys: list[str] = []
+    for idx in range(count):
+        key = f"products/thumbs/sku-{idx + 1}.png"
+        acc = palette[idx % len(palette)]
+        DEMO_MEDIA_STORAGE.save(make_demo_png(64, 64, accent=acc), key=key, content_type="image/png")
+        thumb_keys.append(key)
+    return thumb_keys
+
+
+def _seed_demo_data(
+    session_factory: sessionmaker[Any],
+    audit_store: SQLAlchemyAuditStore,
+    *,
+    seed_profile: Literal["standard", "showcase"] = "standard",
+) -> None:
     now = datetime.now(timezone.utc)
+    is_showcase = seed_profile == "showcase"
+    thumb_keys = _ensure_demo_media(count=18 if is_showcase else 7)
+
     with session_factory() as sess:
         if sess.scalar(sa.select(sa.func.count()).select_from(Organization)) or 0:
             return
@@ -514,6 +645,46 @@ def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyA
             Organization(name="Solstice Logistics", slug="solstice-log", plan=PlanTier.GROWTH, mrr_cents=180000, seats_used=21, seats_limit=25, created_at=now - timedelta(days=4)),
             Organization(name="Boreal Systems", slug="boreal-sys", plan=PlanTier.STARTER, mrr_cents=39000, seats_used=4, seats_limit=10, is_active=False, created_at=now - timedelta(days=2)),
         ]
+        if is_showcase:
+            extra_org_specs = [
+                ("Aether Compute AI", "aether-ai", PlanTier.ENTERPRISE, 890000, 92, 100, True, 86),
+                ("Vanguard Quantum", "vanguard-q", PlanTier.ENTERPRISE, 740000, 71, 80, True, 81),
+                ("Lumen Health Cloud", "lumen-health", PlanTier.ENTERPRISE, 560000, 58, 75, True, 75),
+                ("Obsidian Payments", "obsidian-pay", PlanTier.ENTERPRISE, 690000, 68, 80, True, 70),
+                ("Stratos Aerospace", "stratos-aero", PlanTier.ENTERPRISE, 940000, 114, 120, True, 66),
+                ("Cobalt Security", "cobalt-sec", PlanTier.GROWTH, 240000, 22, 30, True, 61),
+                ("Atlas Maritime", "atlas-maritime", PlanTier.GROWTH, 215000, 19, 25, True, 57),
+                ("Polaris Genomics", "polaris-gene", PlanTier.ENTERPRISE, 530000, 48, 60, True, 53),
+                ("Nimbus Telemetry", "nimbus-tel", PlanTier.GROWTH, 175000, 17, 25, True, 49),
+                ("Horizon Freight", "horizon-freight", PlanTier.GROWTH, 162000, 15, 25, True, 45),
+                ("Veritas Ledger", "veritas-ledger", PlanTier.ENTERPRISE, 645000, 62, 75, True, 39),
+                ("Krypton Networks", "krypton-net", PlanTier.GROWTH, 228000, 27, 30, True, 34),
+                ("Saffron Retail Ops", "saffron-retail", PlanTier.STARTER, 59000, 7, 10, True, 30),
+                ("Pulse Energy Grid", "pulse-energy", PlanTier.ENTERPRISE, 710000, 66, 80, True, 26),
+                ("Zeta Robotics", "zeta-robotics", PlanTier.GROWTH, 205000, 23, 25, True, 23),
+                ("Argo Autonomous", "argo-auto", PlanTier.ENTERPRISE, 810000, 84, 100, True, 20),
+                ("Fable Studio ML", "fable-ml", PlanTier.STARTER, 45000, 6, 10, True, 17),
+                ("Sierra Defence AI", "sierra-def", PlanTier.ENTERPRISE, 980000, 96, 100, True, 15),
+                ("Halcyon Fintech", "halcyon-fin", PlanTier.GROWTH, 190000, 18, 25, True, 13),
+                ("Driftwood Media", "driftwood-med", PlanTier.STARTER, 35000, 3, 10, False, 11),
+                ("Vectoris Pharma", "vectoris-ph", PlanTier.ENTERPRISE, 590000, 54, 70, True, 9),
+                ("Chronos Data", "chronos-data", PlanTier.GROWTH, 168000, 16, 20, True, 6),
+                ("Orion Edge CDN", "orion-edge", PlanTier.GROWTH, 235000, 21, 30, True, 3),
+                ("Quarry Labs", "quarry-labs", PlanTier.STARTER, 29000, 2, 10, False, 1),
+            ]
+            for name, slug, plan, mrr, used, lim, active, days in extra_org_specs:
+                orgs.append(
+                    Organization(
+                        name=name,
+                        slug=slug,
+                        plan=plan,
+                        mrr_cents=mrr,
+                        seats_used=used,
+                        seats_limit=lim,
+                        is_active=active,
+                        created_at=now - timedelta(days=days),
+                    )
+                )
         sess.add_all(orgs)
         sess.flush()
 
@@ -527,25 +698,63 @@ def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyA
             User(full_name="Clara Weber", email="clara@solstice.eu", role=UserRole.OWNER, organization_id=orgs[6].id, created_at=now - timedelta(days=3)),
             User(full_name="Liam O'Connor", email="liam@boreal.dev", role=UserRole.MEMBER, organization_id=orgs[7].id, is_active=False, created_at=now - timedelta(days=1)),
         ]
+        if is_showcase:
+            extra_user_names = [
+                ("Emre Yilmaz", "emre@aether.ai", UserRole.OWNER, True),
+                ("Sophia Patel", "sophia@vanguardq.com", UserRole.ADMIN, True),
+                ("Lukas Meyer", "lukas@lumenhealth.org", UserRole.ENGINEER, True),
+                ("Nadia Al-Mansoor", "nadia@obsidianpay.io", UserRole.OWNER, True),
+                ("Hiroshi Tanaka", "hiroshi@stratosaero.jp", UserRole.ADMIN, True),
+                ("Chloe Laurent", "chloe@cobaltsec.dev", UserRole.ENGINEER, True),
+                ("Jonas Lindqvist", "jonas@atlasmaritime.se", UserRole.OWNER, True),
+                ("Mina Kwak", "mina@polarisgene.kr", UserRole.ADMIN, True),
+                ("Rafael Silva", "rafael@nimbustel.br", UserRole.ENGINEER, True),
+                ("Hannah Brooks", "hannah@horizonfreight.co", UserRole.MEMBER, True),
+                ("Tariq Haddad", "tariq@veritasledger.io", UserRole.OWNER, True),
+                ("Klara Novak", "klara@krypton.net", UserRole.ENGINEER, True),
+                ("Daniel Cho", "daniel@saffronops.com", UserRole.MEMBER, True),
+                ("Eva Rossi", "eva@pulseenergy.it", UserRole.ADMIN, True),
+                ("Owen Gallagher", "owen@zetarobotics.ai", UserRole.ENGINEER, True),
+                ("Amara Okafor", "amara@argoauto.io", UserRole.OWNER, True),
+                ("Viktor Horvath", "viktor@fableml.studio", UserRole.ENGINEER, True),
+                ("Zeynep Arslan", "zeynep@sierradef.ai", UserRole.ADMIN, True),
+                ("Mateo Morales", "mateo@halcyonfin.es", UserRole.OWNER, True),
+                ("Claire Dubois", "claire@driftwood.fm", UserRole.MEMBER, False),
+                ("Soren Bakke", "soren@vectorispharma.no", UserRole.ADMIN, True),
+                ("Priya Nair", "priya@chronosdata.in", UserRole.ENGINEER, True),
+                ("Felix Hoffmann", "felix@orionedge.de", UserRole.OWNER, True),
+                ("Tessa Campbell", "tessa@quarrylabs.io", UserRole.MEMBER, False),
+                ("Cem Ozkan", "cem@northstar.io", UserRole.ENGINEER, True),
+                ("Rachel Greenwald", "rachel@kestrel.finance", UserRole.ENGINEER, True),
+                ("Ibrahim Mansour", "ibrahim@aether.ai", UserRole.ADMIN, True),
+                ("Yuna Takahashi", "yuna@vanguardq.com", UserRole.ENGINEER, True),
+                ("Gavin Mercer", "gavin@lumenhealth.org", UserRole.MEMBER, True),
+                ("Daria Sokolova", "daria@obsidianpay.io", UserRole.ADMIN, True),
+                ("Samir Haddad", "samir@meridian.bio", UserRole.ENGINEER, True),
+                ("Anika Verma", "anika@stratosaero.jp", UserRole.ENGINEER, True),
+                ("Lucas Bernard", "lucas@cobaltsec.dev", UserRole.MEMBER, False),
+                ("Defne Aydin", "defne@pulseenergy.it", UserRole.ENGINEER, True),
+                ("Ethan Park", "ethan@argoauto.io", UserRole.ADMIN, True),
+                ("Mila Petrovic", "mila@veritasledger.io", UserRole.ENGINEER, True),
+                ("Jules Moreau", "jules@sierradef.ai", UserRole.OWNER, True),
+                ("Leila Farah", "leila@vectorispharma.no", UserRole.ENGINEER, True),
+                ("Henrik Solberg", "henrik@chronosdata.in", UserRole.MEMBER, True),
+                ("Nora Albers", "nora@orionedge.de", UserRole.MEMBER, False),
+            ]
+            for u_idx, (full_name, email, u_role, active) in enumerate(extra_user_names):
+                org = orgs[(u_idx + 8) % len(orgs)]
+                users.append(
+                    User(
+                        full_name=full_name,
+                        email=email,
+                        role=u_role,
+                        organization_id=org.id,
+                        is_active=active,
+                        created_at=now - timedelta(days=1 + (u_idx * 2) % 85),
+                    )
+                )
         sess.add_all(users)
         sess.flush()
-
-        sample_pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
-        DEMO_MEDIA_STORAGE.save(sample_pdf, key="products/specs/acme-cloud-datasheet.pdf", content_type="application/pdf")
-        palette = [
-            (96, 165, 250),
-            (74, 222, 128),
-            (251, 191, 36),
-            (244, 244, 245),
-            (248, 113, 113),
-            (96, 165, 250),
-            (74, 222, 128),
-        ]
-        thumb_keys: list[str] = []
-        for idx, acc in enumerate(palette):
-            key = f"products/thumbs/sku-{idx + 1}.png"
-            DEMO_MEDIA_STORAGE.save(make_demo_png(64, 64, accent=acc), key=key, content_type="image/png")
-            thumb_keys.append(key)
 
         products = [
             Product(sku="GPU-H200-8X", name="Dedicated H200 8x Cluster Node", category=ProductCategory.COMPUTE, price_cents=245000, stock_pct=78, thumbnail_path=thumb_keys[0], spec_sheet_path="products/specs/acme-cloud-datasheet.pdf", metadata_json={"region": "eu-central-1", "vram_gb": 1128}),
@@ -556,6 +765,34 @@ def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyA
             Product(sku="NET-PRIVLINK", name="Zero-Trust PrivateLink Tunnel", category=ProductCategory.NETWORKING, price_cents=15000, stock_pct=18, thumbnail_path=thumb_keys[5], metadata_json={"region": "eu-central-1", "mtls": True}),
             Product(sku="ADD-SOC2-LOG", name="7-Year Compliance Audit Retention", category=ProductCategory.ADDON, price_cents=29000, stock_pct=100, thumbnail_path=thumb_keys[6], spec_sheet_path="products/specs/acme-cloud-datasheet.pdf", metadata_json={"region": "global", "packs": ["SOC2", "ISO27001"]}),
         ]
+        if is_showcase:
+            extra_product_specs = [
+                ("GPU-B200-16X", "Blackwell B200 16x Training Pod", ProductCategory.COMPUTE, 480000, 42, True, {"region": "us-east-1", "vram_gb": 2880, "nvlink": "1.8TB/s"}),
+                ("GPU-L40S-4X", "Inference L40S 4x Serving Node", ProductCategory.COMPUTE, 118000, 84, True, {"region": "ap-northeast-1", "fp8_tflops": 1466}),
+                ("CPU-EPYC-128", "EPYC 9754 High-Memory Compute", ProductCategory.COMPUTE, 68000, 73, True, {"region": "eu-central-1", "ram_gb": 768}),
+                ("STO-LUSTRE-50", "Parallel Lustre AI Scratch (50 TB)", ProductCategory.STORAGE, 89000, 55, True, {"region": "us-east-1", "throughput_gbps": 40}),
+                ("STO-PG-HA", "Multi-AZ Managed Postgres NVMe", ProductCategory.STORAGE, 54000, 89, True, {"region": "eu-central-1", "pitr_days": 35}),
+                ("NET-WAF-ENT", "Enterprise L7 WAF & Bot Shield", ProductCategory.NETWORKING, 34000, 91, True, {"region": "global", "anycast": True}),
+                ("NET-MESH-MTLS", "Cross-Region WireGuard Backbone", ProductCategory.NETWORKING, 22000, 31, True, {"region": "global", "mtu": 9000}),
+                ("ADD-MCP-GUARD", "AI-Agent HITL Approval Gateway", ProductCategory.ADDON, 45000, 100, True, {"region": "global", "protocols": ["MCP-2025", "REST-v1"]}),
+                ("ADD-SSO-SCIM", "OIDC PKCE + Okta SCIM Connector", ProductCategory.ADDON, 19500, 100, True, {"region": "global", "idp": ["Okta", "EntraID"]}),
+                ("ADD-DED-KMS", "FIPS 140-3 Hardware KMS Envelope", ProductCategory.ADDON, 39000, 87, True, {"region": "eu-central-1", "hsm": "Luna-7"}),
+                ("CPU-INTEL-LEG", "Legacy Skylake Gen2 Spot Pool", ProductCategory.COMPUTE, 21000, 12, False, {"region": "us-west-2", "eol": "2027-Q1"}),
+            ]
+            for p_idx, (sku, name, cat, price, stock, active, meta) in enumerate(extra_product_specs, start=7):
+                products.append(
+                    Product(
+                        sku=sku,
+                        name=name,
+                        category=cat,
+                        price_cents=price,
+                        stock_pct=stock,
+                        is_active=active,
+                        thumbnail_path=thumb_keys[p_idx],
+                        spec_sheet_path="products/specs/acme-cloud-datasheet.pdf" if p_idx % 2 == 0 else None,
+                        metadata_json=meta,
+                    )
+                )
         sess.add_all(products)
         sess.flush()
 
@@ -569,8 +806,16 @@ def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyA
             OrderStatus.PAID,
             OrderStatus.REFUNDED,
         ]
+        order_count = 120 if is_showcase else 28
+        days_span = 89 if is_showcase else 14
+        order_notes = [
+            "Provisioned via automated enterprise billing cycle.",
+            "Approved via four-eyes capacity escalation workflow.",
+            "Annual committed reserved-capacity drawdown.",
+            "Q4 GPU cluster expansion with multi-AZ NVMe tier.",
+        ]
         orders: list[Order] = []
-        for idx in range(28):
+        for idx in range(order_count):
             org = orgs[idx % len(orgs)]
             usr = users[idx % len(users)]
             st = status_cycle[idx % len(status_cycle)]
@@ -578,25 +823,23 @@ def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyA
             p2 = products[(idx + 2) % len(products)]
             qty1 = 1 + (idx % 3)
             total = p1.price_cents * qty1 + p2.price_cents
-            days_ago = idx % 14
+            days_ago = (idx * 7) % days_span if is_showcase else (idx % 14)
             ord_obj = Order(
                 order_number=f"ORD-2026-{1040 + idx}",
                 organization_id=org.id,
                 customer_id=usr.id,
                 status=st,
                 total_cents=total,
-                notes="Provisioned via automated enterprise billing cycle.",
+                notes=order_notes[idx % len(order_notes)],
                 created_at=now - timedelta(days=days_ago, hours=(idx * 3) % 20),
-            )
-            sess.add(ord_obj)
-            sess.flush()
-            sess.add_all(
-                [
-                    OrderItem(order_id=ord_obj.id, product_id=p1.id, quantity=qty1, unit_price_cents=p1.price_cents),
-                    OrderItem(order_id=ord_obj.id, product_id=p2.id, quantity=1, unit_price_cents=p2.price_cents),
-                ]
+                items=[
+                    OrderItem(product_id=p1.id, quantity=qty1, unit_price_cents=p1.price_cents),
+                    OrderItem(product_id=p2.id, quantity=1, unit_price_cents=p2.price_cents),
+                ],
             )
             orders.append(ord_obj)
+        sess.add_all(orders)
+        sess.flush()
 
         tickets = [
             SupportTicket(ticket_key="OPS-412", subject="Dedicated PrivateLink BGP peering failover in eu-central-1", organization_id=orgs[1].id, requester_id=users[1].id, priority=TicketPriority.CRITICAL, status=TicketStatus.IN_PROGRESS, sla_health=22, created_at=now - timedelta(hours=3)),
@@ -608,46 +851,225 @@ def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyA
             SupportTicket(ticket_key="OPS-406", subject="Duplicate staging webhook test alert (archived)", organization_id=orgs[5].id, requester_id=users[5].id, priority=TicketPriority.LOW, status=TicketStatus.CLOSED, sla_health=100, deleted_at=now - timedelta(days=1), created_at=now - timedelta(days=5)),
             SupportTicket(ticket_key="OPS-405", subject="Legacy TLS 1.1 deprecation notice (archived)", organization_id=orgs[7].id, requester_id=users[7].id, priority=TicketPriority.LOW, status=TicketStatus.CLOSED, sla_health=100, deleted_at=now - timedelta(days=2), created_at=now - timedelta(days=6)),
         ]
+        if is_showcase:
+            extra_ticket_subjects = [
+                ("Blackwell B200 NVLink fabric CRC counters elevated in us-east-1", TicketPriority.CRITICAL, TicketStatus.OPEN, 19, False, 2),
+                ("Enable hardware KMS key rotation schedule on eu-central-1 vault", TicketPriority.HIGH, TicketStatus.IN_PROGRESS, 52, False, 5),
+                ("Audit MCP API key CIDR allowlist for production runner pool", TicketPriority.HIGH, TicketStatus.OPEN, 48, False, 8),
+                ("Provision 40 Gbps Lustre scratch volume for genomics pipeline", TicketPriority.MEDIUM, TicketStatus.IN_PROGRESS, 71, False, 11),
+                ("Rotate OIDC client secret ahead of annual IdP certificate rollover", TicketPriority.MEDIUM, TicketStatus.OPEN, 82, False, 14),
+                ("Packet loss detected on Frankfurt-Amsterdam WireGuard tunnel", TicketPriority.CRITICAL, TicketStatus.IN_PROGRESS, 29, False, 1),
+                ("Increase REST API rate limit tier from 120 to 600 req/min", TicketPriority.MEDIUM, TicketStatus.RESOLVED, 95, False, 18),
+                ("Cross-border GDPR data residency attestation for Frankfurt cluster", TicketPriority.LOW, TicketStatus.RESOLVED, 99, False, 21),
+                ("WebAuthn FIDO2 passkey attestation check on strict CSP origins", TicketPriority.HIGH, TicketStatus.RESOLVED, 88, False, 24),
+                ("Dead-letter webhook replay requested after downstream 503 outage", TicketPriority.HIGH, TicketStatus.IN_PROGRESS, 56, False, 4),
+                ("Configure custom PO number on annualized Enterprise agreement", TicketPriority.LOW, TicketStatus.OPEN, 86, False, 27),
+                ("Investigate occasional cold-start latency on serverless EU worker", TicketPriority.MEDIUM, TicketStatus.IN_PROGRESS, 64, False, 9),
+                ("Whitelist customer egress NAT block on PrivateLink endpoint", TicketPriority.MEDIUM, TicketStatus.RESOLVED, 93, False, 30),
+                ("Verify hash-chained audit ledger anchor export before board audit", TicketPriority.HIGH, TicketStatus.OPEN, 41, False, 6),
+                ("Upgrade Graviton4 fleet kernel for perf_event telemetry patch", TicketPriority.LOW, TicketStatus.RESOLVED, 97, False, 33),
+                ("Decommission unused Spot GPU allocation in us-west-2 (archived)", TicketPriority.LOW, TicketStatus.CLOSED, 100, True, 35),
+                ("Approve four-eyes production refund batch for billing adjustment", TicketPriority.MEDIUM, TicketStatus.OPEN, 73, False, 3),
+                ("Sync Active Directory security groups to Deck RBAC roles", TicketPriority.MEDIUM, TicketStatus.IN_PROGRESS, 69, False, 16),
+                ("Resolve 409 OCC edit collision reported by multi-region finance team", TicketPriority.LOW, TicketStatus.RESOLVED, 94, False, 38),
+                ("Benchmark keyset cursor pagination over 1.2M ledger events", TicketPriority.LOW, TicketStatus.RESOLVED, 100, False, 41),
+                ("Quarantine suspicious credential scan against staging ingress", TicketPriority.CRITICAL, TicketStatus.RESOLVED, 87, False, 44),
+                ("Add automated SARIF security audit step to release workflow", TicketPriority.MEDIUM, TicketStatus.RESOLVED, 96, False, 47),
+                ("Configure Arabic RTL invoice date/currency formatting preview", TicketPriority.LOW, TicketStatus.CLOSED, 100, False, 50),
+                ("Legacy VPN concentrator shutdown notice (archived)", TicketPriority.LOW, TicketStatus.CLOSED, 100, True, 53),
+                ("Validate Postgres connection pooler idle timeout under failover", TicketPriority.HIGH, TicketStatus.RESOLVED, 90, False, 56),
+                ("Review AI-agent proposed MRR adjustment before checker sign-off", TicketPriority.HIGH, TicketStatus.OPEN, 37, False, 2),
+                ("Enable strict immutable WORM lock on compliance S3 bucket", TicketPriority.MEDIUM, TicketStatus.RESOLVED, 97, False, 59),
+                ("Test duplicate test-tenant cleanup script (archived)", TicketPriority.LOW, TicketStatus.CLOSED, 100, True, 62),
+                ("Inspect slow query plan on multi-bind analytics cluster", TicketPriority.MEDIUM, TicketStatus.OPEN, 79, False, 12),
+                ("Configure PagerDuty webhook signature HMAC verification", TicketPriority.MEDIUM, TicketStatus.RESOLVED, 95, False, 65),
+                ("Expand anycast PoP health probe interval to 10s", TicketPriority.LOW, TicketStatus.CLOSED, 100, False, 68),
+                ("Migrate customer custom role permissions to scoped API keys", TicketPriority.MEDIUM, TicketStatus.IN_PROGRESS, 74, False, 15),
+                ("Review quarterly seat utilization overage report", TicketPriority.LOW, TicketStatus.OPEN, 89, False, 19),
+                ("Certify Zero-Trust mTLS termination on edge ingress tier", TicketPriority.HIGH, TicketStatus.RESOLVED, 92, False, 72),
+            ]
+            for t_idx, (subj, prio, t_status, sla, trashed, days_ago) in enumerate(extra_ticket_subjects):
+                org = orgs[(t_idx + 2) % len(orgs)]
+                usr = users[(t_idx + 2) % len(users)]
+                tickets.append(
+                    SupportTicket(
+                        ticket_key=f"OPS-{413 + t_idx}",
+                        subject=subj,
+                        organization_id=org.id,
+                        requester_id=usr.id,
+                        priority=prio,
+                        status=t_status,
+                        sla_health=sla,
+                        deleted_at=(now - timedelta(days=max(1, days_ago // 4))) if trashed else None,
+                        created_at=now - timedelta(days=days_ago, hours=(t_idx * 5) % 18),
+                    )
+                )
         sess.add_all(tickets)
+
+        # Build InfrastructureNode hierarchy (standard: 7 nodes, showcase: 22 nodes)
+        root_node = InfrastructureNode(
+            code="GLB-CORE-00",
+            name="Acme Global Backbone",
+            node_type=InfraNodeType.GLOBAL,
+            parent_id=None,
+            accent_color="#3b82f6",
+            health_pct=99,
+            labels=["tier:backbone", "control-plane", "soc2"],
+            topology_yaml="mesh:\n  bgp_asn: 64512\n  anycast: true\n  mtls_strict: true",
+            is_active=True,
+        )
+        sess.add(root_node)
+        sess.flush()
+
+        eu_reg = InfrastructureNode(
+            code="REG-EU-C1",
+            name="eu-central-1 (Frankfurt)",
+            node_type=InfraNodeType.REGION,
+            parent_id=root_node.id,
+            accent_color="#10b981",
+            health_pct=96,
+            labels=["region:eu-central-1", "gdpr", "primary"],
+            topology_yaml="region: eu-central-1\nquorum: 3\nencryption: fips-140-3",
+        )
+        us_reg = InfrastructureNode(
+            code="REG-US-E1",
+            name="us-east-1 (Virginia)",
+            node_type=InfraNodeType.REGION,
+            parent_id=root_node.id,
+            accent_color="#22c55e",
+            health_pct=98,
+            labels=["region:us-east-1", "ai-training", "primary"],
+            topology_yaml="region: us-east-1\nquorum: 3\nnvlink_fabric: enabled",
+        )
+        ap_reg = InfrastructureNode(
+            code="REG-AP-NE1",
+            name="ap-northeast-1 (Tokyo)",
+            node_type=InfraNodeType.REGION,
+            parent_id=root_node.id,
+            accent_color="#0ea5e9",
+            health_pct=94,
+            labels=["region:ap-northeast-1", "inference"],
+            topology_yaml="region: ap-northeast-1\nquorum: 2\nlow_latency: true",
+        )
+        sess.add_all([eu_reg, us_reg, ap_reg])
+        sess.flush()
+
+        infra_leaf_specs: list[tuple[str, str, InfraNodeType, int, str, int, list[str], bool]] = [
+            ("CL-EU-H200", "Frankfurt H200 Inference Cluster", InfraNodeType.GPU_POD, eu_reg.id, "#22c55e", 91, ["gpu:h200", "vram:1128g"], True),
+            ("CL-US-B200", "Virginia B200 Training Pod A", InfraNodeType.GPU_POD, us_reg.id, "#f59e0b", 72, ["gpu:b200", "nvlink"], True),
+            ("CL-EU-PLINK", "PrivateLink Edge Concentrator", InfraNodeType.CLUSTER, eu_reg.id, "#ef4444", 39, ["bgp-failover", "net"], True),
+        ]
+        if is_showcase:
+            eu_az1 = InfrastructureNode(
+                code="AZ-EU-C1A",
+                name="eu-central-1a (Equinix FR5)",
+                node_type=InfraNodeType.ZONE,
+                parent_id=eu_reg.id,
+                accent_color="#3b82f6",
+                health_pct=97,
+                labels=["az:1a", "equinix"],
+                topology_yaml="zone: eu-central-1a\npower_pue: 1.18\nuplink_gbps: 400",
+            )
+            eu_az2 = InfrastructureNode(
+                code="AZ-EU-C1B",
+                name="eu-central-1b (Interxion)",
+                node_type=InfraNodeType.ZONE,
+                parent_id=eu_reg.id,
+                accent_color="#6366f1",
+                health_pct=88,
+                labels=["az:1b", "interxion"],
+                topology_yaml="zone: eu-central-1b\npower_pue: 1.21\nuplink_gbps: 400",
+            )
+            us_az1 = InfrastructureNode(
+                code="AZ-US-E1A",
+                name="us-east-1a (Ashburn DC4)",
+                node_type=InfraNodeType.ZONE,
+                parent_id=us_reg.id,
+                accent_color="#14b8a6",
+                health_pct=95,
+                labels=["az:1a", "ashburn"],
+                topology_yaml="zone: us-east-1a\ncooling: direct-liquid\nuplink_gbps: 800",
+            )
+            us_az2 = InfrastructureNode(
+                code="AZ-US-E1B",
+                name="us-east-1b (Ashburn DC7)",
+                node_type=InfraNodeType.ZONE,
+                parent_id=us_reg.id,
+                accent_color="#22c55e",
+                health_pct=99,
+                labels=["az:1b", "storage"],
+                topology_yaml="zone: us-east-1b\nlustre_pool: active\nuplink_gbps: 400",
+            )
+            ap_az1 = InfrastructureNode(
+                code="AZ-AP-NE1A",
+                name="ap-northeast-1a (TY2)",
+                node_type=InfraNodeType.ZONE,
+                parent_id=ap_reg.id,
+                accent_color="#0ea5e9",
+                health_pct=94,
+                labels=["az:1a", "tokyo"],
+                topology_yaml="zone: ap-northeast-1a\nuplink_gbps: 200",
+            )
+            ap_az2 = InfrastructureNode(
+                code="AZ-AP-NE1C",
+                name="ap-northeast-1c (TY4)",
+                node_type=InfraNodeType.ZONE,
+                parent_id=ap_reg.id,
+                accent_color="#f59e0b",
+                health_pct=68,
+                labels=["az:1c", "maintenance"],
+                topology_yaml="zone: ap-northeast-1c\nmaintenance_window: sunday-02utc",
+            )
+            sess.add_all([eu_az1, eu_az2, us_az1, us_az2, ap_az1, ap_az2])
+            sess.flush()
+
+            infra_leaf_specs = [
+                ("POD-EU-H200-01", "H200-8X Pod Alpha (EU)", InfraNodeType.GPU_POD, eu_az1.id, "#22c55e", 96, ["gpu:h200", "vram:1128g"], True),
+                ("POD-EU-H200-02", "H200-8X Pod Beta (EU)", InfraNodeType.GPU_POD, eu_az1.id, "#10b981", 91, ["gpu:h200", "vram:1128g"], True),
+                ("CL-EU-PG-HA", "Frankfurt Postgres NVMe Quorum", InfraNodeType.CLUSTER, eu_az1.id, "#3b82f6", 99, ["postgres:17", "ha-quorum"], True),
+                ("CL-EU-PLINK", "PrivateLink BGP Peering Cluster", InfraNodeType.CLUSTER, eu_az2.id, "#ef4444", 39, ["bgp-alert", "ticket:OPS-412"], True),
+                ("CL-EU-KMS-HSM", "FIPS 140-3 Hardware KMS Vault", InfraNodeType.CLUSTER, eu_az2.id, "#8b5cf6", 100, ["fips-140-3", "hsm"], True),
+                ("POD-US-B200-01", "Blackwell B200-16X Training Pod", InfraNodeType.GPU_POD, us_az1.id, "#f59e0b", 72, ["gpu:b200", "nvlink"], True),
+                ("POD-US-ARM-01", "Graviton4 Worker Pool US-01", InfraNodeType.CLUSTER, us_az1.id, "#22c55e", 97, ["arch:arm64", "stateless"], True),
+                ("CL-US-LUSTRE", "50TB Parallel Lustre Scratch Pool", InfraNodeType.CLUSTER, us_az2.id, "#14b8a6", 95, ["storage:lustre", "40gbps"], True),
+                ("CL-US-WORM-01", "Immutable SOC2 Audit Object Vault", InfraNodeType.CLUSTER, us_az2.id, "#6366f1", 100, ["worm", "soc2"], True),
+                ("POD-AP-L40S-01", "Tokyo L40S Real-Time Inference Pod", InfraNodeType.GPU_POD, ap_az1.id, "#0ea5e9", 93, ["gpu:l40s", "fp8"], True),
+                ("CL-AP-ANYCAST", "Tokyo Anycast PoP Ingress", InfraNodeType.CLUSTER, ap_az1.id, "#3b82f6", 98, ["anycast", "waf-l7"], True),
+                ("CL-AP-SPOT-LEG", "Legacy Spot Drained Pool (Cordoned)", InfraNodeType.CLUSTER, ap_az2.id, "#71717a", 44, ["cordoned", "eol"], False),
+            ]
+        sess.add_all(
+            [
+                InfrastructureNode(
+                    code=code,
+                    name=name,
+                    node_type=ntype,
+                    parent_id=parent_id,
+                    accent_color=color,
+                    health_pct=health,
+                    labels=tags,
+                    topology_yaml=f"node: {code.lower()}\nparent_id: {parent_id}\nhealth_sla: {health}%\nactive: {str(active).lower()}",
+                    is_active=active,
+                    created_at=now - timedelta(days=(idx + 1) * 3),
+                )
+                for idx, (code, name, ntype, parent_id, color, health, tags, active) in enumerate(infra_leaf_specs)
+            ]
+        )
+        sess.flush()
         sess.commit()
 
-        # Pre-seed crisp realistic Audit Ledger entries
+        # Pre-seed chronological Audit Ledger entries (oldest -> newest so hash chain stays valid)
         seed_audits = [
             make_audit_entry(
                 actor_id="admin",
                 actor_name="Duhan Güler",
                 actor_ip="10.24.0.18",
                 action="update",
-                model_slug="orders",
-                model_label="Order",
-                record_pk=str(orders[0].id),
-                record_repr=orders[0].order_number,
-                changes={"status": {"old": "pending", "new": "paid"}},
-                timestamp=now - timedelta(minutes=14),
-            ),
-            make_audit_entry(
-                actor_id="support",
-                actor_name="Maya Chen",
-                actor_ip="10.24.0.42",
-                action="inline_edit",
-                model_slug="tickets",
-                model_label="Ticket",
-                record_pk=str(tickets[0].id),
-                record_repr=tickets[0].ticket_key,
-                changes={"status": {"old": "open", "new": "in_progress"}},
-                timestamp=now - timedelta(minutes=38),
-            ),
-            make_audit_entry(
-                actor_id="admin",
-                actor_name="Duhan Güler",
-                actor_ip="10.24.0.18",
-                action="update",
-                model_slug="organizations",
-                model_label="Organization",
-                record_pk=str(orgs[4].id),
-                record_repr=orgs[4].name,
-                changes={"plan": {"old": "growth", "new": "enterprise"}, "mrr_cents": {"old": 240000, "new": 510000}},
-                timestamp=now - timedelta(hours=2),
+                model_slug="users",
+                model_label="User",
+                record_pk=str(users[1].id),
+                record_repr=users[1].full_name,
+                changes={"role": {"old": "engineer", "new": "admin"}, "api_token": {"old": "[REDACTED]", "new": "[REDACTED]"}},
+                timestamp=now - timedelta(hours=9),
             ),
             make_audit_entry(
                 actor_id="admin",
@@ -666,22 +1088,532 @@ def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyA
                 actor_name="Duhan Güler",
                 actor_ip="10.24.0.18",
                 action="update",
-                model_slug="users",
-                model_label="User",
-                record_pk=str(users[1].id),
-                record_repr=users[1].full_name,
-                changes={"role": {"old": "engineer", "new": "admin"}, "api_token": {"old": "[REDACTED]", "new": "[REDACTED]"}},
-                timestamp=now - timedelta(hours=9),
+                model_slug="organizations",
+                model_label="Organization",
+                record_pk=str(orgs[4].id),
+                record_repr=orgs[4].name,
+                changes={"plan": {"old": "growth", "new": "enterprise"}, "mrr_cents": {"old": 240000, "new": 510000}},
+                timestamp=now - timedelta(hours=2),
+            ),
+            make_audit_entry(
+                actor_id="support",
+                actor_name="Maya Chen",
+                actor_ip="10.24.0.42",
+                action="inline_edit",
+                model_slug="tickets",
+                model_label="Ticket",
+                record_pk=str(tickets[0].id),
+                record_repr=tickets[0].ticket_key,
+                changes={"status": {"old": "open", "new": "in_progress"}},
+                timestamp=now - timedelta(minutes=38),
+            ),
+            make_audit_entry(
+                actor_id="admin",
+                actor_name="Duhan Güler",
+                actor_ip="10.24.0.18",
+                action="update",
+                model_slug="orders",
+                model_label="Order",
+                record_pk=str(orders[0].id),
+                record_repr=orders[0].order_number,
+                changes={"status": {"old": "pending", "new": "paid"}},
+                timestamp=now - timedelta(minutes=14),
             ),
         ]
+        if is_showcase:
+            extra_audits = [
+                make_audit_entry(
+                    actor_id="admin",
+                    actor_name="Duhan Güler",
+                    actor_ip="10.24.0.18",
+                    action="create",
+                    model_slug="organizations",
+                    model_label="Organization",
+                    record_pk=str(orgs[i % len(orgs)].id),
+                    record_repr=orgs[i % len(orgs)].name,
+                    changes={"plan": {"old": None, "new": orgs[i % len(orgs)].plan.value}},
+                    timestamp=now - timedelta(days=14 - (i % 12), hours=(i * 2) % 20),
+                )
+                if i % 4 == 0
+                else (
+                    make_audit_entry(
+                        actor_id="mcp-agent",
+                        actor_name="Claude Ops MCP Agent",
+                        actor_ip="10.24.8.12",
+                        action="approval_approved",
+                        model_slug="orders",
+                        model_label="Order",
+                        record_pk=str(orders[i % len(orders)].id),
+                        record_repr=orders[i % len(orders)].order_number,
+                        changes={"status": {"old": "pending", "new": "shipped"}},
+                        metadata={"actor_type": "ai_agent", "reviewer": "Duhan Güler"},
+                        timestamp=now - timedelta(days=12 - (i % 10), hours=(i * 3) % 18),
+                    )
+                    if i % 4 == 1
+                    else (
+                        make_audit_entry(
+                            actor_id="support",
+                            actor_name="Maya Chen",
+                            actor_ip="10.24.0.42",
+                            action="inline_edit",
+                            model_slug="tickets",
+                            model_label="Ticket",
+                            record_pk=str(tickets[i % len(tickets)].id),
+                            record_repr=tickets[i % len(tickets)].ticket_key,
+                            changes={"priority": {"old": "medium", "new": "high"}},
+                            timestamp=now - timedelta(days=10 - (i % 8), hours=(i * 4) % 16),
+                        )
+                        if i % 4 == 2
+                        else make_audit_entry(
+                            actor_id="admin",
+                            actor_name="Duhan Güler",
+                            actor_ip="10.24.0.18",
+                            action="api_key_create",
+                            model_slug="infrastructure",
+                            model_label="Infra Node",
+                            record_pk=str(root_node.id),
+                            record_repr=f"Key rotation & node health sync #{i}",
+                            changes={"health_pct": {"old": 94, "new": 98}},
+                            timestamp=now - timedelta(days=8 - (i % 6), hours=(i * 5) % 14),
+                        )
+                    )
+                )
+                for i in range(31)
+            ]
+            seed_audits = [*extra_audits, *seed_audits]
         for entry in seed_audits:
             audit_store.record(entry)
+
+
+def _seed_showcase_control_plane(
+    deck: Deck,
+    session_factory: sessionmaker[Any],
+    now: datetime,
+) -> None:
+    """Populate v0.4.0 governance, BI SQL, API key, webhook DLQ, and job showcase stores."""
+    with session_factory() as sess:
+        orgs = list(sess.scalars(sa.select(Organization).order_by(Organization.id.asc()).limit(10)).all())
+        orders = list(sess.scalars(sa.select(Order).order_by(Order.id.asc()).limit(8)).all())
+        tickets = list(sess.scalars(sa.select(SupportTicket).order_by(SupportTicket.id.asc()).limit(6)).all())
+        infra_nodes = list(
+            sess.scalars(sa.select(InfrastructureNode).order_by(InfrastructureNode.id.asc()).limit(12)).all()
+        )
+    if not orgs or not orders or not tickets:
+        return
+
+    # 1. Four-Eyes Maker-Checker Approvals (4 pending incl. 2 AI agent proposals + 3 historical)
+    if deck.approval_store is not None and not deck.approval_store.list_requests(limit=1):
+        pending_specs: list[dict[str, Any]] = [
+            {
+                "id": "appr-ai-001",
+                "model_slug": "organizations",
+                "model_label": "Organization",
+                "operation": "edit",
+                "record_pk": str(orgs[2].id),
+                "record_repr": orgs[2].name,
+                "payload": {"plan": "enterprise", "seats_limit": 60, "mrr_cents": 495000},
+                "diff": {
+                    "plan": {"old": "growth", "new": "enterprise"},
+                    "seats_limit": {"old": 25, "new": 60},
+                    "mrr_cents": {"old": 195000, "new": 495000},
+                },
+                "reason": "MCP agent verified signed enterprise PO #ENT-2026-884 and seat pressure (72% -> 95% forecast).",
+                "requester_id": "mcp-agent",
+                "requester_name": "Claude Ops MCP Agent",
+                "actor_type": "ai_agent",
+                "mins": 9,
+            },
+            {
+                "id": "appr-ai-002",
+                "model_slug": "tickets",
+                "model_label": "Ticket",
+                "operation": "edit",
+                "record_pk": str(tickets[1].id),
+                "record_repr": f"{tickets[1].ticket_key} · {tickets[1].subject[:48]}",
+                "payload": {"priority": "critical", "status": "in_progress", "sla_health": 32},
+                "diff": {
+                    "priority": {"old": "high", "new": "critical"},
+                    "status": {"old": "open", "new": "in_progress"},
+                },
+                "reason": "AI telemetry triage detected GPU queue backlog exceeding 4h Enterprise SLA budget.",
+                "requester_id": "mcp-agent",
+                "requester_name": "Claude Ops MCP Agent",
+                "actor_type": "ai_agent",
+                "mins": 24,
+            },
+            {
+                "id": "appr-hm-003",
+                "model_slug": "orders",
+                "model_label": "Order",
+                "operation": "action",
+                "record_pk": str(orders[3].id),
+                "record_repr": orders[3].order_number,
+                "payload": {"action": "issue_refund", "selected_pks": [str(orders[3].id)]},
+                "diff": {"status": {"old": orders[3].status.value, "new": "refunded"}},
+                "reason": "Customer duplicate billing adjustment requested by Maya Chen (requires checker sign-off).",
+                "requester_id": "support",
+                "requester_name": "Maya Chen",
+                "actor_type": "human",
+                "mins": 55,
+            },
+            {
+                "id": "appr-hm-004",
+                "model_slug": "organizations",
+                "model_label": "Organization",
+                "operation": "edit",
+                "record_pk": str(orgs[5].id),
+                "record_repr": orgs[5].name,
+                "payload": {"plan": "growth", "seats_limit": 25, "mrr_cents": 149000},
+                "diff": {
+                    "plan": {"old": "starter", "new": "growth"},
+                    "seats_limit": {"old": 10, "new": 25},
+                },
+                "reason": "Mid-cycle plan expansion signed via Stripe Enterprise Billing webhook.",
+                "requester_id": "support",
+                "requester_name": "Maya Chen",
+                "actor_type": "human",
+                "mins": 110,
+            },
+        ]
+        for sp in pending_specs:
+            deck.approval_store.create(
+                ApprovalRequest(
+                    id=sp["id"],
+                    model_slug=sp["model_slug"],
+                    model_label=sp["model_label"],
+                    operation=sp["operation"],
+                    record_pk=sp["record_pk"],
+                    record_repr=sp["record_repr"],
+                    payload=sp["payload"],
+                    diff=sp["diff"],
+                    reason=sp["reason"],
+                    requester_id=sp["requester_id"],
+                    requester_name=sp["requester_name"],
+                    actor_type=sp["actor_type"],
+                    created_at=now - timedelta(minutes=sp["mins"]),
+                )
+            )
+
+        historical_specs: list[tuple[str, str, str, str, str, str, str, str, str]] = [
+            ("appr-hist-101", "orders", "Order", "edit", str(orders[0].id), orders[0].order_number, "mcp-agent", "approved", "Checker confirmed Stripe settlement TX #ch_3QP91."),
+            ("appr-hist-102", "tickets", "Ticket", "edit", str(tickets[0].id), tickets[0].ticket_key, "support", "approved", "Escalated BGP failover to eu-central-1 network on-call."),
+            ("appr-hist-103", "organizations", "Organization", "delete", str(orgs[7].id), orgs[7].name, "mcp-agent", "rejected", "Retain paused organization ledger records for 7-year SOC2 retention."),
+        ]
+        for aid, slug, label, op, pk, repr_s, req_id, final_st, note in historical_specs:
+            deck.approval_store.create(
+                ApprovalRequest(
+                    id=aid,
+                    model_slug=slug,
+                    model_label=label,
+                    operation=op,  # type: ignore[arg-type]
+                    record_pk=pk,
+                    record_repr=repr_s,
+                    payload={"note": note},
+                    diff={"reviewed": {"old": "pending", "new": final_st}},
+                    reason="Historical governance audit record.",
+                    requester_id=req_id,
+                    requester_name="Claude Ops MCP Agent" if req_id == "mcp-agent" else "Maya Chen",
+                    actor_type="ai_agent" if req_id == "mcp-agent" else "human",
+                    created_at=now - timedelta(hours=6),
+                )
+            )
+            deck.approval_store.resolve(
+                aid,
+                status=final_st,  # type: ignore[arg-type]
+                reviewer_id="admin",
+                reviewer_name="Duhan Güler",
+                review_note=note,
+            )
+
+    # 2. Saved BI SQL Queries & Pinned Dashboard Tiles
+    if deck.saved_query_store is not None and not deck.saved_query_store.list_queries(limit=1):
+        saved_queries = [
+            SavedQueryRecord(
+                id="sq-bi-plan-mrr",
+                name="Active MRR by Plan Tier (USD)",
+                sql="SELECT plan, SUM(mrr_cents) / 100 AS mrr_usd FROM demo_organizations WHERE is_active = 1 GROUP BY plan ORDER BY mrr_usd DESC",
+                owner_id="admin",
+                owner_name="Duhan Güler",
+                is_pinned_to_dashboard=True,
+                chart_type="bar",
+                created_at=now - timedelta(hours=1),
+            ),
+            SavedQueryRecord(
+                id="sq-bi-cat-rev",
+                name="Order Line-Item Revenue by Category (USD)",
+                sql="SELECT p.category, SUM(oi.quantity * oi.unit_price_cents) / 100 AS revenue_usd FROM demo_order_items oi JOIN demo_products p ON p.id = oi.product_id GROUP BY p.category ORDER BY revenue_usd DESC",
+                owner_id="admin",
+                owner_name="Duhan Güler",
+                is_pinned_to_dashboard=True,
+                chart_type="bar",
+                created_at=now - timedelta(hours=2),
+            ),
+            SavedQueryRecord(
+                id="sq-bi-order-st",
+                name="Orders by Fulfillment State",
+                sql="SELECT status, COUNT(*) AS orders, SUM(total_cents) / 100 AS volume_usd FROM demo_orders GROUP BY status ORDER BY orders DESC",
+                owner_id="admin",
+                owner_name="Duhan Güler",
+                is_pinned_to_dashboard=False,
+                chart_type="line",
+                created_at=now - timedelta(hours=5),
+            ),
+            SavedQueryRecord(
+                id="sq-bi-seat-pressure",
+                name="High Seat Utilization Accounts (>80%)",
+                sql="SELECT name, plan, seats_used, seats_limit, ROUND(100.0 * seats_used / seats_limit, 1) AS pct_used FROM demo_organizations WHERE is_active = 1 AND (100.0 * seats_used / seats_limit) >= 80 ORDER BY pct_used DESC LIMIT 12",
+                owner_id="admin",
+                owner_name="Duhan Güler",
+                is_pinned_to_dashboard=False,
+                chart_type="table",
+                created_at=now - timedelta(hours=8),
+            ),
+            SavedQueryRecord(
+                id="sq-bi-sla-risk",
+                name="Open Critical & High SLA Tickets",
+                sql="SELECT ticket_key, priority, status, sla_health, subject FROM demo_tickets WHERE deleted_at IS NULL AND status IN ('open', 'in_progress') ORDER BY sla_health ASC LIMIT 10",
+                owner_id="support",
+                owner_name="Maya Chen",
+                is_pinned_to_dashboard=False,
+                chart_type="table",
+                created_at=now - timedelta(hours=12),
+            ),
+            SavedQueryRecord(
+                id="sq-bi-fleet-health",
+                name="Fleet Health by Node Tier",
+                sql="SELECT node_type, COUNT(*) AS nodes, ROUND(AVG(health_pct), 1) AS avg_health_pct FROM demo_infrastructure_nodes GROUP BY node_type ORDER BY avg_health_pct ASC",
+                owner_id="admin",
+                owner_name="Duhan Güler",
+                is_pinned_to_dashboard=False,
+                chart_type="bar",
+                created_at=now - timedelta(days=1),
+            ),
+        ]
+        for sq in saved_queries:
+            deck.saved_query_store.create(sq)
+
+    # 3. Shared Team Saved Views
+    if deck.saved_view_store is not None and not deck.saved_view_store.list_for_model(
+        "organizations", user_id="admin", roles=("superadmin",)
+    ):
+        team_views = [
+            SavedViewRecord(id="sv-org-ent", model_slug="organizations", name="Enterprise $4K+ MRR", query_string="?f_plan=enterprise&f_mrr_cents__gte=400000", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-ord-ent", model_slug="orders", name="Enterprise Plan Orders", query_string="?f_organization.plan=enterprise", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-ord-big", model_slug="orders", name="Large Deals ($5K+)", query_string="?f_total_cents__gte=500000", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-tkt-sla", model_slug="tickets", name="SLA At-Risk (<50%)", query_string="?f_sla_health__lte=50", scope="team", owner_id="support", owner_name="Maya Chen"),
+            SavedViewRecord(id="sv-prd-gpu", model_slug="products", name="Compute Gallery", query_string="?view=gallery&f_category=compute", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-inf-tree", model_slug="infrastructure", name="Live Fleet Tree", query_string="?view=tree", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+        ]
+        for sv in team_views:
+            deck.saved_view_store.create(sv)
+
+    # 4. Operational Record Notes (strict-CSP safe Markdown subset)
+    if deck.note_store is not None and not deck.note_store.list_notes("tickets", str(tickets[0].id), limit=1):
+        notes_specs: list[tuple[str, str, str, str, str, bool, int]] = [
+            ("tickets", str(tickets[0].id), "admin", "Duhan Güler", "**Incident Commander Note:** BGP session bounced on `DE-CIX-02`. Failover active via Interxion backup fiber; zero customer packet drop after `03:14 UTC`.", True, 25),
+            ("tickets", str(tickets[0].id), "support", "Maya Chen", "Shared live packet capture summary with Kerem Kaya (`kestrel-fin`). Monitoring stability window for next 4h.", False, 15),
+            ("tickets", str(tickets[1].id), "admin", "Duhan Güler", "**Capacity Check:** Verify `AZ-US-E1A` H200 thermal envelope before expanding quota from 32 to 64 GPUs.", True, 45),
+            ("tickets", str(tickets[2].id), "support", "Maya Chen", "SOC2 Type II attestation package generated as CSV artifact in `/admin/_jobs`.", False, 90),
+            ("organizations", str(orgs[0].id), "admin", "Duhan Güler", "**Strategic Account:** Executive sponsor `Ada Lindholm`. Dedicated 64x H200 renewal scheduled for Q1 2027.", True, 120),
+            ("organizations", str(orgs[1].id), "admin", "Duhan Güler", "- Strict PrivateLink mTLS required on all endpoints\n- Audit exports retained in EU-Central vault (`eu-central-1`)", True, 180),
+            ("organizations", str(orgs[2].id), "support", "Maya Chen", "Pending AI-agent **Enterprise upgrade proposal** in `/admin/_approvals` awaiting Finance checker sign-off.", False, 14),
+            ("organizations", str(orgs[4].id), "admin", "Duhan Güler", "Upgraded Growth → Enterprise (`$2,400` → `$5,100` MRR); HIPAA BAA countersigned.", False, 240),
+            ("orders", str(orders[0].id), "admin", "Duhan Güler", "Stripe invoice settled (`EUR/USD FX locked`); provisioning completed across 2 line items.", True, 60),
+            ("orders", str(orders[1].id), "support", "Maya Chen", "Customer requested consolidated PO reference on next monthly billing run.", False, 140),
+            ("orders", str(orders[2].id), "admin", "Duhan Güler", "Verified EU-Central shipping fulfillment & NVMe snapshot replication.", False, 200),
+            ("infrastructure", str(infra_nodes[0].id), "admin", "Duhan Güler", "**Global Mesh Policy:** All inter-region east-west traffic enforces WireGuard + FIPS-140-3 KMS rotation every 24h.", True, 300),
+            ("infrastructure", str(infra_nodes[1].id), "admin", "Duhan Güler", "Primary GDPR-pinned cluster zone; all KMS keys reside in `eu-central-1` HSM.", True, 360),
+            ("infrastructure", str(infra_nodes[-1].id), "support", "Maya Chen", "Health degraded under BGP maintenance; auto-drain rule verified.", False, 40),
+        ]
+        for slug, pk, aid, aname, body, pinned, mins in notes_specs:
+            deck.note_store.add(
+                RecordNote(
+                    id="",
+                    model_slug=slug,
+                    record_pk=pk,
+                    author_id=aid,
+                    author_name=aname,
+                    body=body,
+                    pinned=pinned,
+                    created_at=now - timedelta(minutes=mins),
+                )
+            )
+
+    # 5. Scoped API Keys (SHA-256 hashed at rest, plaintext never stored)
+    if deck.api_key_store is not None and not deck.api_key_store.list_keys(limit=1):
+        key_specs: list[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...], bool, int | None, bool]] = [
+            ("Claude Ops MCP Agent (HITL)", ("*:view", "organizations:edit", "tickets:edit"), ("support",), (), False, 90, False),
+            ("Billing ERP Read-Only Sync", ("orders:view", "orders:export", "organizations:view"), ("auditor",), ("10.24.0.0/16", "198.51.100.0/24"), False, 180, False),
+            ("SOC2 Compliance Auditor Bot", ("*:view", "audit:view", "*:export"), ("auditor",), (), False, 365, False),
+            ("Legacy Staging CI Key", ("*:view",), ("auditor",), (), False, 30, True),
+        ]
+        for k_name, scopes, k_roles, cidrs, is_su, ttl, should_revoke in key_specs:
+            _plaintext, k_rec = build_api_key_record(
+                name=k_name,
+                owner_id="admin",
+                owner_name="Duhan Güler",
+                scopes=scopes,
+                roles=k_roles,
+                allowed_ips=cidrs,
+                is_superuser=is_su,
+                ttl_days=ttl,
+            )
+            deck.api_key_store.create(k_rec)
+            if should_revoke:
+                deck.api_key_store.revoke(k_rec.id)
+
+    # 6. Webhook Delivery Ledger & Dead-Letter Queue (DLQ)
+    if deck.webhook_delivery_store is not None and not deck.webhook_delivery_store.list_deliveries(limit=1):
+        wh_specs: list[tuple[str, str, str, int, int, int | None, str | None, int]] = [
+            ("https://hooks.acme-ops.internal/audit-siem", "audit.recorded", "delivered", 1, 3, 200, None, 4),
+            ("https://hooks.acme-ops.internal/erp-billing", "record.updated", "delivered", 1, 3, 200, None, 16),
+            ("https://hooks.acme-ops.internal/pagerduty-bridge", "approval.requested", "dead_letter", 3, 3, 503, "Webhook transport returned HTTP 503 (upstream maintenance window)", 28),
+            ("https://hooks.acme-ops.internal/slack-secops", "api_key.created", "delivered", 1, 3, 200, None, 44),
+            ("https://hooks.acme-ops.internal/warehouse-cdc", "import.committed", "retrying", 2, 4, 504, "Upstream timeout after 5000ms waiting for TLS handshake", 62),
+            ("https://hooks.acme-ops.internal/pagerduty-bridge", "record.updated", "delivered", 1, 3, 200, None, 95),
+            ("https://hooks.acme-ops.internal/audit-siem", "approval.resolved", "delivered", 1, 3, 200, None, 130),
+            ("https://hooks.acme-ops.internal/erp-billing", "record.created", "dead_letter", 3, 3, 502, "Bad Gateway from legacy SAP billing receiver", 190),
+            ("https://hooks.acme-ops.internal/slack-secops", "record.restored", "delivered", 1, 3, 200, None, 250),
+            ("https://hooks.acme-ops.internal/audit-siem", "job.succeeded", "delivered", 1, 3, 200, None, 310),
+        ]
+        for idx, (url, ev, st, att, max_att, code, err, mins) in enumerate(wh_specs):
+            ts = now - timedelta(minutes=mins)
+            deck.webhook_delivery_store.record(
+                WebhookDeliveryRecord(
+                    id=f"wh-demo-{idx + 1:03d}",
+                    webhook_url=url,
+                    event_name=ev,
+                    payload_json=f'{{"event":"{ev}","seq":{idx + 1},"env":"staging"}}',
+                    status=st,  # type: ignore[arg-type]
+                    attempts=att,
+                    max_attempts=max_att,
+                    last_status_code=code,
+                    last_error=err,
+                    created_at=ts,
+                    updated_at=ts + timedelta(seconds=att * 2),
+                    delivered_at=(ts + timedelta(seconds=1)) if st == "delivered" else None,
+                )
+            )
+
+    # 7. Background Jobs & Downloadable Compliance Artifact
+    if isinstance(deck.job_backend, ThreadPoolJobBackend) and not deck.job_backend.list_jobs(limit=1):
+        report_csv = (
+            b"timestamp_utc,actor,action,model,record_pk,chain_status\n"
+            b"2026-11-23T12:00:00Z,admin,update,organizations,5,VALID\n"
+            b"2026-11-23T14:15:00Z,mcp-agent,approval_approved,orders,1,VALID\n"
+            b"2026-11-23T16:45:00Z,support,inline_edit,tickets,1,VALID\n"
+        )
+        deck.job_storage.save(
+            report_csv,
+            key="jobs/soc2-q4-attestation.csv",
+            content_type="text/csv",
+        )
+        seeded_jobs = [
+            JobRecord(
+                id="job-demo-005",
+                name="audit_chain_snapshot",
+                label="Audit Chain Merkle Anchor Snapshot",
+                actor_id="admin",
+                actor_name="Duhan Güler",
+                model_slug="",
+                status="succeeded",
+                progress=100,
+                message="Verified 36 hash-chained audit ledger entries (0 breaks).",
+                logs=[
+                    "[09:00:01] Starting cryptographic chain scan across flask_deck_audit_logs",
+                    "[09:00:02] Verified GENESIS -> seq=36 SHA-256 integrity",
+                ],
+                created_at=now - timedelta(hours=7),
+                started_at=now - timedelta(hours=7),
+                finished_at=now - timedelta(hours=7) + timedelta(seconds=2),
+            ),
+            JobRecord(
+                id="job-demo-004",
+                name="webhook_dlq_replay",
+                label="Replay ERP Webhook Dead-Letter Batch",
+                actor_id="support",
+                actor_name="Maya Chen",
+                model_slug="orders",
+                status="failed",
+                progress=65,
+                message="Failed",
+                error="Legacy SAP billing receiver returned HTTP 502 Bad Gateway after 3 retries.",
+                logs=[
+                    "[11:20:00] Dequeued 2 dead_letter deliveries for replay",
+                    "[11:20:04] ERROR: HTTP 502 Bad Gateway from hooks.acme-ops.internal/erp-billing",
+                ],
+                created_at=now - timedelta(hours=5),
+                started_at=now - timedelta(hours=5),
+                finished_at=now - timedelta(hours=5) + timedelta(seconds=5),
+            ),
+            JobRecord(
+                id="job-demo-003",
+                name="bulk_import_commit",
+                label="Async Catalog CSV Import (Q4 SKUs)",
+                actor_id="admin",
+                actor_name="Duhan Güler",
+                model_slug="products",
+                status="succeeded",
+                progress=100,
+                message="Committed +11 created, ~3 updated across 14 SKU rows.",
+                logs=[
+                    "[13:10:00] Validated SAVEPOINT dry-run preview token",
+                    "[13:10:01] Committed 14 product catalog mutations atomically",
+                ],
+                created_at=now - timedelta(hours=3),
+                started_at=now - timedelta(hours=3),
+                finished_at=now - timedelta(hours=3) + timedelta(seconds=1),
+            ),
+            JobRecord(
+                id="job-demo-002",
+                name="orders_sync_erp",
+                label="Sync ERP Ledger (12 Selected Orders)",
+                actor_id="admin",
+                actor_name="Duhan Güler",
+                model_slug="orders",
+                status="succeeded",
+                progress=100,
+                message="Synced 12 order(s) with ERP ledger.",
+                logs=[
+                    "[15:40:00] Reconciling ORD-2026-1040..ORD-2026-1051",
+                    "[15:40:03] Ledger balanced ($148,920.00 settled)",
+                ],
+                created_at=now - timedelta(hours=2),
+                started_at=now - timedelta(hours=2),
+                finished_at=now - timedelta(hours=2) + timedelta(seconds=3),
+            ),
+            JobRecord(
+                id="job-demo-001",
+                name="soc2_attestation_export",
+                label="Generate SOC2 Q4 Attestation Bundle (CSV)",
+                actor_id="admin",
+                actor_name="Duhan Güler",
+                model_slug="",
+                status="succeeded",
+                progress=100,
+                message="Generated signed SOC2 attestation CSV artifact.",
+                logs=[
+                    "[17:15:00] Exporting tamper-evident audit digest",
+                    "[17:15:01] Saved artifact soc2-q4-attestation.csv",
+                ],
+                created_at=now - timedelta(minutes=42),
+                started_at=now - timedelta(minutes=42),
+                finished_at=now - timedelta(minutes=42) + timedelta(seconds=1),
+                artifact_key="jobs/soc2-q4-attestation.csv",
+                artifact_filename="soc2-q4-attestation.csv",
+                artifact_mime="text/csv",
+            ),
+        ]
+        with deck.job_backend._lock:
+            for job in seeded_jobs:
+                deck.job_backend._jobs[job.id] = job
 
 
 def create_demo_app(
     db_uri: str = "sqlite:///:memory:",
     *,
     secret_key: str | None = None,
+    seed_profile: Literal["standard", "showcase"] = "standard",
 ) -> Flask:
     """Create the complete Acme Cloud Ops SaaS demo Flask application."""
     app = Flask(__name__)
@@ -704,7 +1636,7 @@ def create_demo_app(
     DemoBase.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     audit_store = SQLAlchemyAuditStore(engine, hash_chain=True)
-    _seed_demo_data(session_factory, audit_store)
+    _seed_demo_data(session_factory, audit_store, seed_profile=seed_profile)
 
     roles = [
         Role(
@@ -818,9 +1750,66 @@ def create_demo_app(
                 "Order Status Summary",
                 "SELECT status, COUNT(*) AS orders, SUM(total_cents) / 100 AS volume_usd FROM demo_orders GROUP BY status ORDER BY orders DESC",
             ),
+            (
+                "Category Revenue Split",
+                "SELECT p.category, COUNT(*) AS line_items, SUM(oi.quantity * oi.unit_price_cents) / 100 AS revenue_usd FROM demo_order_items oi JOIN demo_products p ON p.id = oi.product_id GROUP BY p.category ORDER BY revenue_usd DESC",
+            ),
+            (
+                "Enterprise Seat Pressure (>80%)",
+                "SELECT name, plan, seats_used, seats_limit, ROUND(100.0 * seats_used / seats_limit, 1) AS util_pct FROM demo_organizations WHERE is_active = 1 AND (100.0 * seats_used / seats_limit) >= 80 ORDER BY util_pct DESC",
+            ),
+            (
+                "Fleet Topology Health",
+                "SELECT code, name, node_type, health_pct, is_active FROM demo_infrastructure_nodes ORDER BY health_pct ASC LIMIT 12",
+            ),
         ],
     )
-    deck.register(OrganizationView, UserView, ProductView, OrderView, SupportTicketView)
+    deck.register(
+        OrganizationView,
+        UserView,
+        ProductView,
+        OrderView,
+        SupportTicketView,
+        InfrastructureNodeView,
+    )
+    if seed_profile == "showcase":
+        _seed_showcase_control_plane(deck, session_factory, datetime.now(timezone.utc))
+
+    @deck.scheduled_job(
+        "nightly_billing_reconcile",
+        schedule="0 2 * * *",
+        label="Reconcile Enterprise Billing",
+        description="Verify active MRR commitments against settled payment ledger.",
+    )
+    def _nightly_billing_reconcile(job_ctx: JobContext) -> str:
+        job_ctx.set_progress(40, "Scanning active enterprise subscriptions…")
+        job_ctx.log("Reconciled active MRR & settled order totals against ledger.")
+        job_ctx.set_progress(100, "Billing reconciliation complete")
+        return "Reconciled enterprise MRR and order totals cleanly."
+
+    @deck.scheduled_job(
+        "sla_breach_digest",
+        schedule="*/15 * * * *",
+        label="Check Critical SLA Budgets",
+        description="Scan open Critical & High tickets below 45% SLA remaining.",
+    )
+    def _sla_breach_digest(job_ctx: JobContext) -> str:
+        job_ctx.set_progress(50, "Evaluating open ticket SLA thresholds…")
+        job_ctx.log("Checked Critical/High queue SLA budgets across active tenants.")
+        job_ctx.set_progress(100, "SLA digest emitted")
+        return "Evaluated open SLA budgets and dispatched alert digest."
+
+    @deck.scheduled_job(
+        "audit_chain_snapshot",
+        schedule="0 * * * *",
+        label="Verify & Snapshot Audit Chain",
+        description="Validate cryptographic SHA-256 hash chain across flask_deck_audit_logs.",
+    )
+    def _audit_chain_snapshot(job_ctx: JobContext) -> str:
+        ok, err = audit_store.verify_chain()
+        job_ctx.log(f"Hash chain verification result: ok={ok}")
+        job_ctx.set_progress(100, "Verified" if ok else f"Broken: {err}")
+        return "Audit hash chain integrity verified (0 tamper breaks)." if ok else f"Chain check failed: {err}"
 
     @deck.dashboard
     def acme_dashboard(ctx: DashboardContext) -> list[Widget]:
@@ -837,7 +1826,15 @@ def create_demo_app(
             ).all()
         )
         open_tickets = sum(1 for t in tickets_all if t.status in {TicketStatus.OPEN, TicketStatus.IN_PROGRESS})
+        critical_open = sum(
+            1
+            for t in tickets_all
+            if t.priority == TicketPriority.CRITICAL and t.status in {TicketStatus.OPEN, TicketStatus.IN_PROGRESS}
+        )
         critical_t = next((t for t in tickets_all if t.priority == TicketPriority.CRITICAL and t.status != TicketStatus.RESOLVED), None)
+        total_seats_used = sum(o.seats_used for o in orgs_all if o.is_active)
+        total_seats_lim = sum(o.seats_limit for o in orgs_all if o.is_active)
+        seat_util_pct = int(total_seats_used / max(1, total_seats_lim) * 100)
 
         span_days = ctx.range_days
         labels = ctx.last_n_days(span_days)
@@ -923,7 +1920,7 @@ def create_demo_app(
                 KPIWidget(
                     title="Active Organizations",
                     value=str(active_orgs),
-                    delta="87% enterprise seats",
+                    delta=f"{seat_util_pct}% seat utilization",
                     trend="up",
                     icon="building",
                     href=ctx.url_for_model(Organization),
@@ -933,7 +1930,7 @@ def create_demo_app(
                 KPIWidget(
                     title="Open SLA Tickets",
                     value=str(open_tickets),
-                    delta="1 critical (<4h SLA)",
+                    delta=f"{critical_open} critical (<4h SLA)",
                     trend="down" if open_tickets >= 4 else "flat",
                     icon="life-buoy",
                     href=f"{ctx.url_for_model(SupportTicket)}?view=board",
@@ -1005,6 +2002,49 @@ def create_demo_app(
                 ),
             ]
         )
+        if (
+            deck.saved_query_store is not None
+            and deck.config.enable_sql_console
+            and deck.auth.has_permission(ctx.user, "sql:query")
+            and deck.adapter is not None
+        ):
+            pinned_queries = deck.saved_query_store.list_queries(pinned_only=True, limit=4)
+            engines = deck.adapter.get_engines()
+            for sq in pinned_queries:
+                target_eng = engines.get(sq.bind_key) if sq.bind_key else deck.adapter.get_engine()
+                if target_eng is None:
+                    continue
+                q_res = execute_readonly_sql(
+                    target_eng,
+                    sq.sql,
+                    max_rows=min(25, deck.config.sql_console_max_rows),
+                    extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+                )
+                if q_res.error:
+                    continue
+                chart_pair = extract_sql_chart_data(q_res) if sq.chart_type in {"bar", "line"} else None
+                if chart_pair is not None:
+                    c_labels, c_series = chart_pair
+                    widgets.append(
+                        ChartWidget(
+                            title=sq.name,
+                            subtitle=f"Pinned BI ({sq.bind_key or 'default'})",
+                            chart_type="area" if sq.chart_type == "line" else "bar",
+                            labels=c_labels,
+                            series=c_series,
+                            col_span=6,
+                        )
+                    )
+                else:
+                    widgets.append(
+                        TableWidget(
+                            title=sq.name,
+                            subtitle=f"Pinned SQL ({sq.bind_key or 'default'})",
+                            headers=list(q_res.columns),
+                            rows=[list(r) for r in q_res.rows[:10]],
+                            col_span=6,
+                        )
+                    )
         return widgets
 
     @deck.page(

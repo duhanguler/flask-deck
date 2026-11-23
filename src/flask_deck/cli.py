@@ -193,7 +193,7 @@ def _run_demo(host: str = "127.0.0.1", port: int = 5055, open_browser: bool = Fa
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="flask_deck_demo_"))
     db_file = tmp_dir / "demo.sqlite3"
-    app = create_demo_app(db_uri=f"sqlite:///{db_file.as_posix()}")
+    app = create_demo_app(db_uri=f"sqlite:///{db_file.as_posix()}", seed_profile="showcase")
 
     def _cleanup_demo() -> None:
         decks = app.extensions.get("flask_deck", {})
