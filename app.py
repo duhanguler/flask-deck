@@ -35,10 +35,21 @@ def _resolve_seed_profile() -> Literal["standard", "showcase"]:
     return "standard" if raw == "standard" else "showcase"
 
 
+def _resolve_auto_reset() -> bool:
+    raw = os.environ.get("FLASK_DECK_AUTO_DAILY_RESET", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _resolve_reset_timezone() -> str:
+    return os.environ.get("FLASK_DECK_RESET_TIMEZONE", "Europe/Istanbul").strip() or "Europe/Istanbul"
+
+
 app = create_demo_app(
     db_uri=_resolve_db_uri(),
     secret_key=_resolve_secret_key(),
     seed_profile=_resolve_seed_profile(),
+    auto_daily_reset=_resolve_auto_reset(),
+    reset_timezone=_resolve_reset_timezone(),
 )
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)  # type: ignore[method-assign]
 if os.environ.get("VERCEL"):

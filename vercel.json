@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "schedules": {
+    "daily-demo-reset": {
+      "schedule": "0 0 * * *",
+      "timezone": "Europe/Istanbul",
+      "path": "/api/cron/reset-demo",
+      "requestMethod": "POST"
+    }
+  }
+}

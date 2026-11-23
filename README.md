@@ -8,22 +8,22 @@
   <img src="https://img.shields.io/badge/Python-3.10%20--%203.13-18181b?style=flat-square&logo=python&logoColor=white" alt="Python 3.10-3.13" />
   <img src="https://img.shields.io/badge/Flask-2.3%2B%20%7C%203.x-18181b?style=flat-square&logo=flask&logoColor=white" alt="Flask" />
   <img src="https://img.shields.io/badge/SQLAlchemy-2.0%2B-18181b?style=flat-square&logo=sqlalchemy&logoColor=white" alt="SQLAlchemy 2.0+" />
-  <img src="https://img.shields.io/badge/Assets-23.6%20KB%20gzip-18181b?style=flat-square" alt="23.6 KB gzip" />
+  <img src="https://img.shields.io/badge/Assets-15.6%20KB%20core%20gz-18181b?style=flat-square" alt="15.6 KB core gzip" />
   <img src="https://img.shields.io/badge/CSP-Strict%20Nonce-18181b?style=flat-square" alt="Strict Nonce CSP" />
   <a href="https://github.com/duhanguler/flask-deck/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-18181b?style=flat-square" alt="MIT License" /></a>
 </p>
 
 # flask-deck
 
-**A precision, fail-closed Enterprise Admin Panel & Operations Workbench for Flask and SQLAlchemy 2.0** — engineered for teams that want the visual craft of **Django-Unfold / Filament / Linear** plus enterprise security, media storage, i18n/RTL, cursor pagination, background SSE jobs, and pure-Python TOTP 2FA on WSGI — without shipping Bootstrap, jQuery, Node build pipelines, or external CDNs.
+**A precision, fail-closed Enterprise & AI-Agent Operations Control Plane for Flask and SQLAlchemy 2.0** — engineered for teams that want the visual craft of **Django-Unfold / Filament / Linear** plus enterprise IAM (SSO, Passkeys, encrypted TOTP), four-eyes Maker-Checker approvals, hash-chained audit ledgers, headless REST API v1, HITL MCP agent tooling, media storage, i18n/RTL, and SQL BI charts on WSGI — without shipping Bootstrap, jQuery, Node build pipelines, or external CDNs.
 
-- **Zero Node Build · Zero External CDN · `< 18 KB` Core / `< 24 KB` Route gzip budgets** (`deck.css` + ES6 vanilla JS + inline SVGs + pure SSR SVG visualizations & QR codes). Runs out of the box in air-gapped enterprise environments.
+- **Zero Node Build · Zero External CDN · `< 18 KB` Core / `< 24 KB` Route gzip budgets** (`9.22 KB` CSS + `6.41 KB` core JS = `15.63 KB` gzip core; modular grid/form/ops route totals `18.12–20.89 KB` gzip + pure SSR SVG visualizations & QR codes). Runs out of the box in air-gapped enterprise environments.
 - **Carbon Dark, Swiss Light & Strict-CSP Brand Themes**: `1px` hairline grids, `tabular-nums`, CSS Logical Properties for native **RTL**, custom `#RRGGBB` brand accents served over external `/_theme.css` (auto WCAG 2.1 contrast, **0 `'unsafe-inline'`**), and 7 allowlisted extension slots.
 - **Enterprise Control Plane & AI-Agent Platform (`v0.4.0`)**:
-  1. **Enterprise IAM 2.0 & Tamper-Evident Audit**: Encrypted TOTP 2FA (`SecretCipher`), WebAuthn **Passkeys**, PKCE OIDC SSO, Session Registry (`/_security/sessions`), Four-Eyes **Approval Workflows (`/_approvals`)**, 3-way **OCC**, Server-Side **Saved Views & Notes**, and Hash-Chained **Audit Ledger**.
-  2. **Headless REST API v1 & HITL MCP Server**: Scoped Bearer **API Keys** (`dk_live_...`, CIDR allowlist, rate limiting), OpenAPI 3.1.0 `/_api/v1/...`, and JSON-RPC 2.0 **MCP Server** (`POST /_mcp` & `flask deck mcp`) with savepoint-validated agent proposals.
-  3. **Workspace 2.0 & SQL Workbench 2.0 BI**: **Table, Kanban Board, Calendar, Gallery & Cycle-Safe Tree** views, universal scalar inline edits, clickable FK badges, 1-to-N sub-tables, whole-dataset currency aggregates, dotted FK filters, `__in`/`__not_in`/`__fts`, multi-bind Schema Browser, `EXPLAIN`, SVG Bar/Line charts & pinned Dashboard BI tiles.
-  4. **Import/Export 2.0, ORM Introspection 2.0 & CLI**: Interactive column-mapping wizard, failed-rows CSV download, async background imports, optional **XLSX** (`flask-deck[excel]`), `TypeDecorator`/`hybrid_property`/`column_property`/Joined-Table Inheritance, typed `widgets.py`, clickable zoomable SVG ERD, `flask deck scaffold`, and `flask deck audit --format sarif`.
+  1. **Enterprise IAM 2.0 & Tamper-Evident Audit**: Encrypted TOTP 2FA (`SecretCipher`), WebAuthn **Passkeys**, PKCE OIDC SSO, Session Registry (`/_security/sessions`), Four-Eyes **Approval Workflows (`/_approvals`)**, 3-way **OCC**, Server-Side **Saved Views & Notes**, and Hash-Chained **Audit Ledger (`verify_chain()`)**.
+  2. **Headless REST API v1 & HITL MCP Server**: Scoped Bearer **API Keys** (`dk_live_...`, CIDR allowlist, sliding-window rate limiting), OpenAPI 3.1.0 `/_api/v1/...`, and JSON-RPC 2.0 **MCP Server** (`POST /_mcp` & `flask deck mcp`) with savepoint-validated agent proposals.
+  3. **Workspace 2.0 & SQL Workbench 2.0 BI**: **Table, Kanban Board, Calendar, Gallery & Cycle-Safe Tree** views, universal scalar inline edits, clickable FK badges, 1-to-N sub-tables, whole-dataset currency aggregates (`aggregate_scope="all"`), dotted FK filters, `__in`/`__not_in`/`__fts`, multi-bind Schema Browser, `EXPLAIN`, SVG Bar/Line charts & pinned Dashboard BI tiles.
+  4. **Import/Export 2.0, ORM Introspection 2.0 & CLI**: Interactive column-mapping wizard, failed-rows CSV download, async background imports, optional **XLSX** (`flask-deck[excel]`), `TypeDecorator`/`hybrid_property`/`column_property`/Joined-Table Inheritance, typed `widgets.py`, clickable zoomable SVG ERD, `flask deck scaffold`, `flask deck audit --format sarif`, and `flask-lens` auto-detection.
 
 ---
 
@@ -35,11 +35,17 @@ uvx flask-deck demo
 pip install flask-deck && flask-deck demo
 ```
 
-Open `http://127.0.0.1:5055/admin/` and explore:
+Open `http://127.0.0.1:5055/admin/` and explore the **`showcase`** control-plane seed (32 orgs, 48 users, 18 products with thumbnails, 120 orders across 90 days, 42 tickets, 22 infrastructure tree nodes, 36 hash-chained audit entries, pending AI-agent/human approvals, saved SQL BI queries, API keys, webhooks & jobs):
 - **Live RBAC Switching**: Bottom-left **SESSION ROLE** switcher (`Admin` / `Support` with live email PII masking / `Viewer` read-only) plus **Impersonate User**.
-- **Media & 3-Step Wizard**: Click any Product thumbnail on `/admin/products/` for the Lightbox, or open **Edit** for the 3-step Wizard with image dropzone & metadata editor.
-- **Cursor Pagination & Soft-Delete Trash**: Explore `/admin/tickets/` with HMAC keyset cursors and Trash / Restore tabs.
-- **TOTP 2FA QR, Revision Diffs, Background SSE Jobs & Arabic RTL**: Visit `/admin/_security/mfa`, `/admin/orders/1/history`, `/admin/_jobs`, or switch to **العربية (AR)** + `Europe/Istanbul` in the topbar Globe popover.
+- **Workspace 2.0 Multi-Views & Media**: Browse `/admin/infrastructure/?view=tree`, `/admin/products/?view=gallery` (with Image Lightbox), `/admin/orders/?view=calendar`, `/admin/tickets/?view=board`, and Trash restore (`?trashed=1`).
+- **Four-Eyes Approvals, Hash-Chained Audit & BI SQL**: Review pending AI-agent (`mcp-agent`) & human requests on `/admin/_approvals`, verify ledger integrity on `/admin/_audit`, or chart & pin BI queries on `/admin/_sql`.
+- **IAM, Headless APIs, Jobs & Arabic RTL**: Visit `/admin/_security/mfa`, `/admin/_security/passkeys`, `/admin/_security/sessions`, `/admin/_security/api-keys`, `/admin/_webhooks`, `/admin/_jobs`, or switch to **العربية (AR)** + `Europe/Istanbul` in the topbar Globe popover.
+
+#### Deploy Live Demo on Vercel
+
+`flask-deck` includes a zero-config Vercel Flask entrypoint ([app.py](https://github.com/duhanguler/flask-deck/blob/main/app.py)) and [vercel.json](https://github.com/duhanguler/flask-deck/blob/main/vercel.json) scheduled reset configuration:
+- **Daily `00:00` (`Europe/Istanbul`) Auto-Reset:** Vercel Schedules invokes `POST /api/cron/reset-demo` daily at `00:00 Europe/Istanbul` (protected by Bearer `CRON_SECRET`), and an in-process day-rollover guard automatically resets ephemeral/persistent demo state across midnight on the next request.
+- **Optional Environment Variables:** `CRON_SECRET` (recommended on Vercel), `DATABASE_URL` / `FLASK_DECK_DEMO_DB_URI` (optional Postgres backing), `FLASK_DECK_SECRET_KEY`, `FLASK_DECK_DEMO_PROFILE` (`showcase` default or `standard`), `FLASK_DECK_AUTO_DAILY_RESET` (`1` default), `FLASK_DECK_RESET_TIMEZONE` (`Europe/Istanbul` default).
 
 Optional extras (zero mandatory bloat in the base wheel):
 
@@ -60,8 +66,8 @@ pip install "flask-deck[enterprise]"  # Full enterprise bundle
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/dashboard-dark.png" />
-    <source media="(prefers-color-scheme: light)" srcset="docs/assets/dashboard-light.png" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/dashboard-dark.png" />
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/dashboard-light.png" />
     <img src="https://raw.githubusercontent.com/duhanguler/flask-deck/main/docs/assets/dashboard-dark.png" alt="flask-deck Carbon Dark & Swiss Light Dashboard Workbench" width="100%" />
   </picture>
 </p>
@@ -250,24 +256,66 @@ deck.add_webhook(
 
 ---
 
+## Governance, Workspace 2.0 Views & AI-Agent Control Plane (`v0.4.0`)
+
+```python
+from flask_deck import (
+    CodeWidget,
+    ColorWidget,
+    Deck,
+    ModelView,
+    SliderWidget,
+    TagInputWidget,
+)
+
+class InfrastructureNodeView(ModelView):
+    model = InfrastructureNode
+    tree_parent_field = "parent_id"       # Cycle-safe Tree Hierarchy (?view=tree)
+    tree_title_field = "name"
+    calendar_date_field = "created_at"    # Opt-in Month Calendar (?view=calendar)
+    gallery_image_field = "thumb_key"     # Opt-in Media Gallery (?view=gallery)
+    aggregate_scope = "all"               # Whole-filtered dataset summary footer
+    approval_required = ("edit", "delete")  # Four-Eyes Maker-Checker workflow
+    field_widgets = {
+        "accent_color": ColorWidget(),
+        "health_pct": SliderWidget(min_value=0, max_value=100, unit="%"),
+        "labels": TagInputWidget(),
+        "topology_yaml": CodeWidget(language="yaml", rows=6),
+    }
+
+deck = Deck(
+    app,
+    db,
+    auth=auth,
+    enable_sql_console=True,
+    enable_rest_api=True,      # OpenAPI 3.1.0 REST API at /admin/_api/v1/...
+    enable_mcp=True,           # JSON-RPC 2.0 MCP Server at POST /admin/_mcp
+    mcp_require_approval=True, # AI-agent writes validate via SAVEPOINT -> /_approvals
+)
+```
+
+Run the local stdio MCP server for desktop AI clients with `flask --app yourapp deck mcp`.
+
+---
+
 ## Ecosystem Comparison
 
-| Capability | **flask-deck `v0.3`** | `flask-admin` v2.2 | `flask-appbuilder` | `sqladmin` | `django-unfold` |
+| Capability | **flask-deck `v0.4`** | `flask-admin` v2.2 | `flask-appbuilder` | `sqladmin` | `django-unfold` |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Flask / WSGI Native** | **Yes** | Yes | Yes | No (ASGI) | No (Django) |
 | **Pure SQLAlchemy 2.0 + Multi-Bind DBs** | **Yes** | Partial | No | Yes | N/A |
-| **Zero Node Build & Zero CDN** | **Yes (`23.6 KB` gz)** | Partial | Partial | No | Partial |
+| **Zero Node Build & Zero CDN** | **Yes (`15.6 KB` core / ≤`20.9 KB` route gz)** | Partial | Partial | No | Partial |
 | **Media Upload (Local + S3/R2/MinIO + Lightbox)** | **Yes (Magic-byte + Bomb guard)** | Local only | Partial | Via lib | Via Django |
 | **Built-In i18n, Native RTL & Per-User TZ** | **Yes (CSS Logical Props)** | Babel | Babel | No | Yes |
 | **Strict-CSP Dynamic Brand Theme & Slots** | **Yes (`/_theme.css`)** | Manual | Manual | Manual | Tailwind |
-| **Built-In TOTP 2FA + Pure SVG QR + OIDC SSO** | **Yes (0 external deps)** | No | OAuth only | No | Via plugins |
-| **Audited User Impersonation** | **Yes** | No | No | No | Via plugin |
-| **Keyset Cursor Pagination + PG `JSONB`/`ARRAY`** | **Yes (HMAC cursor)** | No | No | No | Partial |
-| **Conditional Fields, Cascading FK & Wizards** | **Yes (+ Pydantic)** | No | No | No | Partial |
-| **Soft-Delete Trash & Side-by-Side Diff Revert** | **Yes** | No | No | No | Via plugin |
-| **Background Jobs + Live SSE + SSRF Webhooks** | **Yes** | No | No | No | Via Celery |
-| **Kanban + Schema ERD + Redacting SQL Console** | **Yes** | No | No | No | No |
-| **SAVEPOINT Dry-Run CSV/JSON Diff Import** | **Yes** | No | No | No | Via plugin |
+| **TOTP 2FA (Encrypted), Passkeys & OIDC SSO** | **Yes (Pure SVG QR + WebAuthn)** | No | OAuth only | No | Via plugins |
+| **Active Sessions Registry + Audited Impersonation** | **Yes** | No | No | No | Via plugin |
+| **Four-Eyes Approvals & 3-Way OCC Locking** | **Yes (`ETag` / `If-Match`)** | No | No | No | No |
+| **Headless REST API v1 + Scoped API Keys** | **Yes (`OpenAPI 3.1.0` + CIDR/RL)** | No | Partial | No | DRF / Ninja |
+| **HITL MCP Server for AI Agents** | **Yes (`/_mcp` + `flask deck mcp`)** | No | No | No | No |
+| **Keyset Cursor Pagination + PG `JSONB`/`ARRAY`** | **Yes (HMAC cursor + `__fts`)** | No | No | No | Partial |
+| **Calendar / Gallery / Tree + Kanban + BI SQL Charts** | **Yes (`EXPLAIN` + pinned SVG tiles)** | No | No | No | Partial |
+| **Column-Map Wizard CSV/XLSX + Diff Revert** | **Yes (Hash-chained audit + XLSX)** | CSV only | No | No | Via plugin |
 | **4-Level RBAC + Field Masking + Matrix UI** | **Yes** | Manual | Partial | Manual | Via Django |
 | **Strict Nonce CSP (`0 unsafe-inline`)** | **Yes** | No | No | No | No |
 
@@ -275,15 +323,15 @@ deck.add_webhook(
 
 ## Performance Architecture & Benchmarks
 
-Measured on Python 3.13 + SQLAlchemy 2.1 + SQLite via `uv run python benchmarks/bench_deck.py`:
+Measured on Python 3.13 + SQLAlchemy + SQLite via `uv run python benchmarks/bench_deck.py`:
 
 | Workload | Result | Engineering Mechanism |
 | :--- | :--- | :--- |
-| **Frontend Asset Payload** | **`23.59 KB` gzip** (`8.83 KB` CSS + `14.76 KB` JS) | Zero frameworks, zero icon fonts, zero chart or QR libraries; SHA-256 immutable caching (`?v=<hash>`). |
-| **Offset List View (50 / 2,000 rows + FK + 4 Tabs)** | **`4.16 ms` p50 · `4` SQL queries** | Auto `joinedload`/`selectinload` (zero N+1), single-pass `CASE` Quick Tab & Trash aggregation, `defer()` heavy blobs, single-query sidebar counts. |
-| **Keyset Cursor List (50 / 2,000 rows, `count=none`)** | **`4.40 ms` p50 · `4` SQL queries** | HMAC-signed opaque cursor (`LIMIT N+1`, no `OFFSET` table scan, zero `COUNT(*)` overhead). |
-| **Streaming CSV Export (2,000 rows)** | **`51.6 ms` (`38,768 rows/s`) · `2.8 MB` peak** | `session.scalars(stmt).yield_per(500)` + generator streaming (`O(1)` RAM) shared with Background CSV Jobs; CSV formula neutralization. |
-| **Dry-Run Savepoint Import (1,000 rows)** | **`153.1 ms` · `0` leaked mutations** | Chunked `IN (...)` batch preload (`batch_size=500`) + released `SAVEPOINT` validation + unconditional `finally: rollback()`. |
+| **Frontend Asset Payload** | **`15.63 KB` core gzip** (`9.22 KB` CSS + `6.41 KB` core JS) · **`18.12–20.89 KB`** per-route total | Modular vanilla ES6 (`deck.js` + route-scoped `deck-grid.js` / `deck-form.js` / `deck-ops.js`), zero icon fonts, zero chart or QR libraries; SHA-256 immutable caching (`?v=<hash>`). |
+| **Offset List View (50 / 2,000 rows + FK + 4 Tabs)** | **`6.36 ms` p50 · `4` SQL queries** | Auto `joinedload`/`selectinload` (zero N+1), single-pass `CASE` Quick Tab & Trash aggregation, `defer()` heavy blobs, single-query sidebar counts. |
+| **Keyset Cursor List (50 / 2,000 rows, `count=none`)** | **`6.16 ms` p50 · `4` SQL queries** | HMAC-signed opaque cursor (`LIMIT N+1`, no `OFFSET` table scan, zero `COUNT(*)` overhead). |
+| **Streaming CSV Export (2,000 rows)** | **`60.2 ms` (`33,238 rows/s`) · `2.8 MB` peak** | `session.scalars(stmt).yield_per(500)` + generator streaming (`O(1)` RAM) shared with Background CSV Jobs; CSV/XLSX formula neutralization. |
+| **Dry-Run Savepoint Import (1,000 rows)** | **`194.5 ms` · `0` leaked mutations** | Chunked `IN (...)` batch preload (`batch_size=500`) + released `SAVEPOINT` validation + unconditional `finally: rollback()`; auto-async job above `max_sync_import_rows`. |
 
 Every page footer displays live request telemetry (`SQLAlchemy 2.0 · 4 queries · 0.3 ms SQL · 8.1 ms`) measured via lightweight request-scoped SQLAlchemy event listeners.
 
@@ -296,19 +344,23 @@ Every page footer displays live request telemetry (`SQLAlchemy 2.0 · 4 queries 
 | **Unauthenticated Exposure** | **Fail-closed:** Refuses to mount when `app.debug is False` without an explicit `AuthProvider` or `SECRET_KEY` (`SecurityConfigurationError`). Demo role switcher is hard-blocked whenever `environment == "production"`. |
 | **XSS & Script Injection** | Strict per-request nonce CSP (`default-src 'none'; script-src 'self' 'nonce-…'; style-src 'self'; frame-ancestors 'none'`), zero `'unsafe-inline'`, zero `<style>`, zero inline `style=` or `on*=`, zero untrusted `innerHTML`, validated `#RRGGBB` `/_theme.css`, safe allowlisted `template_slots`. |
 | **File Upload & Media Attacks** | Pure-Python magic-byte MIME verification (SVG XSS blocked by default), PNG/JPEG/GIF/WebP header decompression-bomb guard (`max_image_pixels`), path-traversal-proof storage keys, RBAC + `scope_query` enforcement on `/_media`, `X-Content-Type-Options: nosniff`, `Content-Disposition: attachment`. |
-| **Account Takeover & SSO** | Built-in RFC 6238 TOTP 2FA with timestep replay prevention & PBKDF2 recovery codes, PKCE `S256` + `state`/`nonce` OIDC SSO with `allowed_domains`, sliding-window login rate limiter (`HTTP 429` + `Retry-After`), `session.clear()` fixation rotation, server-side idle/absolute timeouts, and audited superuser Impersonation (`impersonated_by`). |
-| **CSRF & Clickjacking** | Cryptographic per-session token (`hmac.compare_digest`) + `Sec-Fetch-Site` / `Origin` enforcement on every mutation (login, MFA, preferences, Kanban, restore, impersonate, async jobs) + `X-Frame-Options: DENY`. |
-| **Mass Assignment & IDOR** | Strict `allowed_form_fields()` allowlist rejecting tampered PK/readonly/hidden/sensitive fields (including on `?clone=`); inline parent-ownership verification; uniform `scope_query` across list, cursor, Kanban, media, history, drawer, search, export, and import. |
-| **SSRF & Data Exfiltration** | `WebhookSink` validates DNS & target IPs before dispatch, blocking loopback, RFC 1918 private, link-local, multicast, and cloud metadata endpoints (`169.254.169.254`, `127.0.0.1`, `::1`). Opt-in superuser `/_sql` console enforces multi-layer read-only SQL firewall + automatic `[REDACTED]` masking. |
+| **Account Takeover & SSO** | `SecretCipher`-encrypted TOTP 2FA secrets & recovery codes at rest (HKDF + AES/Fernet or HMAC fallback), WebAuthn Passkeys, PKCE `S256` + `state`/`nonce` OIDC SSO with `allowed_domains`, server-side Session Registry (`/_security/sessions`) with remote revocation, sliding-window login rate limiter (`HTTP 429` + `Retry-After`), `session.clear()` fixation rotation, and audited superuser Impersonation (`impersonated_by`). |
+| **CSRF, Replay & Clickjacking** | Cryptographic per-session token (`hmac.compare_digest`) + `Sec-Fetch-Site` / `Origin` enforcement on every cookie mutation (plus Origin-rebinding guard on `/_mcp`), optimistic concurrency control (`ETag` / `If-Match` `409 Conflict`), and `X-Frame-Options: DENY`. |
+| **Governance, Agents & APIs** | Declarative four-eyes `approval_required` Maker-Checker queue across UI, REST API v1 (`202 Accepted`), and AI-Agent MCP proposals; SHA-256 hashed Bearer API keys (`dk_live_...`) with scoped permissions, CIDR allowlists, and sliding-window `429 Retry-After` throttling. |
+| **Mass Assignment & Tampering** | Strict `allowed_form_fields()` allowlist rejecting tampered PK/computed/readonly/hidden/sensitive fields (including on `?clone=`); uniform `scope_query` everywhere; optional cryptographic SHA-256 hash-chained Audit Ledger (`hash_chain=True`, `verify_chain()`). |
+| **SSRF & Data Exfiltration** | `WebhookSink` validates DNS & pinned target IPs (incl. DNS-rebinding & DLQ tracking), blocking loopback, RFC 1918 private, link-local, and cloud metadata endpoints (`169.254.169.254`, `127.0.0.1`, `::1`). Opt-in superuser `/_sql` console enforces multi-layer read-only SQL firewall + automatic `[REDACTED]` masking. |
 
 ### Built-In CLI & In-App Security Auditor
 
 ```bash
 flask --app yourapp deck info
-flask --app yourapp deck audit
+flask --app yourapp deck audit --format text   # text | json | sarif (SARIF 2.1.0)
+flask --app yourapp deck scaffold             # Generate ModelView boilerplate from ORM metadata
+flask --app yourapp deck mcp                  # Start stdio JSON-RPC 2.0 MCP server
+flask --app yourapp deck jobs list            # Inspect / trigger @deck.scheduled_job tasks
 ```
 
-Both `flask deck audit` and the live `/admin/_diagnostics` panel inspect `SECRET_KEY` entropy, session cookie flags (`HttpOnly`, `SameSite`, `Secure`), `OpenAuthProvider` misuse, MFA/impersonation posture, sensitive column exposure, SQL console posture, and unindexed `searchable_columns`.
+Both `flask deck audit` and `/admin/_diagnostics` inspect `SECRET_KEY` entropy, session cookie flags (`HttpOnly`, `SameSite`, `Secure`), `OpenAuthProvider` misuse, MFA/encryption/impersonation posture, REST/MCP posture, SQL console posture, unindexed `searchable_columns`, and auto-detected `flask-lens` telemetry.
 
 ---
 

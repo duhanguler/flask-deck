@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import enum
+import hmac
 import os
 import secrets
-from datetime import datetime, timedelta, timezone
+import threading
+from datetime import datetime, timedelta, timezone, tzinfo
 from types import MappingProxyType
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 import sqlalchemy as sa
-from flask import Flask, redirect
+from flask import Flask, jsonify, redirect, request
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 from flask_deck.api_keys import build_api_key_record
@@ -55,6 +58,29 @@ from flask_deck.storage import FileFieldConfig, MemoryFileStorage, make_demo_png
 from flask_deck.widgets import CodeWidget, ColorWidget, SliderWidget, TagInputWidget
 
 DEMO_MEDIA_STORAGE = MemoryFileStorage()
+_DEMO_STATE_META = sa.MetaData()
+_DEMO_STATE_TABLE = sa.Table(
+    "_flask_deck_demo_state",
+    _DEMO_STATE_META,
+    sa.Column("key", sa.String(64), primary_key=True),
+    sa.Column("value", sa.String(255), nullable=False),
+)
+
+
+def _resolve_tz(tz_name: str) -> tzinfo:
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return timezone.utc
+
+
+def reset_demo_app(app: Flask, *, force: bool = True) -> dict[str, Any]:
+    """Reset the demo database and control-plane stores back to a fresh seeded state."""
+    reset_fn = app.extensions.get("flask_deck_demo_reset")
+    if not callable(reset_fn):
+        raise RuntimeError("This Flask application was not created with create_demo_app().")
+    result: dict[str, Any] = reset_fn(force=force)
+    return result
 
 
 class PlanTier(enum.Enum):
@@ -1614,6 +1640,8 @@ def create_demo_app(
     *,
     secret_key: str | None = None,
     seed_profile: Literal["standard", "showcase"] = "standard",
+    auto_daily_reset: bool = False,
+    reset_timezone: str = "Europe/Istanbul",
 ) -> Flask:
     """Create the complete Acme Cloud Ops SaaS demo Flask application."""
     app = Flask(__name__)
@@ -1634,6 +1662,7 @@ def create_demo_app(
             conn.exec_driver_sql("PRAGMA journal_mode=WAL")
             conn.exec_driver_sql("PRAGMA busy_timeout=5000")
     DemoBase.metadata.create_all(engine)
+    _DEMO_STATE_META.create_all(engine, checkfirst=True)
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
     audit_store = SQLAlchemyAuditStore(engine, hash_chain=True)
     _seed_demo_data(session_factory, audit_store, seed_profile=seed_profile)
@@ -1730,7 +1759,11 @@ def create_demo_app(
         brand=BrandConfig(
             accent="monochrome",
             footer_note="Acme Cloud Ops",
-            login_notice="SOC2 Type II Audited · Select a Demo RBAC Profile Below",
+            login_notice=(
+                f"SOC2 Type II Audited · Auto-Resets Daily at 00:00 ({reset_timezone})"
+                if auto_daily_reset
+                else "SOC2 Type II Audited · Select a Demo RBAC Profile Below"
+            ),
         ),
         demo_credentials=[
             ("admin@acme.dev", demo_pwd, "Superadmin · Full Access"),
@@ -2110,6 +2143,137 @@ def create_demo_app(
                 col_span=6,
             ),
         ]
+
+    tz = _resolve_tz(reset_timezone)
+    reset_lock = threading.RLock()
+    state: dict[str, str] = {"last_reset_day": datetime.now(tz).date().isoformat()}
+
+    def _read_db_reset_day() -> str | None:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.select(_DEMO_STATE_TABLE.c.value).where(_DEMO_STATE_TABLE.c.key == "last_reset_day")
+            ).scalar_one_or_none()
+        return str(row) if isinstance(row, str) else None
+
+    def _write_db_reset_day(day_str: str) -> None:
+        with engine.begin() as conn:
+            conn.execute(
+                _DEMO_STATE_TABLE.delete().where(_DEMO_STATE_TABLE.c.key == "last_reset_day")
+            )
+            conn.execute(
+                _DEMO_STATE_TABLE.insert().values(key="last_reset_day", value=day_str)
+            )
+
+    def _reset_demo_state(*, force: bool = True, current_day: str | None = None) -> dict[str, Any]:
+        target_day = current_day or datetime.now(tz).date().isoformat()
+        with reset_lock:
+            if not force:
+                existing_day = _read_db_reset_day()
+                if existing_day == target_day:
+                    state["last_reset_day"] = target_day
+                    return {
+                        "reset": False,
+                        "reset_day": target_day,
+                        "timezone": reset_timezone,
+                        "seed_profile": seed_profile,
+                    }
+
+            if engine.dialect.name == "postgresql":
+                with engine.begin() as conn:
+                    conn.execute(
+                        sa.text(
+                            "TRUNCATE TABLE demo_order_items, demo_orders, demo_tickets, "
+                            "demo_users, demo_products, demo_organizations, "
+                            "demo_infrastructure_nodes RESTART IDENTITY CASCADE"
+                        )
+                    )
+            else:
+                DemoBase.metadata.drop_all(engine)
+                DemoBase.metadata.create_all(engine)
+
+            stores: tuple[Any, ...] = (
+                deck.audit_store,
+                deck.approval_store,
+                deck.saved_query_store,
+                deck.saved_view_store,
+                deck.note_store,
+                deck.api_key_store,
+                deck.webhook_delivery_store,
+                deck.mfa_store,
+                deck.passkey_store,
+                deck.session_store,
+                deck._preview_store,
+                deck._rate_limiter,
+            )
+            with engine.begin() as conn:
+                for store in stores:
+                    tbl = getattr(store, "_table", None)
+                    if isinstance(tbl, sa.Table):
+                        conn.execute(tbl.delete())
+
+            if deck.approval_store is not None and hasattr(deck.approval_store, "_pending_cache"):
+                deck.approval_store._pending_cache = None
+            if deck.saved_view_store is not None and hasattr(deck.saved_view_store, "_model_cache"):
+                model_cache = deck.saved_view_store._model_cache
+                if isinstance(model_cache, dict):
+                    model_cache.clear()
+            deck._staged_imports.clear()
+
+            with DEMO_MEDIA_STORAGE._lock:
+                DEMO_MEDIA_STORAGE._entries.clear()
+            if isinstance(deck.job_storage, MemoryFileStorage):
+                with deck.job_storage._lock:
+                    deck.job_storage._entries.clear()
+            if isinstance(deck.job_backend, ThreadPoolJobBackend):
+                with deck.job_backend._lock:
+                    deck.job_backend._jobs.clear()
+
+            _seed_demo_data(session_factory, audit_store, seed_profile=seed_profile)
+            if seed_profile == "showcase":
+                _seed_showcase_control_plane(deck, session_factory, datetime.now(timezone.utc))
+
+            _write_db_reset_day(target_day)
+            state["last_reset_day"] = target_day
+            return {
+                "reset": True,
+                "reset_day": target_day,
+                "timezone": reset_timezone,
+                "seed_profile": seed_profile,
+                "reset_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    app.extensions["flask_deck_demo_reset"] = _reset_demo_state
+
+    startup_day = datetime.now(tz).date().isoformat()
+    existing_day = _read_db_reset_day()
+    if existing_day is None:
+        _write_db_reset_day(startup_day)
+        state["last_reset_day"] = startup_day
+    elif auto_daily_reset and existing_day != startup_day:
+        _reset_demo_state(force=True, current_day=startup_day)
+    else:
+        state["last_reset_day"] = existing_day
+
+    if auto_daily_reset:
+        def _check_daily_demo_reset() -> None:
+            path = request.path
+            if path.startswith("/admin/static/") or path == "/api/cron/reset-demo":
+                return None
+            today_str = datetime.now(tz).date().isoformat()
+            if today_str != state["last_reset_day"]:
+                _reset_demo_state(force=False, current_day=today_str)
+            return None
+
+        app.before_request_funcs.setdefault(None, []).insert(0, _check_daily_demo_reset)
+
+    @app.route("/api/cron/reset-demo", methods=["GET", "POST"])
+    def cron_reset_demo() -> Any:
+        cron_secret = os.environ.get("CRON_SECRET", "").strip()
+        auth_header = request.headers.get("Authorization", "")
+        if not cron_secret or not hmac.compare_digest(auth_header, f"Bearer {cron_secret}"):
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        result = _reset_demo_state(force=True)
+        return jsonify({"ok": True, **result}), 200
 
     @app.route("/")
     def root_redirect() -> Any:
