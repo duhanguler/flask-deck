@@ -114,19 +114,58 @@ def test_keyset_cursor_pagination_forward_backward_duplicate_keys_and_tampering(
     meta = introspect_model(TicketRecord)
     secret = b"cursor-hmac-secret-key-32-bytes!"
 
-    with SessionLocal() as sess:
-        seen_ids: list[int] = []
-        cursor: str | None = None
-        pages_fwd: list[list[int]] = []
-        for _ in range(10):
-            res = execute_list_query(
+    try:
+        with SessionLocal() as sess:
+            seen_ids: list[int] = []
+            cursor: str | None = None
+            pages_fwd: list[list[int]] = []
+            for _ in range(10):
+                res = execute_list_query(
+                    sess,
+                    meta,
+                    base_stmt=sa.select(TicketRecord),
+                    displayed_columns=("code", "bucket", "score"),
+                    searchable_columns=("code",),
+                    filterable_columns=frozenset({"bucket", "score", "meta_json"}),
+                    sortable_columns=frozenset({"id", "bucket", "score"}),
+                    quick_tabs=(),
+                    active_tab_key=None,
+                    search_term="",
+                    filter_params={},
+                    sort_by="bucket",
+                    sort_dir="asc",
+                    default_sort=None,
+                    page=1,
+                    page_size=4,
+                    max_page_size=50,
+                    pagination_mode="cursor",
+                    count_mode="none",
+                    after_cursor=cursor,
+                    cursor_secret=secret,
+                )
+                assert not res.total_known
+                page_ids = [r.id for r in res.items]
+                pages_fwd.append(page_ids)
+                seen_ids.extend(page_ids)
+                if not res.has_next:
+                    break
+                cursor = res.next_cursor
+                assert cursor is not None
+
+            # Disjoint union of all 15 records with ZERO skips and ZERO duplicates!
+            assert len(seen_ids) == 15
+            assert len(set(seen_ids)) == 15
+            assert len(pages_fwd) == 4  # 4 + 4 + 4 + 3
+
+            # Now walk backward from page 4 -> page 3 using before_cursor
+            prev_res = execute_list_query(
                 sess,
                 meta,
                 base_stmt=sa.select(TicketRecord),
                 displayed_columns=("code", "bucket", "score"),
                 searchable_columns=("code",),
-                filterable_columns=frozenset({"bucket", "score", "meta_json"}),
-                sortable_columns=frozenset({"id", "bucket", "score"}),
+                filterable_columns=frozenset({"bucket"}),
+                sortable_columns=frozenset({"id", "bucket"}),
                 quick_tabs=(),
                 active_tab_key=None,
                 search_term="",
@@ -138,73 +177,37 @@ def test_keyset_cursor_pagination_forward_backward_duplicate_keys_and_tampering(
                 page_size=4,
                 max_page_size=50,
                 pagination_mode="cursor",
-                count_mode="none",
-                after_cursor=cursor,
+                before_cursor=res.prev_cursor,
                 cursor_secret=secret,
             )
-            assert not res.total_known
-            page_ids = [r.id for r in res.items]
-            pages_fwd.append(page_ids)
-            seen_ids.extend(page_ids)
-            if not res.has_next:
-                break
-            cursor = res.next_cursor
-            assert cursor is not None
+            assert [r.id for r in prev_res.items] == pages_fwd[2]
 
-        # Disjoint union of all 15 records with ZERO skips and ZERO duplicates!
-        assert len(seen_ids) == 15
-        assert len(set(seen_ids)) == 15
-        assert len(pages_fwd) == 4  # 4 + 4 + 4 + 3
-
-        # Now walk backward from page 4 -> page 3 using before_cursor
-        prev_res = execute_list_query(
-            sess,
-            meta,
-            base_stmt=sa.select(TicketRecord),
-            displayed_columns=("code", "bucket", "score"),
-            searchable_columns=("code",),
-            filterable_columns=frozenset({"bucket"}),
-            sortable_columns=frozenset({"id", "bucket"}),
-            quick_tabs=(),
-            active_tab_key=None,
-            search_term="",
-            filter_params={},
-            sort_by="bucket",
-            sort_dir="asc",
-            default_sort=None,
-            page=1,
-            page_size=4,
-            max_page_size=50,
-            pagination_mode="cursor",
-            before_cursor=res.prev_cursor,
-            cursor_secret=secret,
-        )
-        assert [r.id for r in prev_res.items] == pages_fwd[2]
-
-        # Tampered HMAC cursor safely resets to first page (fail-closed)
-        tampered = execute_list_query(
-            sess,
-            meta,
-            base_stmt=sa.select(TicketRecord),
-            displayed_columns=("code",),
-            searchable_columns=(),
-            filterable_columns=frozenset(),
-            sortable_columns=frozenset({"id", "bucket"}),
-            quick_tabs=(),
-            active_tab_key=None,
-            search_term="",
-            filter_params={},
-            sort_by="bucket",
-            sort_dir="asc",
-            default_sort=None,
-            page=1,
-            page_size=4,
-            max_page_size=50,
-            pagination_mode="cursor",
-            after_cursor="eyJ2IjoxfQ.forgedsignature123456789",
-            cursor_secret=secret,
-        )
-        assert [r.id for r in tampered.items] == pages_fwd[0]
+            # Tampered HMAC cursor safely resets to first page (fail-closed)
+            tampered = execute_list_query(
+                sess,
+                meta,
+                base_stmt=sa.select(TicketRecord),
+                displayed_columns=("code",),
+                searchable_columns=(),
+                filterable_columns=frozenset(),
+                sortable_columns=frozenset({"id", "bucket"}),
+                quick_tabs=(),
+                active_tab_key=None,
+                search_term="",
+                filter_params={},
+                sort_by="bucket",
+                sort_dir="asc",
+                default_sort=None,
+                page=1,
+                page_size=4,
+                max_page_size=50,
+                pagination_mode="cursor",
+                after_cursor="eyJ2IjoxfQ.forgedsignature123456789",
+                cursor_secret=secret,
+            )
+            assert [r.id for r in tampered.items] == pages_fwd[0]
+    finally:
+        engine.dispose()
 
 
 def test_postgresql_array_jsonb_sql_compilation_and_sqlite_json_filters() -> None:
@@ -257,57 +260,60 @@ def test_postgresql_array_jsonb_sql_compilation_and_sqlite_json_filters() -> Non
     )
     QBase.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    with SessionLocal() as sess:
-        sess.add_all(
-            [
-                TicketRecord(code="J-1", bucket="a", score=10, meta_json={"region": "eu-west", "vip": True}),
-                TicketRecord(code="J-2", bucket="b", score=80, meta_json={"region": "us-east"}),
-                TicketRecord(code="J-3", bucket="c", score=95, meta_json={"other": 1}),
-            ]
-        )
-        sess.commit()
-        meta = introspect_model(TicketRecord)
-        res_has = execute_list_query(
-            sess,
-            meta,
-            base_stmt=sa.select(TicketRecord),
-            displayed_columns=("code",),
-            searchable_columns=(),
-            filterable_columns=frozenset({"meta_json", "score", "code"}),
-            sortable_columns=frozenset({"id"}),
-            quick_tabs=(),
-            active_tab_key=None,
-            search_term="",
-            filter_params={"meta_json__has_key": "region", "score__gt": "50"},
-            sort_by="id",
-            sort_dir="asc",
-            default_sort=None,
-            page=1,
-            page_size=10,
-            max_page_size=50,
-        )
-        assert [r.code for r in res_has.items] == ["J-2"]
+    try:
+        with SessionLocal() as sess:
+            sess.add_all(
+                [
+                    TicketRecord(code="J-1", bucket="a", score=10, meta_json={"region": "eu-west", "vip": True}),
+                    TicketRecord(code="J-2", bucket="b", score=80, meta_json={"region": "us-east"}),
+                    TicketRecord(code="J-3", bucket="c", score=95, meta_json={"other": 1}),
+                ]
+            )
+            sess.commit()
+            meta = introspect_model(TicketRecord)
+            res_has = execute_list_query(
+                sess,
+                meta,
+                base_stmt=sa.select(TicketRecord),
+                displayed_columns=("code",),
+                searchable_columns=(),
+                filterable_columns=frozenset({"meta_json", "score", "code"}),
+                sortable_columns=frozenset({"id"}),
+                quick_tabs=(),
+                active_tab_key=None,
+                search_term="",
+                filter_params={"meta_json__has_key": "region", "score__gt": "50"},
+                sort_by="id",
+                sort_dir="asc",
+                default_sort=None,
+                page=1,
+                page_size=10,
+                max_page_size=50,
+            )
+            assert [r.code for r in res_has.items] == ["J-2"]
 
-        res_path = execute_list_query(
-            sess,
-            meta,
-            base_stmt=sa.select(TicketRecord),
-            displayed_columns=("code",),
-            searchable_columns=(),
-            filterable_columns=frozenset({"meta_json"}),
-            sortable_columns=frozenset({"id"}),
-            quick_tabs=(),
-            active_tab_key=None,
-            search_term="",
-            filter_params={"meta_json__path": "region=eu-west"},
-            sort_by="id",
-            sort_dir="asc",
-            default_sort=None,
-            page=1,
-            page_size=10,
-            max_page_size=50,
-        )
-        assert [r.code for r in res_path.items] == ["J-1"]
+            res_path = execute_list_query(
+                sess,
+                meta,
+                base_stmt=sa.select(TicketRecord),
+                displayed_columns=("code",),
+                searchable_columns=(),
+                filterable_columns=frozenset({"meta_json"}),
+                sortable_columns=frozenset({"id"}),
+                quick_tabs=(),
+                active_tab_key=None,
+                search_term="",
+                filter_params={"meta_json__path": "region=eu-west"},
+                sort_by="id",
+                sort_dir="asc",
+                default_sort=None,
+                page=1,
+                page_size=10,
+                max_page_size=50,
+            )
+            assert [r.code for r in res_path.items] == ["J-1"]
+    finally:
+        engine.dispose()
 
 
 def test_soft_delete_history_diff_wizard_cascading_fk_multibind_and_ssrf_webhooks() -> None:
@@ -377,96 +383,99 @@ def test_soft_delete_history_diff_wizard_cascading_fk_multibind_and_ssrf_webhook
         allow_insecure_open=True,
         auto_audit=True,
     )
-    deck.register(Dept, Employee, TicketView, MetricView)
+    try:
+        deck.register(Dept, Employee, TicketView, MetricView)
 
-    captured_events: list[DeckEvent] = []
+        captured_events: list[DeckEvent] = []
 
-    @deck.on("*")
-    def _cap(ev: DeckEvent) -> None:
-        captured_events.append(ev)
+        @deck.on("*")
+        def _cap(ev: DeckEvent) -> None:
+            captured_events.append(ev)
 
-    client = app.test_client()
-    tok = _csrf(client)
+        client = app.test_client()
+        tok = _csrf(client)
 
-    # 1. Multi-bind secondary engine list works seamlessly
-    m_resp = client.get("/admin/metric-events/")
-    assert m_resp.status_code == 200
-    assert b"cpu_spike" in m_resp.data
+        # 1. Multi-bind secondary engine list works seamlessly
+        m_resp = client.get("/admin/metric-events/")
+        assert m_resp.status_code == 200
+        assert b"cpu_spike" in m_resp.data
 
-    # 2. Cascading FK endpoint scopes employees by dept_id
-    fk_resp = client.get("/admin/_api/fk/employees?dep_col=dept_id&dep_val=1")
-    assert fk_resp.status_code == 200
-    items = fk_resp.get_json()["items"]
-    assert len(items) == 1 and items[0]["label"] == "Ada Eng"
+        # 2. Cascading FK endpoint scopes employees by dept_id
+        fk_resp = client.get("/admin/_api/fk/employees?dep_col=dept_id&dep_val=1")
+        assert fk_resp.status_code == 200
+        items = fk_resp.get_json()["items"]
+        assert len(items) == 1 and items[0]["label"] == "Ada Eng"
 
-    # 3. Wizard form HTML + conditional data-show-when + pydantic_validator rejection
-    new_page = client.get("/admin/ticket-records/new")
-    assert b"data-deck-wizard" in new_page.data
-    assert b"data-show-when=" in new_page.data
+        # 3. Wizard form HTML + conditional data-show-when + pydantic_validator rejection
+        new_page = client.get("/admin/ticket-records/new")
+        assert b"data-deck-wizard" in new_page.data
+        assert b"data-show-when=" in new_page.data
 
-    bad_val = client.post(
-        "/admin/ticket-records/new",
-        data={CSRF_FORM_FIELD: tok, "code": "SD-2", "bucket": "open", "score": "999"},
-    )
-    assert bad_val.status_code == 200
-    assert b"Score must be &lt;= 100" in bad_val.data
+        bad_val = client.post(
+            "/admin/ticket-records/new",
+            data={CSRF_FORM_FIELD: tok, "code": "SD-2", "bucket": "open", "score": "999"},
+        )
+        assert bad_val.status_code == 200
+        assert b"Score must be &lt;= 100" in bad_val.data
 
-    # 4. Edit record -> generates revision -> inspect Side-by-Side Diff (/history)
-    edit_resp = client.post(
-        "/admin/ticket-records/1/edit",
-        data={CSRF_FORM_FIELD: tok, "code": "SD-1", "bucket": "closed", "score": "85"},
-        follow_redirects=False,
-    )
-    assert edit_resp.status_code == 302
-    hist_resp = client.get("/admin/ticket-records/1/history")
-    assert hist_resp.status_code == 200
-    assert b"Revision Diff" in hist_resp.data
-    assert b"closed" in hist_resp.data
+        # 4. Edit record -> generates revision -> inspect Side-by-Side Diff (/history)
+        edit_resp = client.post(
+            "/admin/ticket-records/1/edit",
+            data={CSRF_FORM_FIELD: tok, "code": "SD-1", "bucket": "closed", "score": "85"},
+            follow_redirects=False,
+        )
+        assert edit_resp.status_code == 302
+        hist_resp = client.get("/admin/ticket-records/1/history")
+        assert hist_resp.status_code == 200
+        assert b"Revision Diff" in hist_resp.data
+        assert b"closed" in hist_resp.data
 
-    # 5. Soft-delete moves record to Trash -> hidden in normal list -> visible in ?trashed=1 -> Restore brings it back!
-    del_resp = client.post("/admin/ticket-records/1/delete", data={CSRF_FORM_FIELD: tok})
-    assert del_resp.status_code == 302
-    after_del = client.get("/admin/ticket-records/").data
-    assert b"Moved Ticket Record (SD-1) to Trash." in after_del
-    assert b"No ticket records match" in after_del
-    assert b"SD-1" in client.get("/admin/ticket-records/?trashed=1").data
+        # 5. Soft-delete moves record to Trash -> hidden in normal list -> visible in ?trashed=1 -> Restore brings it back!
+        del_resp = client.post("/admin/ticket-records/1/delete", data={CSRF_FORM_FIELD: tok})
+        assert del_resp.status_code == 302
+        after_del = client.get("/admin/ticket-records/").data
+        assert b"Moved Ticket Record (SD-1) to Trash." in after_del
+        assert b"No ticket records match" in after_del
+        assert b"SD-1" in client.get("/admin/ticket-records/?trashed=1").data
 
-    rest_resp = client.post("/admin/ticket-records/1/restore", data={CSRF_FORM_FIELD: tok})
-    assert rest_resp.status_code == 302
-    assert b"SD-1" in client.get("/admin/ticket-records/").data
-    assert any(ev.name == "record.restored" for ev in captured_events)
+        rest_resp = client.post("/admin/ticket-records/1/restore", data={CSRF_FORM_FIELD: tok})
+        assert rest_resp.status_code == 302
+        assert b"SD-1" in client.get("/admin/ticket-records/").data
+        assert any(ev.name == "record.restored" for ev in captured_events)
 
-    # 6. Force delete permanently removes record
-    force_resp = client.post(
-        "/admin/ticket-records/1/delete",
-        data={CSRF_FORM_FIELD: tok, "force": "1"},
-    )
-    assert force_resp.status_code == 302
-    assert b"No ticket records match" in client.get("/admin/ticket-records/?trashed=1").data
+        # 6. Force delete permanently removes record
+        force_resp = client.post(
+            "/admin/ticket-records/1/delete",
+            data={CSRF_FORM_FIELD: tok, "force": "1"},
+        )
+        assert force_resp.status_code == 302
+        assert b"No ticket records match" in client.get("/admin/ticket-records/?trashed=1").data
 
-    # 7. SSRF Webhook Security Firewall + HMAC Signature Verification
-    for blocked_url in (
-        "http://169.254.169.254/latest/meta-data/",
-        "https://127.0.0.1/hook",
-        "https://10.0.0.5/internal",
-        "https://localhost/hook",
-        "http://example.com/insecure",
-    ):
-        safe, _reason = is_ssrf_safe_url(blocked_url)
-        assert not safe, f"Expected SSRF guard to block {blocked_url}"
+        # 7. SSRF Webhook Security Firewall + HMAC Signature Verification
+        for blocked_url in (
+            "http://169.254.169.254/latest/meta-data/",
+            "https://127.0.0.1/hook",
+            "https://10.0.0.5/internal",
+            "https://localhost/hook",
+            "http://example.com/insecure",
+        ):
+            safe, _reason = is_ssrf_safe_url(blocked_url)
+            assert not safe, f"Expected SSRF guard to block {blocked_url}"
 
-    delivered: list[tuple[str, bytes, dict[str, str]]] = []
-    sink = WebhookSink(
-        "https://93.184.216.34/webhook",
-        secret="webhook-signing-secret-32-bytes!",
-        events=("record.created",),
-        transport=lambda u, b, h, _t: (delivered.append((u, b, h)) or 200),
-    )
-    ev = DeckEvent(name="record.created", model_slug="orders", record_pk="42")
-    sink(ev)
-    assert len(delivered) == 1
-    url_sent, body_sent, hdrs = delivered[0]
-    assert url_sent == "https://93.184.216.34/webhook"
-    assert hdrs["X-Deck-Signature"] == sign_webhook_payload(body_sent, "webhook-signing-secret-32-bytes!")
-    assert hdrs["X-Deck-Event"] == "record.created"
-    _ = (RBACAuthProvider, Role, parse_qs, urlsplit, pytest)
+        delivered: list[tuple[str, bytes, dict[str, str]]] = []
+        sink = WebhookSink(
+            "https://93.184.216.34/webhook",
+            secret="webhook-signing-secret-32-bytes!",
+            events=("record.created",),
+            transport=lambda u, b, h, _t: (delivered.append((u, b, h)) or 200),
+        )
+        ev = DeckEvent(name="record.created", model_slug="orders", record_pk="42")
+        sink(ev)
+        assert len(delivered) == 1
+        url_sent, body_sent, hdrs = delivered[0]
+        assert url_sent == "https://93.184.216.34/webhook"
+        assert hdrs["X-Deck-Signature"] == sign_webhook_payload(body_sent, "webhook-signing-secret-32-bytes!")
+        assert hdrs["X-Deck-Event"] == "record.created"
+        _ = (RBACAuthProvider, Role, parse_qs, urlsplit, pytest)
+    finally:
+        deck.close()

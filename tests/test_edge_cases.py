@@ -91,5 +91,8 @@ def test_date_presets_multi_enum_null_filters_and_pure_example(sa_bundle: tuple[
     from examples.pure_sqlalchemy_app import create_app as create_pure_app
 
     pure = create_pure_app()
-    pc = pure.test_client()
-    assert pc.get("/admin/login").status_code == 200
+    try:
+        pc = pure.test_client()
+        assert pc.get("/admin/login").status_code == 200
+    finally:
+        pure.extensions["flask_deck"]["deck"].close()

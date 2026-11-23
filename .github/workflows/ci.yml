@@ -21,6 +21,6 @@ jobs:
       - run: uv sync --extra dev
       - run: uv run ruff check src tests examples benchmarks
       - run: uv run mypy src
-      - run: uv run pytest --cov=flask_deck --cov-report=term-missing
+      - run: uv run pytest -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning --cov=flask_deck --cov-report=term-missing
       - run: uv run python benchmarks/bench_deck.py
       - run: uv build

@@ -2,6 +2,29 @@
 
 All notable changes to `flask-deck` are documented in this file.
 
+## [0.4.0] - 2026-11-23
+
+### Added
+- **Security Hardening & Multi-Worker Scale (`v0.4.0`):**
+  - Encrypted TOTP MFA secrets & recovery codes at rest via `SecretCipher` (`flask-deck[crypto]` / HKDF + HMAC-SHA256 fallback).
+  - Multi-worker SQLAlchemy stores (`SQLAlchemyMFAStore`, `SQLAlchemySessionStore`, `SQLAlchemyPasskeyStore`, `SQLAlchemyApprovalStore`, `SQLAlchemySavedViewStore`, `SQLAlchemyRecordNoteStore`, `SQLAlchemyAPIKeyStore`, `SQLAlchemySavedQueryStore`, `SQLAlchemyPreviewStore`, `SQLAlchemyRateLimitStore`, `SQLAlchemyJobBackend`, `SQLAlchemyWebhookDeliveryStore`) + `RedisPreviewStore` / `RedisRateLimitStore` (`flask-deck[redis]`).
+  - Passkeys / WebAuthn (`flask-deck[webauthn]`), Server-Side Active Sessions Registry & Remote Revocation (`/_security/sessions`), and Hash-Chained Tamper-Evident Audit Ledger (`hash_chain=True`, `verify_chain()`).
+- **Governance & Collaborative Operations:**
+  - Declarative **Four-Eyes Approval Workflows (`approval_required`)** across creates, edits, deletes, bulk actions, REST API mutations (`202 Accepted`), and AI-agent MCP proposals (`/_approvals`).
+  - Field-level **Optimistic Concurrency Control (OCC)** with 3-way conflict resolution UI & REST `ETag` / `If-Match` `409 Conflict` enforcement.
+  - Server-backed Personal / Team / Role-Default **Saved Views** and Markdown-subset **Operational Record Notes**.
+- **Headless REST API v1 & HITL MCP Server:**
+  - Scoped SHA-256 **API Keys** (`dk_live_...`) with IP CIDR allowlists & sliding-window `429 Retry-After` rate limiting (`/_security/api-keys`).
+  - OpenAPI 3.1.0 **REST API v1 (`/_api/v1/...`)** with cursor/offset pagination, RBAC field scoping/masking, partial PATCH safety, and Maker-Checker approvals.
+  - JSON-RPC 2.0 **Model Context Protocol (MCP) Server** (`POST /_mcp` & `flask deck mcp` stdio) with savepoint-validated HITL proposals and origin-rebinding protection.
+- **Workspace 2.0 & SQL Workbench 2.0 / Self-Service BI:**
+  - Multi-viewswitcher: **Calendar** (`calendar_date_field`), **Gallery** (`gallery_image_field`), and cycle-safe **Tree Hierarchy** (`tree_parent_field`).
+  - Universal inline table editing across scalars (`string`, `integer`, `float`, `decimal`, `date`, `boolean`, `enum`), `row_action=True`, clickable FK chips, and **1-to-N Related Sub-Tables** on record detail.
+  - Whole-dataset formatter-aware **Summary Aggregates (`aggregate_scope="all"`)**, dotted MANYTOONE filters (`org.tier`), `__in` / `__not_in` / dialect-aware `__fts` search, multi-bind SQL Schema Browser, `EXPLAIN` plan mode, pure-SVG Bar/Line charts, Saved BI Queries pinned to `/`, and SQL `GROUP BY` time-range trends (`7d/14d/30d/90d`).
+- **Import/Export 2.0, ORM Introspection 2.0 & Developer CLI:**
+  - Interactive **Column Mapping Wizard**, downloadable formula-safe **Failed Rows CSV**, async background import commits (`max_sync_import_rows`), and optional lazy **XLSX** import/export (`flask-deck[excel]`).
+  - ORM **Introspection 2.0** (`TypeDecorator` unwrapping, `column_property`, `hybrid_property`, Joined-Table Inheritance), strict-CSP **`widgets.py`** (`CodeWidget`, `MarkdownWidget`, `ColorWidget`, `TagInputWidget`, `SliderWidget`, `JSONSchemaWidget`), interactive **SVG ERD** clickable links + zoom controls, **`flask deck scaffold`**, **`flask deck audit --format json|sarif`** (SARIF 2.1.0), and zero-dependency **`flask-lens`** diagnostics auto-detection.
+
 ## [0.3.0] - 2026-11-21
 
 ### Added

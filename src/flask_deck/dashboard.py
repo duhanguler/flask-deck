@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal
 
 import sqlalchemy as sa
@@ -274,8 +274,12 @@ class DashboardContext:
             return []
         if not self._deck.auth.has_permission(self.user, "audit:view"):
             return []
-        entries, _ = self._deck.audit_store.list_entries(limit=limit)
-        return entries
+        excluded = self._deck._excluded_audit_models(self.user)
+        entries, _ = self._deck.audit_store.list_entries(
+            limit=limit,
+            excluded_models=excluded,
+        )
+        return [self._deck._sanitize_audit_entry(e, self.user) for e in entries]
 
     def last_n_days(self, n: int = 14) -> list[str]:
         today = datetime.now(timezone.utc).date()
@@ -295,16 +299,13 @@ def build_default_dashboard(deck: Deck, ctx: DashboardContext) -> list[Widget]:
         and deck.auth.has_permission(ctx.user, f"{v.meta.slug}:view", model_slug=v.meta.slug)
     ]
 
+    days = max(2, min(int(ctx.range_days), 90))
     model_counts: list[tuple[str, int]] = []
-    trend_labels = ctx.last_n_days(14)
+    trend_labels = ctx.last_n_days(days)
     trend_series: list[dict[str, Any]] = []
     today = datetime.now(timezone.utc).date()
-    window_start = datetime(
-        (today - timedelta(days=13)).year,
-        (today - timedelta(days=13)).month,
-        (today - timedelta(days=13)).day,
-        tzinfo=timezone.utc,
-    )
+    start_date = today - timedelta(days=days - 1)
+    window_start = datetime(start_date.year, start_date.month, start_date.day)
 
     for view in views[:4]:
         view_sess = deck.get_session(view.bind_key)
@@ -316,7 +317,7 @@ def build_default_dashboard(deck: Deck, ctx: DashboardContext) -> list[Widget]:
         total = int(view_sess.execute(count_stmt).scalar_one() or 0)
         model_counts.append((view.plural_label, total))
 
-        # Check if model has a creation timestamp to build real 7d/14d series.
+        # Check if model has a creation timestamp to build SQL GROUP BY trends across range_days.
         ts_field = next(
             (
                 f
@@ -331,29 +332,42 @@ def build_default_dashboard(deck: Deck, ctx: DashboardContext) -> list[Widget]:
         trend: Literal["up", "down", "flat"] = "flat"
         if ts_field is not None:
             ts_col = getattr(view.model, ts_field.name)
-            ts_stmt = (
-                sa.select(ts_col)
+            date_bucket = sa.func.date(ts_col)
+            grp_stmt = (
+                sa.select(date_bucket.label("d_key"), sa.func.count().label("cnt"))
                 .where(ts_col >= window_start)
                 .where(*base._where_criteria)
+                .group_by(date_bucket)
+                .order_by(date_bucket)
             )
-            dates = list(view_sess.scalars(ts_stmt).all())
-            buckets = [0] * 14
-            for dt in dates:
-                if isinstance(dt, datetime):
-                    dt_utc = dt.astimezone(timezone.utc) if dt.tzinfo is not None else dt
-                    d = dt_utc.date()
-                    diff_days = (d - (today - timedelta(days=13))).days
-                    if 0 <= diff_days < 14:
-                        buckets[diff_days] += 1
+            buckets = [0] * days
+            for raw_d, cnt in view_sess.execute(grp_stmt).all():
+                if raw_d is None:
+                    continue
+                d_obj: date | None = None
+                if isinstance(raw_d, date) and not isinstance(raw_d, datetime):
+                    d_obj = raw_d
+                elif isinstance(raw_d, datetime):
+                    d_obj = raw_d.date()
+                else:
+                    try:
+                        d_obj = date.fromisoformat(str(raw_d)[:10])
+                    except ValueError:
+                        d_obj = None
+                if d_obj is not None:
+                    diff_days = (d_obj - start_date).days
+                    if 0 <= diff_days < days:
+                        buckets[diff_days] += int(cnt or 0)
             spark = [float(b) for b in buckets[-7:]]
-            prev_7 = sum(buckets[:7])
-            curr_7 = sum(buckets[7:])
-            if prev_7 > 0:
-                pct = ((curr_7 - prev_7) / prev_7) * 100.0
-                delta = f"{pct:+.1f}% 7d"
+            half = max(1, days // 2)
+            prev_half = sum(buckets[:half])
+            curr_half = sum(buckets[-half:])
+            if prev_half > 0:
+                pct = ((curr_half - prev_half) / prev_half) * 100.0
+                delta = f"{pct:+.1f}% {half}d"
                 trend = "up" if pct > 0 else ("down" if pct < 0 else "flat")
-            elif curr_7 > 0:
-                delta = f"+{curr_7} new (7d)"
+            elif curr_half > 0:
+                delta = f"+{curr_half} new ({half}d)"
                 trend = "up"
             if len(trend_series) < 2:
                 trend_series.append(
@@ -380,7 +394,7 @@ def build_default_dashboard(deck: Deck, ctx: DashboardContext) -> list[Widget]:
     if trend_series:
         widgets.append(
             ChartWidget(
-                title="14-Day Record Activity",
+                title=f"{days}-Day Record Activity",
                 subtitle="New records indexed per day across primary tables",
                 chart_type="area",
                 labels=trend_labels,
@@ -401,6 +415,52 @@ def build_default_dashboard(deck: Deck, ctx: DashboardContext) -> list[Widget]:
                 col_span=4 if trend_series else 6,
             )
         )
+
+    if (
+        deck.saved_query_store is not None
+        and deck.config.enable_sql_console
+        and deck.auth.has_permission(ctx.user, "sql:query")
+        and deck.adapter is not None
+    ):
+        from flask_deck.sql_console import execute_readonly_sql, extract_sql_chart_data
+
+        pinned_queries = deck.saved_query_store.list_queries(pinned_only=True, limit=6)
+        engines = deck.adapter.get_engines()
+        for sq in pinned_queries:
+            target_eng = engines.get(sq.bind_key) if sq.bind_key else deck.adapter.get_engine()
+            if target_eng is None:
+                continue
+            q_res = execute_readonly_sql(
+                target_eng,
+                sq.sql,
+                max_rows=min(25, deck.config.sql_console_max_rows),
+                extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+            )
+            if q_res.error:
+                continue
+            chart_pair = extract_sql_chart_data(q_res) if sq.chart_type in {"bar", "line"} else None
+            if chart_pair is not None:
+                c_labels, c_series = chart_pair
+                widgets.append(
+                    ChartWidget(
+                        title=sq.name,
+                        subtitle=f"Pinned BI ({sq.bind_key or 'default'})",
+                        chart_type="area" if sq.chart_type == "line" else "bar",
+                        labels=c_labels,
+                        series=c_series,
+                        col_span=6,
+                    )
+                )
+            else:
+                widgets.append(
+                    TableWidget(
+                        title=sq.name,
+                        subtitle=f"Pinned SQL ({sq.bind_key or 'default'})",
+                        headers=list(q_res.columns),
+                        rows=[list(r) for r in q_res.rows[:10]],
+                        col_span=6,
+                    )
+                )
 
     if deck.auth.has_permission(ctx.user, "audit:view"):
         entries = ctx.recent_audit_entries(limit=8)

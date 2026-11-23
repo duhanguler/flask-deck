@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import os
@@ -8,6 +9,7 @@ import struct
 import tempfile
 import threading
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +67,11 @@ class StoredFile:
 
 
 @runtime_checkable
+class _ReadableBytes(Protocol):
+    def read(self, size: int = -1, /) -> bytes: ...
+
+
+@runtime_checkable
 class StorageBackend(Protocol):
     """Storage-agnostic contract implemented by Local, S3/R2, and Memory backends."""
 
@@ -96,6 +103,8 @@ class FileFieldConfig:
     prefix: str = "uploads"
     delete_orphan: bool = False
     allow_svg: bool = False
+    use_presigned_redirect: bool = False
+    presign_ttl: int = 300
 
     def resolved_allowed_mimes(self) -> frozenset[str]:
         base = self.allowed_mimes or (
@@ -436,6 +445,57 @@ class LocalFileStorage:
         fh.seek(0)
         return fh, detect_mime_from_bytes(head, target.name)
 
+    def open_stream(
+        self, key: str, *, chunk_size: int = 65536
+    ) -> tuple[Iterator[bytes], str | None]:
+        target = self._resolve_path(key)
+        if not target.is_file():
+            raise FileNotFoundError(key)
+        with target.open("rb") as probe:
+            head = probe.read(4096)
+        mime = detect_mime_from_bytes(head, target.name)
+        size = max(1024, int(chunk_size))
+
+        def _gen() -> Iterator[bytes]:
+            with target.open("rb") as fh:
+                while True:
+                    buf = fh.read(size)
+                    if not buf:
+                        break
+                    yield buf
+
+        return _gen(), mime
+
+    def save_stream(
+        self, stream: _ReadableBytes, *, key: str, content_type: str
+    ) -> StoredFile:
+        target = self._resolve_path(key)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        hasher = hashlib.sha256()
+        total = 0
+        fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".dk_tmp_")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                    total += len(chunk)
+                    fh.write(chunk)
+            os.replace(tmp_name, target)
+        except Exception:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+            raise
+        return StoredFile(
+            key=_validate_opaque_key(key),
+            filename=target.name,
+            content_type=content_type,
+            size_bytes=total,
+            sha256=hasher.hexdigest(),
+        )
+
     def delete(self, key: str) -> None:
         try:
             target = self._resolve_path(key)
@@ -485,6 +545,23 @@ class MemoryFileStorage:
             raise FileNotFoundError(key)
         payload, ctype = entry
         return io.BytesIO(payload), ctype
+
+    def open_stream(
+        self, key: str, *, chunk_size: int = 65536
+    ) -> tuple[Iterator[bytes], str | None]:
+        clean = _validate_opaque_key(key)
+        with self._lock:
+            entry = self._entries.get(clean)
+        if entry is None:
+            raise FileNotFoundError(key)
+        payload, ctype = entry
+        size = max(1024, int(chunk_size))
+
+        def _gen() -> Iterator[bytes]:
+            for pos in range(0, len(payload), size):
+                yield payload[pos : pos + size]
+
+        return _gen(), ctype
 
     def delete(self, key: str) -> None:
         try:
@@ -571,7 +648,7 @@ class S3StorageBackend:
             sha256=digest,
         )
 
-    def open(self, key: str) -> tuple[BinaryIO, str | None]:
+    def _get_s3_object(self, key: str) -> tuple[Any, str | None]:
         full = self._full_key(key)
         try:
             resp = self._get_client().get_object(Bucket=self._bucket, Key=full)
@@ -585,14 +662,39 @@ class S3StorageBackend:
                 if code in {"NoSuchKey", "404", "NotFound"} or status == 404:
                     raise FileNotFoundError(key) from exc
             raise
-        body = resp["Body"]
+        ctype_raw = resp.get("ContentType")
+        return resp["Body"], str(ctype_raw) if isinstance(ctype_raw, str) else None
+
+    def open(self, key: str) -> tuple[BinaryIO, str | None]:
+        body, ctype = self._get_s3_object(key)
         try:
             raw: bytes = body.read()
         finally:
             if hasattr(body, "close"):
                 body.close()
-        ctype = resp.get("ContentType")
-        return io.BytesIO(raw), str(ctype) if isinstance(ctype, str) else None
+        return io.BytesIO(raw), ctype
+
+    def open_stream(
+        self, key: str, *, chunk_size: int = 65536
+    ) -> tuple[Iterator[bytes], str | None]:
+        body, ctype = self._get_s3_object(key)
+        size = max(1024, int(chunk_size))
+
+        def _gen() -> Iterator[bytes]:
+            try:
+                if hasattr(body, "iter_chunks"):
+                    yield from body.iter_chunks(chunk_size=size)
+                else:
+                    while True:
+                        chunk = body.read(size)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                if hasattr(body, "close"):
+                    body.close()
+
+        return _gen(), ctype
 
     def delete(self, key: str) -> None:
         try:
@@ -624,6 +726,58 @@ class S3StorageBackend:
             ExpiresIn=ttl,
         )
         return str(url) if url else None
+
+
+class _ClosingChunkIterator:
+    """Wrap an already-open BinaryIO in a chunk iterator that always closes on exhaustion/close/GC."""
+
+    __slots__ = ("_chunk_size", "_fh")
+
+    def __init__(self, fh: BinaryIO, chunk_size: int) -> None:
+        self._fh = fh
+        self._chunk_size = max(1024, int(chunk_size))
+
+    def __iter__(self) -> Iterator[bytes]:
+        return self
+
+    def __next__(self) -> bytes:
+        if getattr(self._fh, "closed", False):
+            raise StopIteration
+        buf = self._fh.read(self._chunk_size)
+        if not buf:
+            self.close()
+            raise StopIteration
+        return buf
+
+    def close(self) -> None:
+        if not getattr(self._fh, "closed", False):
+            self._fh.close()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
+
+
+def stream_storage_object(
+    storage: StorageBackend, key: str, *, chunk_size: int = 65536
+) -> tuple[Iterator[bytes], str | None]:
+    """Stream object bytes in bounded chunks while guaranteeing handle closure."""
+    stream_fn = getattr(storage, "open_stream", None)
+    if callable(stream_fn):
+        return stream_fn(key, chunk_size=chunk_size)  # type: ignore[no-any-return]
+    fh, detected = storage.open(key)
+    return _ClosingChunkIterator(fh, chunk_size), detected
+
+
+def save_stream_to_storage(
+    storage: StorageBackend, stream: _ReadableBytes, *, key: str, content_type: str
+) -> StoredFile:
+    """Persist a readable binary stream without buffering LocalFileStorage in RAM."""
+    save_fn = getattr(storage, "save_stream", None)
+    if callable(save_fn):
+        return save_fn(stream, key=key, content_type=content_type)  # type: ignore[no-any-return]
+    data = stream.read()
+    return storage.save(data, key=key, content_type=content_type)
 
 
 def make_demo_png(

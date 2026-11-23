@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import csv
+import enum
 import io
 import json
 import secrets
 import threading
 import time
+import uuid
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from datetime import date, datetime
+from datetime import time as dt_time
+from decimal import Decimal
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import sqlalchemy as sa
+from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -21,7 +27,7 @@ from flask_deck.auth import AuthProvider, DeckUser
 from flask_deck.exceptions import ImportLimitError
 from flask_deck.model_view import ModelView, coerce_form_value
 from flask_deck.query import soft_delete_predicate
-from flask_deck.security import check_json_depth
+from flask_deck.security import check_json_depth, sanitize_csv_cell
 
 RowStatus = Literal["create", "update", "unchanged", "error"]
 
@@ -37,6 +43,7 @@ class RowDiff:
     errors: tuple[str, ...] = ()
     coerced_data: dict[str, Any] = field(default_factory=dict)
     existing_pk: Any = None
+    raw_row: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +80,140 @@ class _CachedPreview:
     created_at: float
 
 
+@runtime_checkable
+class PreviewStore(Protocol):
+    """Multi-worker preview token store contract for dry-run import confirmation."""
+
+    def put(self, report: DryRunReport, *, user_id: str, session_token: str) -> None: ...
+
+    def peek(
+        self,
+        token: str,
+        *,
+        user_id: str,
+        session_token: str,
+        model_slug: str,
+    ) -> DryRunReport | None: ...
+
+    def consume(
+        self,
+        token: str,
+        *,
+        user_id: str,
+        session_token: str,
+        model_slug: str,
+    ) -> DryRunReport | None: ...
+
+
+def _encode_preview_val(val: Any) -> Any:
+    if isinstance(val, enum.Enum):
+        return _encode_preview_val(val.value)
+    if isinstance(val, Decimal):
+        return {"__dk_t__": "decimal", "v": str(val)}
+    if isinstance(val, datetime):
+        return {"__dk_t__": "datetime", "v": val.isoformat()}
+    if isinstance(val, date):
+        return {"__dk_t__": "date", "v": val.isoformat()}
+    if isinstance(val, dt_time):
+        return {"__dk_t__": "time", "v": val.isoformat()}
+    if isinstance(val, uuid.UUID):
+        return {"__dk_t__": "uuid", "v": str(val)}
+    if isinstance(val, tuple):
+        return {"__dk_t__": "tuple", "v": [_encode_preview_val(x) for x in val]}
+    if isinstance(val, list):
+        return [_encode_preview_val(x) for x in val]
+    if isinstance(val, dict):
+        return {str(k): _encode_preview_val(v) for k, v in val.items()}
+    return val
+
+
+def _decode_preview_val(val: Any) -> Any:
+    if isinstance(val, list):
+        return [_decode_preview_val(x) for x in val]
+    if isinstance(val, dict):
+        tag = val.get("__dk_t__")
+        if tag == "decimal":
+            return Decimal(str(val["v"]))
+        if tag == "datetime":
+            return datetime.fromisoformat(str(val["v"]))
+        if tag == "date":
+            return date.fromisoformat(str(val["v"]))
+        if tag == "time":
+            return dt_time.fromisoformat(str(val["v"]))
+        if tag == "uuid":
+            return uuid.UUID(str(val["v"]))
+        if tag == "tuple":
+            return tuple(_decode_preview_val(x) for x in val["v"])
+        return {k: _decode_preview_val(v) for k, v in val.items()}
+    return val
+
+
+def serialize_dry_run_report(report: DryRunReport) -> str:
+    payload = {
+        "token": report.token,
+        "model_slug": report.model_slug,
+        "filename": report.filename,
+        "format": report.format,
+        "upsert_key": report.upsert_key,
+        "headers": list(report.headers),
+        "mapped_columns": dict(report.mapped_columns),
+        "creates": report.creates,
+        "updates": report.updates,
+        "unchanged": report.unchanged,
+        "errors": report.errors,
+        "rows": [
+            {
+                "row_number": r.row_number,
+                "status": r.status,
+                "key_display": r.key_display,
+                "changes": {k: [_encode_preview_val(v[0]), _encode_preview_val(v[1])] for k, v in r.changes.items()},
+                "errors": list(r.errors),
+                "coerced_data": _encode_preview_val(r.coerced_data),
+                "existing_pk": _encode_preview_val(r.existing_pk),
+                "raw_row": _encode_preview_val(r.raw_row),
+            }
+            for r in report.rows
+        ],
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def deserialize_dry_run_report(raw: str) -> DryRunReport:
+    data = json.loads(raw)
+    rows: list[RowDiff] = []
+    for item in data["rows"]:
+        changes = {
+            k: (_decode_preview_val(pair[0]), _decode_preview_val(pair[1]))
+            for k, pair in item["changes"].items()
+        }
+        rows.append(
+            RowDiff(
+                row_number=int(item["row_number"]),
+                status=item["status"],
+                key_display=str(item["key_display"]),
+                changes=changes,
+                errors=tuple(str(e) for e in item["errors"]),
+                coerced_data=dict(_decode_preview_val(item["coerced_data"])),
+                existing_pk=_decode_preview_val(item["existing_pk"]),
+                raw_row=dict(_decode_preview_val(item.get("raw_row") or {})),
+            )
+        )
+    return DryRunReport(
+        token=str(data["token"]),
+        model_slug=str(data["model_slug"]),
+        filename=str(data["filename"]),
+        format=str(data["format"]),
+        upsert_key=data.get("upsert_key"),
+        headers=tuple(str(h) for h in data["headers"]),
+        mapped_columns=dict(data["mapped_columns"]),
+        rows=tuple(rows),
+        creates=int(data["creates"]),
+        updates=int(data["updates"]),
+        unchanged=int(data["unchanged"]),
+        errors=int(data["errors"]),
+    )
+
+
 class ImportPreviewStore:
     """Thread-safe bounded, user/session-bound, single-use TTL store for dry-run previews."""
 
@@ -104,6 +245,29 @@ class ImportPreviewStore:
             self._entries.move_to_end(report.token)
             self._prune(now)
 
+    def peek(
+        self,
+        token: str,
+        *,
+        user_id: str,
+        session_token: str,
+        model_slug: str,
+    ) -> DryRunReport | None:
+        """Read a cached preview report non-destructively without invalidating its token."""
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            item = self._entries.get(token)
+            if item is None:
+                return None
+            if (
+                item.user_id != user_id
+                or item.session_token != session_token
+                or item.report.model_slug != model_slug
+            ):
+                return None
+            return item.report
+
     def consume(
         self,
         token: str,
@@ -129,6 +293,211 @@ class ImportPreviewStore:
             return item.report
 
 
+InMemoryPreviewStore = ImportPreviewStore
+
+
+class SQLAlchemyPreviewStore:
+    """Multi-worker SQLAlchemy dry-run import preview store with atomic single-use consumption."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        ttl_seconds: int = 900,
+        max_entries: int = 256,
+        table_name: str = "_flask_deck_import_previews",
+    ) -> None:
+        self._engine = engine
+        self._ttl = max(60, int(ttl_seconds))
+        self._max_entries = max(4, int(max_entries))
+        self._meta = sa.MetaData()
+        self._table = sa.Table(
+            table_name,
+            self._meta,
+            sa.Column("token", sa.String(128), primary_key=True),
+            sa.Column("user_id", sa.String(128), nullable=False, index=True),
+            sa.Column("session_token", sa.String(255), nullable=False),
+            sa.Column("model_slug", sa.String(128), nullable=False),
+            sa.Column("payload_json", sa.Text, nullable=False),
+            sa.Column("expires_at", sa.Float, nullable=False, index=True),
+        )
+        self._meta.create_all(engine, checkfirst=True)
+
+    def put(self, report: DryRunReport, *, user_id: str, session_token: str) -> None:
+        now = time.time()
+        payload = serialize_dry_run_report(report)
+        with self._engine.begin() as conn:
+            conn.execute(self._table.delete().where(self._table.c.expires_at < now))
+            conn.execute(self._table.delete().where(self._table.c.token == report.token))
+            conn.execute(
+                self._table.insert().values(
+                    token=report.token,
+                    user_id=user_id,
+                    session_token=session_token,
+                    model_slug=report.model_slug,
+                    payload_json=payload,
+                    expires_at=now + self._ttl,
+                )
+            )
+            excess = conn.execute(
+                sa.select(self._table.c.token)
+                .order_by(self._table.c.expires_at.desc())
+                .offset(self._max_entries)
+            ).scalars().all()
+            if excess:
+                conn.execute(self._table.delete().where(self._table.c.token.in_(excess)))
+
+    def peek(
+        self,
+        token: str,
+        *,
+        user_id: str,
+        session_token: str,
+        model_slug: str,
+    ) -> DryRunReport | None:
+        now = time.time()
+        with self._engine.begin() as conn:
+            conn.execute(self._table.delete().where(self._table.c.expires_at < now))
+            raw = conn.execute(
+                sa.select(self._table.c.payload_json).where(
+                    sa.and_(
+                        self._table.c.token == token,
+                        self._table.c.user_id == user_id,
+                        self._table.c.session_token == session_token,
+                        self._table.c.model_slug == model_slug,
+                        self._table.c.expires_at >= now,
+                    )
+                )
+            ).scalar_one_or_none()
+            return deserialize_dry_run_report(str(raw)) if raw is not None else None
+
+    def consume(
+        self,
+        token: str,
+        *,
+        user_id: str,
+        session_token: str,
+        model_slug: str,
+    ) -> DryRunReport | None:
+        now = time.time()
+        with self._engine.begin() as conn:
+            conn.execute(self._table.delete().where(self._table.c.expires_at < now))
+            raw = conn.execute(
+                sa.select(self._table.c.payload_json).where(
+                    sa.and_(
+                        self._table.c.token == token,
+                        self._table.c.user_id == user_id,
+                        self._table.c.session_token == session_token,
+                        self._table.c.model_slug == model_slug,
+                        self._table.c.expires_at >= now,
+                    )
+                )
+            ).scalar_one_or_none()
+            if raw is None:
+                return None
+            del_res = conn.execute(
+                self._table.delete().where(
+                    sa.and_(
+                        self._table.c.token == token,
+                        self._table.c.user_id == user_id,
+                        self._table.c.session_token == session_token,
+                        self._table.c.model_slug == model_slug,
+                    )
+                )
+            )
+            if (del_res.rowcount or 0) != 1:
+                return None
+            return deserialize_dry_run_report(str(raw))
+
+
+class RedisPreviewStore:
+    """Optional Redis multi-worker preview store (requires optional `redis` package or client)."""
+
+    def __init__(
+        self,
+        redis_url_or_client: str | Any,
+        *,
+        ttl_seconds: int = 900,
+        key_prefix: str = "flask_deck:preview:",
+    ) -> None:
+        self._ttl = max(60, int(ttl_seconds))
+        self._prefix = key_prefix
+        if isinstance(redis_url_or_client, str):
+            try:
+                import redis as redis_lib  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise RuntimeError(
+                    "redis is required for RedisPreviewStore. Install with: pip install 'flask-deck[redis]'"
+                ) from exc
+            self._client: Any = redis_lib.Redis.from_url(redis_url_or_client, decode_responses=True)
+        else:
+            self._client = redis_url_or_client
+
+    def put(self, report: DryRunReport, *, user_id: str, session_token: str) -> None:
+        envelope = json.dumps(
+            {
+                "user_id": user_id,
+                "session_token": session_token,
+                "model_slug": report.model_slug,
+                "report": serialize_dry_run_report(report),
+            }
+        )
+        self._client.set(f"{self._prefix}{report.token}", envelope, ex=self._ttl)
+
+    def peek(
+        self,
+        token: str,
+        *,
+        user_id: str,
+        session_token: str,
+        model_slug: str,
+    ) -> DryRunReport | None:
+        raw = self._client.get(f"{self._prefix}{token}")
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            env = json.loads(raw)
+        except Exception:
+            return None
+        if (
+            env.get("user_id") != user_id
+            or env.get("session_token") != session_token
+            or env.get("model_slug") != model_slug
+        ):
+            return None
+        return deserialize_dry_run_report(str(env["report"]))
+
+    def consume(
+        self,
+        token: str,
+        *,
+        user_id: str,
+        session_token: str,
+        model_slug: str,
+    ) -> DryRunReport | None:
+        key = f"{self._prefix}{token}"
+        raw = self._client.getdel(key) if hasattr(self._client, "getdel") else self._client.get(key)
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            env = json.loads(raw)
+        except Exception:
+            return None
+        if (
+            env.get("user_id") != user_id
+            or env.get("session_token") != session_token
+            or env.get("model_slug") != model_slug
+        ):
+            return None
+        if not hasattr(self._client, "getdel") and int(self._client.delete(key) or 0) != 1:
+            return None
+        return deserialize_dry_run_report(str(env["report"]))
+
+
 def parse_import_payload(
     raw_bytes: bytes,
     *,
@@ -138,7 +507,7 @@ def parse_import_payload(
     max_columns: int,
     max_json_depth: int,
 ) -> tuple[str, tuple[str, ...], list[dict[str, Any]]]:
-    """Parse bounded CSV or JSON upload into (format, headers, row_dicts)."""
+    """Parse bounded CSV, JSON, or optional XLSX upload into (format, headers, row_dicts)."""
     if len(raw_bytes) > max_bytes:
         raise ImportLimitError(
             f"Upload exceeds maximum allowed size ({max_bytes // (1024 * 1024)} MiB)."
@@ -146,12 +515,54 @@ def parse_import_payload(
     if not raw_bytes.strip():
         raise ImportLimitError("Uploaded file is empty.")
 
+    lower_name = filename.lower()
+    if lower_name.endswith(".xlsx"):
+        try:
+            import openpyxl  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportLimitError(
+                "XLSX import requires openpyxl. Install with: pip install 'flask-deck[excel]'."
+            ) from exc
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        except Exception as exc:
+            raise ImportLimitError(f"Could not parse XLSX workbook: {exc}") from exc
+        try:
+            sheet = wb.active
+            if sheet is None:
+                raise ImportLimitError("XLSX workbook contains no sheets.")
+            row_iter = sheet.iter_rows(values_only=True)
+            header_tuple = next(row_iter, None)
+            if not header_tuple:
+                raise ImportLimitError("XLSX file is missing a header row.")
+            headers = tuple(str(h).strip() for h in header_tuple if h is not None and str(h).strip())
+            if not headers:
+                raise ImportLimitError("XLSX file header row is empty.")
+            if len(headers) > max_columns:
+                raise ImportLimitError(f"XLSX exceeds maximum column limit ({max_columns}).")
+            xlsx_rows: list[dict[str, Any]] = []
+            for raw_vals in row_iter:
+                if len(xlsx_rows) >= max_rows:
+                    raise ImportLimitError(f"XLSX exceeds maximum row limit ({max_rows}).")
+                vals = list(raw_vals)
+                if not any(v is not None and str(v).strip() != "" for v in vals):
+                    continue
+                row_dict: dict[str, Any] = {}
+                for col_idx, hname in enumerate(headers):
+                    cell_v = vals[col_idx] if col_idx < len(vals) else None
+                    row_dict[hname] = "" if cell_v is None else cell_v
+                xlsx_rows.append(row_dict)
+            return "xlsx", headers, xlsx_rows
+        finally:
+            close_fn = getattr(wb, "close", None)
+            if callable(close_fn):
+                close_fn()
+
     try:
         text = raw_bytes.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ImportLimitError("File must be valid UTF-8 text.") from exc
 
-    lower_name = filename.lower()
     is_json = lower_name.endswith(".json") or text.lstrip().startswith("[")
 
     if is_json:
@@ -349,7 +760,7 @@ def run_dry_run_import(
         raise ImportLimitError("No uploaded columns matched any writable fields on this model.")
 
     # Coerce rows first & collect upsert lookup keys for batched DB preload.
-    parsed_entries: list[tuple[int, dict[str, Any], list[str], Any]] = []
+    parsed_entries: list[tuple[int, dict[str, Any], list[str], Any, dict[str, Any]]] = []
     lookup_keys: list[Any] = []
     for idx, raw_row in enumerate(raw_rows, start=1):
         row_data: dict[str, Any] = {}
@@ -366,7 +777,7 @@ def run_dry_run_import(
         key_val = row_data.get(upsert_key) if upsert_key else None
         if upsert_key and key_val is not None:
             lookup_keys.append(key_val)
-        parsed_entries.append((idx, row_data, row_errors, key_val))
+        parsed_entries.append((idx, row_data, row_errors, key_val, raw_row))
 
     existing_map = (
         _batch_load_existing(session, view, user, upsert_key, lookup_keys)
@@ -381,7 +792,7 @@ def run_dry_run_import(
     # Outer savepoint guarantees ZERO mutations persist during dry-run even on exceptions!
     outer_sp = session.begin_nested()
     try:
-        for row_num, row_data, row_errors, key_val in parsed_entries:
+        for row_num, row_data, row_errors, key_val, orig_raw in parsed_entries:
             key_display = str(key_val) if key_val is not None else f"Row #{row_num}"
             if row_errors:
                 error_count += 1
@@ -391,6 +802,7 @@ def run_dry_run_import(
                         status="error",
                         key_display=key_display,
                         errors=tuple(row_errors),
+                        raw_row=dict(orig_raw),
                     )
                 )
                 continue
@@ -424,6 +836,7 @@ def run_dry_run_import(
                             status="error",
                             key_display=key_display,
                             errors=flat,
+                            raw_row=dict(orig_raw),
                         )
                     )
                     continue
@@ -467,6 +880,7 @@ def run_dry_run_import(
                             status="error",
                             key_display=key_display,
                             errors=(f"Database constraint error: {exc.__class__.__name__}",),
+                            raw_row=dict(orig_raw),
                         )
                     )
                 continue
@@ -490,6 +904,7 @@ def run_dry_run_import(
                         status="error",
                         key_display=key_display,
                         errors=tuple(missing_req),
+                        raw_row=dict(orig_raw),
                     )
                 )
                 continue
@@ -507,6 +922,7 @@ def run_dry_run_import(
                         status="error",
                         key_display=key_display,
                         errors=flat,
+                        raw_row=dict(orig_raw),
                     )
                 )
                 continue
@@ -544,6 +960,7 @@ def run_dry_run_import(
                         status="error",
                         key_display=key_display,
                         errors=(f"Database constraint error: {exc.__class__.__name__}",),
+                        raw_row=dict(orig_raw),
                     )
                 )
     finally:
@@ -568,6 +985,25 @@ def run_dry_run_import(
     )
 
 
+def format_failed_rows_csv(report: DryRunReport, *, sanitize_csv: bool = True) -> str:
+    """Serialize all errored rows from a DryRunReport as formula-safe downloadable CSV."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    headers = list(report.headers)
+    writer.writerow(["row_number", "key", "errors", *[sanitize_csv_cell(h, enabled=sanitize_csv) for h in headers]])
+    for r in report.rows:
+        if r.status != "error":
+            continue
+        cells = [
+            r.row_number,
+            sanitize_csv_cell(r.key_display, enabled=sanitize_csv),
+            sanitize_csv_cell("; ".join(r.errors), enabled=sanitize_csv),
+            *[sanitize_csv_cell(r.raw_row.get(h, ""), enabled=sanitize_csv) for h in headers],
+        ]
+        writer.writerow(cells)
+    return buf.getvalue()
+
+
 def commit_dry_run_import(
     session: Session,
     view: ModelView,
@@ -575,6 +1011,7 @@ def commit_dry_run_import(
     *,
     user: DeckUser | None,
     skip_errors: bool = False,
+    row_audit_cb: Callable[[str, str, str, dict[str, dict[str, Any]]], None] | None = None,
 ) -> tuple[int, int]:
     """Atomically apply a previously validated DryRunReport to the database."""
     if report.errors > 0 and not skip_errors:
@@ -591,22 +1028,54 @@ def commit_dry_run_import(
 
     created = 0
     updated = 0
+    pending_audits: list[tuple[str, Any, dict[str, dict[str, Any]]]] = []
     for row in report.rows:
+        coerced: dict[str, Any] = {}
+        for fname, val in row.coerced_data.items():
+            fmeta = view.meta.fields_by_name.get(fname)
+            if fmeta is not None and fmeta.enum_class is not None and val is not None and not isinstance(val, fmeta.enum_class):
+                coerced[fname] = fmeta.enum_class(val)
+            else:
+                coerced[fname] = val
         if row.status == "create":
             obj = view.model()
-            for fname, val in row.coerced_data.items():
+            for fname, val in coerced.items():
                 setattr(obj, fname, val)
             view.on_model_change(obj, is_created=True, user=user)
             session.add(obj)
             created += 1
+            if row_audit_cb is not None:
+                diff = {
+                    fname: {"old": old_v, "new": new_v}
+                    for fname, (old_v, new_v) in row.changes.items()
+                }
+                pending_audits.append(("create", obj, diff))
         elif row.status == "update" and row.existing_pk is not None:
             pk_key = row.existing_pk if isinstance(row.existing_pk, tuple) else (row.existing_pk,)
             if pk_key in existing_by_pk:
                 obj = existing_by_pk[pk_key]
-                for fname, val in row.coerced_data.items():
+                for fname, val in coerced.items():
                     setattr(obj, fname, val)
                 view.on_model_change(obj, is_created=False, user=user)
                 updated += 1
+                if row_audit_cb is not None and row.changes:
+                    diff = {
+                        fname: {"old": old_v, "new": new_v}
+                        for fname, (old_v, new_v) in row.changes.items()
+                    }
+                    pending_audits.append(("update", obj, diff))
 
+    session.flush()
+    resolved_audits: list[tuple[str, str, str, dict[str, dict[str, Any]]]] = []
+    if row_audit_cb is not None:
+        from flask_deck.adapters.sqlalchemy import encode_pk
+
+        for op_name, obj, diff in pending_audits:
+            pk_str = encode_pk(extract_pk(obj, view.meta))
+            repr_str = view.format_record_repr(obj, user=user)
+            resolved_audits.append((op_name, pk_str, repr_str, diff))
     session.commit()
+    if row_audit_cb is not None:
+        for op_name, pk_str, repr_str, diff in resolved_audits:
+            row_audit_cb(op_name, pk_str, repr_str, diff)
     return created, updated

@@ -16,6 +16,43 @@
 </div>
 
 <div class="dk-content">
+  {% if scheduled_jobs %}
+  <div class="dk-card dk-mb-md">
+    <div class="dk-card-head">
+      <div>
+        <div class="dk-card-title">Scheduled Jobs</div>
+        <div class="dk-card-sub">Declarative jobs registered via @deck.scheduled_job — run manually or trigger via CLI.</div>
+      </div>
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead>
+          <tr>
+            <th>Job</th>
+            <th>Schedule</th>
+            <th>Description</th>
+            <th class="dk-td-actions">Run</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for spec in scheduled_jobs %}
+          <tr>
+            <td><strong>{{ spec.label }}</strong> <span class="dk-mono dk-subtle">({{ spec.name }})</span></td>
+            <td><span class="dk-badge dk-badge-neutral dk-mono">{{ spec.schedule }}</span></td>
+            <td class="dk-muted">{{ spec.description or "—" }}</td>
+            <td class="dk-td-actions">
+              <form method="post" action="{{ url_for(bp_name ~ '.scheduled_job_run', name=spec.name) }}">
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+                <button type="submit" class="dk-btn dk-btn-sm">{{ deck_icon("play", 12) }} Run Now</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
   <div class="dk-table-wrap">
     <table class="dk-table">
       <thead>
@@ -59,12 +96,10 @@
           <td class="dk-muted">{{ job.actor_name }}</td>
           <td data-job-msg>
             <div>{{ job.error or job.message }}</div>
-            {% if job.logs %}
-            <details class="dk-job-logs">
-              <summary class="dk-subtle dk-mono">Logs ({{ job.logs | length }})</summary>
+            <details class="dk-job-logs"{% if not job.logs %} hidden="hidden"{% endif %}>
+              <summary class="dk-subtle dk-mono" data-job-logs-summary>Logs ({{ job.logs | length }})</summary>
               <pre class="dk-job-log-pre dk-mono" data-job-logs>{{ job.logs | join('\n') }}</pre>
             </details>
-            {% endif %}
           </td>
           <td class="dk-mono dk-tabular dk-subtle">{{ format_dt(job.created_at) }}</td>
           <td class="dk-td-actions">
@@ -80,6 +115,12 @@
                 <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger">{{ deck_icon("stop-circle", 12) }} Cancel</button>
               </form>
               {% endif %}
+              {% if job.id in retryable_ids %}
+              <form method="post" action="{{ url_for(bp_name ~ '.job_retry', job_id=job.id) }}">
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+                <button type="submit" class="dk-btn dk-btn-sm">{{ deck_icon("refresh-cw", 12) }} Retry</button>
+              </form>
+              {% endif %}
             </div>
           </td>
         </tr>
@@ -92,4 +133,7 @@
     </table>
   </div>
 </div>
+{% endblock %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-ops.js') }}"></script>
 {% endblock %}

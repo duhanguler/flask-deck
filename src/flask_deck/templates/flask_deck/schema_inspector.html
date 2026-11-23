@@ -19,7 +19,14 @@
         <h2 class="dk-panel-title">Entity-Relationship Diagram</h2>
         <p class="dk-panel-sub">Pure SSR SVG graph generated from frozen ModelMeta &amp; ForeignKey constraints</p>
       </div>
-      <span class="dk-badge dk-badge-neutral dk-mono">SVG ERD</span>
+      <div class="dk-toolbar-left">
+        <div class="dk-seg" role="group" aria-label="ERD Zoom">
+          <button type="button" class="dk-seg-btn dk-mono" data-erd-zoom="out">-</button>
+          <button type="button" class="dk-seg-btn dk-mono" data-erd-zoom="reset">100%</button>
+          <button type="button" class="dk-seg-btn dk-mono" data-erd-zoom="in">+</button>
+        </div>
+        <span class="dk-badge dk-badge-neutral dk-mono">SVG ERD</span>
+      </div>
     </div>
     <div class="dk-panel-body">{{ erd_svg }}</div>
   </section>
@@ -80,4 +87,7 @@
   </section>
   {% endfor %}
 </div>
+{% endblock %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-ops.js') }}"></script>
 {% endblock %}

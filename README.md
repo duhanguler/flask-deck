@@ -17,17 +17,13 @@
 
 **A precision, fail-closed Enterprise Admin Panel & Operations Workbench for Flask and SQLAlchemy 2.0** — engineered for teams that want the visual craft of **Django-Unfold / Filament / Linear** plus enterprise security, media storage, i18n/RTL, cursor pagination, background SSE jobs, and pure-Python TOTP 2FA on WSGI — without shipping Bootstrap, jQuery, Node build pipelines, or external CDNs.
 
-- **Zero Node Build · Zero External CDN · `23.6 KB` gzip total** (`8.83 KB` CSS + `14.76 KB` vanilla ES6 JS + inline SVGs + pure SSR SVG visualizations & QR codes). Runs out of the box in air-gapped enterprise environments.
+- **Zero Node Build · Zero External CDN · `< 18 KB` Core / `< 24 KB` Route gzip budgets** (`deck.css` + ES6 vanilla JS + inline SVGs + pure SSR SVG visualizations & QR codes). Runs out of the box in air-gapped enterprise environments.
 - **Carbon Dark, Swiss Light & Strict-CSP Brand Themes**: `1px` hairline grids, `tabular-nums`, CSS Logical Properties for native **RTL**, custom `#RRGGBB` brand accents served over external `/_theme.css` (auto WCAG 2.1 contrast, **0 `'unsafe-inline'`**), and 7 allowlisted extension slots.
-- **8 Enterprise Capabilities Built In (`v0.3.0`)**:
-  1. **Media, File Uploads & Object Storage (`LocalFileStorage`, `S3StorageBackend` for S3/R2/MinIO)**: Pure-Python magic-byte MIME validation (SVG XSS blocked by default), PNG/JPEG/GIF/WebP decompression-bomb protection, drag-and-drop dropzone, **Image Lightbox**, and RBAC-guarded `/_media` streaming proxy.
-  2. **Enterprise i18n, Native RTL & Per-User Timezones**: Built-in `en`/`tr`/`de`/`ar` catalogs (`DictTranslator`) + optional `BabelTranslator`, native `dir="rtl"` logical layout, stdlib `ZoneInfo` UTC ↔ local TZ conversion, and Topbar Globe switcher.
-  3. **Built-In Pure-Python TOTP 2FA, OIDC/OAuth2 SSO & Audited Impersonation**: RFC 6238 TOTP with replay prevention, PBKDF2 recovery codes, **pure-Python ISO/IEC 18004 SVG QR generator**, PKCE `S256` OIDC SSO with group-to-role mapping, and superuser Impersonation with immutable audit attribution.
-  4. **Scale-Out Query Engine & PostgreSQL Native Power**: HMAC-signed **Keyset Cursor Pagination** (`LIMIT N+1`), `pg_class.reltuples` O(1) estimated counts, multi-bind database routing (`binds={...}`), dialect-aware `JSONB`/`ARRAY` native filters (`?`, `->>`, `#>>`, `@>`, `&&`), and multi-operator filter Rule Builder.
-  5. **Intelligent Dynamic Forms**: Conditional visibility (`field_conditions`), cascading dependent FK dropdowns (`dependent_fields`), **Multi-Step Form Wizards (`form_layout="wizard"`)**, native `ARRAY` tag-chip editor, and `pydantic_validator(Schema)`.
-  6. **Record Lifecycle**: Declarative **Soft-Delete Trash** (`soft_delete_column`, `?trashed=1`, one-click **Restore**, confirmed **Force Delete**) and **Side-by-Side Revision Diffs** (`/<slug>/<pk>/history`) with one-click Safe Revert.
-  7. **Background Jobs, Live SSE Streaming & SSRF-Safe Webhooks**: `ThreadPoolJobBackend`, `@action(..., async_job=True)`, Background CSV Export, `/_jobs` live **Server-Sent Events** progress/log streaming & downloadable artifacts, `@deck.on(...)` event bus, and HMAC-SHA256 `WebhookSink` blocking RFC 1918 / loopback / cloud metadata IPs.
-  8. **Full Operations Workbench (`v0.1`–`v0.2`)**: Drag-and-Drop **Kanban Board**, Pure SVG Analytics (**91d Heatmap, Radial Gauge, Area/Donut/Grouped Bars, Stat Bars, Timeline**), **Interactive Schema ERD (`/_schema`)**, **Redacting Read-Only SQL Console (`/_sql`)**, **Security Diagnostics (`/_diagnostics`)**, **`@deck.page` Custom Pages**, **`⌘K` Command Palette**, **3-Tab Quick Peek Drawer**, and **SAVEPOINT Dry-Run CSV/JSON Import**.
+- **Enterprise Control Plane & AI-Agent Platform (`v0.4.0`)**:
+  1. **Enterprise IAM 2.0 & Tamper-Evident Audit**: Encrypted TOTP 2FA (`SecretCipher`), WebAuthn **Passkeys**, PKCE OIDC SSO, Session Registry (`/_security/sessions`), Four-Eyes **Approval Workflows (`/_approvals`)**, 3-way **OCC**, Server-Side **Saved Views & Notes**, and Hash-Chained **Audit Ledger**.
+  2. **Headless REST API v1 & HITL MCP Server**: Scoped Bearer **API Keys** (`dk_live_...`, CIDR allowlist, rate limiting), OpenAPI 3.1.0 `/_api/v1/...`, and JSON-RPC 2.0 **MCP Server** (`POST /_mcp` & `flask deck mcp`) with savepoint-validated agent proposals.
+  3. **Workspace 2.0 & SQL Workbench 2.0 BI**: **Table, Kanban Board, Calendar, Gallery & Cycle-Safe Tree** views, universal scalar inline edits, clickable FK badges, 1-to-N sub-tables, whole-dataset currency aggregates, dotted FK filters, `__in`/`__not_in`/`__fts`, multi-bind Schema Browser, `EXPLAIN`, SVG Bar/Line charts & pinned Dashboard BI tiles.
+  4. **Import/Export 2.0, ORM Introspection 2.0 & CLI**: Interactive column-mapping wizard, failed-rows CSV download, async background imports, optional **XLSX** (`flask-deck[excel]`), `TypeDecorator`/`hybrid_property`/`column_property`/Joined-Table Inheritance, typed `widgets.py`, clickable zoomable SVG ERD, `flask deck scaffold`, and `flask deck audit --format sarif`.
 
 ---
 
@@ -48,9 +44,14 @@ Open `http://127.0.0.1:5055/admin/` and explore:
 Optional extras (zero mandatory bloat in the base wheel):
 
 ```bash
-pip install "flask-deck[s3]"        # boto3 for S3 / R2 / MinIO
-pip install "flask-deck[babel]"     # Flask-Babel / Babel catalog integration
-pip install "flask-deck[pydantic]"  # Pydantic v2 form validation adapter
+pip install "flask-deck[s3]"          # boto3 for S3 / R2 / MinIO
+pip install "flask-deck[babel]"       # Flask-Babel / Babel catalog integration
+pip install "flask-deck[pydantic]"    # Pydantic v2 form validation adapter
+pip install "flask-deck[excel]"       # openpyxl for .xlsx import & export
+pip install "flask-deck[webauthn]"    # Passkeys / WebAuthn support
+pip install "flask-deck[sso]"         # authlib for OIDC / OAuth2 SSO
+pip install "flask-deck[redis]"       # Redis rate-limit & import preview stores
+pip install "flask-deck[enterprise]"  # Full enterprise bundle
 ```
 
 ---

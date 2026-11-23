@@ -1,0 +1,86 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("Active Sessions") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ _("Active Sessions &amp; Revocation") }}</h1>
+    <p class="dk-page-sub">Server-side tracked sessions across all workers with instant token invalidation.</p>
+  </div>
+  <div class="dk-page-actions">
+    {% if can_view_all %}
+    <a href="{{ url_for(bp_name ~ '.security_sessions', scope='mine') }}" class="dk-btn{% if scope != 'all' %} is-active{% endif %}">My Sessions</a>
+    <a href="{{ url_for(bp_name ~ '.security_sessions', scope='all') }}" class="dk-btn{% if scope == 'all' %} is-active{% endif %}">All Users</a>
+    {% endif %}
+    <form method="post" action="{{ url_for(bp_name ~ '.security_sessions_revoke_others') }}">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <button type="submit" class="dk-btn dk-btn-danger" data-deck-confirm-form
+              data-confirm-title="Revoke Other Sessions"
+              data-confirm-msg="Sign out all other active sessions for your account?">
+        {{ deck_icon("log-out", 13) }} Sign Out All Other Sessions
+      </button>
+    </form>
+  </div>
+</div>
+
+<div class="dk-content">
+  <div class="dk-table-wrap">
+    <table class="dk-table">
+      <thead>
+        <tr>
+          <th>Session</th>
+          <th>User</th>
+          <th>IP / Client</th>
+          <th>Last Seen</th>
+          <th>Status</th>
+          <th class="dk-td-actions">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for rec in sessions_list %}
+        {% set is_current = current_sid and rec.session_id == current_sid %}
+        <tr>
+          <td class="dk-mono">
+            <span>{{ rec.session_id[:12] }}...</span>
+            {% if is_current %}
+            <span class="dk-badge dk-badge-ok dk-mono">CURRENT</span>
+            {% endif %}
+          </td>
+          <td class="dk-mono">{{ rec.username }} <span class="dk-subtle">({{ rec.user_id }})</span></td>
+          <td>
+            <div class="dk-mono">{{ rec.ip_address }}</div>
+            <div class="dk-mono dk-subtle">{{ rec.user_agent or "unknown" }}</div>
+          </td>
+          <td class="dk-mono dk-tabular dk-subtle">{{ format_dt(rec.last_seen_at) }}</td>
+          <td>
+            {% if rec.is_active %}
+            <span class="dk-badge dk-badge-ok dk-mono"><span class="dk-dot"></span>active</span>
+            {% else %}
+            <span class="dk-badge dk-badge-danger dk-mono"><span class="dk-dot"></span>revoked</span>
+            {% endif %}
+          </td>
+          <td class="dk-td-actions">
+            {% if rec.is_active %}
+            <form method="post" action="{{ url_for(bp_name ~ '.security_session_revoke', sid=rec.session_id) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <input type="hidden" name="scope" value="{{ scope }}">
+              <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger">{{ deck_icon("x", 12) }} Revoke</button>
+            </form>
+            {% else %}
+            <span class="dk-subtle dk-mono">{{ format_dt(rec.revoked_at) }}</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="6" class="dk-chart-empty">No tracked sessions found yet. Sign in again to record active device sessions.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

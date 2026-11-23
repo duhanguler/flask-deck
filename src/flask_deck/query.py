@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import calendar
 import contextlib
 import enum
 import hashlib
@@ -23,8 +24,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, defer, joinedload, selectinload
 
 from flask_deck.formatters import normalize_tone
-from flask_deck.introspection import FieldMeta, ModelMeta
-from flask_deck.security import check_json_depth, escape_like
+from flask_deck.introspection import FieldMeta, ModelMeta, introspect_model
+from flask_deck.security import check_json_depth, escape_like, is_sensitive_field
 
 _TELEMETRY_G_KEY = "_flask_deck_sql_telemetry"
 _INSTRUMENTED_ENGINES: weakref.WeakSet[Engine] = weakref.WeakSet()
@@ -41,14 +42,17 @@ _FILTER_OP_SUFFIXES: tuple[tuple[str, str], ...] = (
     ("__array_any", "array_any"),
     ("__contains", "contains"),
     ("__has_key", "has_key"),
+    ("__not_in", "not_in"),
     ("__preset", "preset"),
     ("__null", "null"),
     ("__path", "path"),
     ("__neq", "neq"),
     ("__gte", "gte"),
     ("__lte", "lte"),
+    ("__fts", "fts"),
     ("__gt", "gt"),
     ("__lt", "lt"),
+    ("__in", "in"),
 )
 
 
@@ -426,13 +430,9 @@ def _build_json_contains_condition(
         for path, v in flat_pairs:
             if v is None:
                 if dialect_name == "postgresql":
-                    preds.append(
-                        sa.and_(
-                            _build_json_has_key_condition(col, fmeta, path, dialect_name=dialect_name)
-                            or sa.true(),
-                            _pg_json_text_accessor(col, path.split(".")).is_(None),
-                        )
-                    )
+                    has_key = _build_json_has_key_condition(col, fmeta, path, dialect_name=dialect_name)
+                    is_null = _pg_json_text_accessor(col, path.split(".")).is_(None)
+                    preds.append(sa.and_(has_key, is_null) if has_key is not None else is_null)
                 else:
                     preds.append(sa.func.json_type(col, f"$.{path}") == "null")
                 continue
@@ -568,6 +568,42 @@ def build_filter_condition(
         lte_expr: sa.ColumnElement[bool] = col <= coerced
         return lte_expr
 
+    if op in {"in", "not_in"}:
+        if isinstance(raw_value, (list, tuple, set)):
+            raw_parts = [str(p).strip() for p in raw_value if str(p).strip()]
+        else:
+            raw_parts = [p.strip() for p in str(raw_value).split(",") if p.strip()]
+        valid = [_coerce_filter_value(p, fmeta) for p in raw_parts]
+        valid = [p for p in valid if p is not None]
+        if not valid:
+            return None
+        if op == "not_in":
+            not_in_expr: sa.ColumnElement[bool] = sa.or_(col.is_(None), col.notin_(valid))
+            return not_in_expr
+        in_op_expr: sa.ColumnElement[bool] = col.in_(valid)
+        return in_op_expr
+
+    if op == "fts":
+        clean = str(raw_value or "").strip()
+        if not clean:
+            return None
+        if dialect_name == "postgresql":
+            fts_expr: sa.ColumnElement[bool] = sa.func.to_tsvector(
+                "english", sa.cast(col, sa.Text)
+            ).op("@@")(sa.func.plainto_tsquery("english", clean))
+            return fts_expr
+        tokens = [tok for tok in clean.split() if tok][:8]
+        if not tokens:
+            return None
+        if len(tokens) == 1:
+            return sa.cast(col, sa.String).ilike(f"%{escape_like(tokens[0])}%", escape="\\")
+        return sa.and_(
+            *(
+                sa.cast(col, sa.String).ilike(f"%{escape_like(tok)}%", escape="\\")
+                for tok in tokens
+            )
+        )
+
     if op == "neq":
         coerced = _coerce_filter_value(raw_value, fmeta)
         if coerced is None:
@@ -589,6 +625,62 @@ def build_filter_condition(
         return None
     eq_expr: sa.ColumnElement[bool] = col == coerced
     return eq_expr
+
+
+def build_dotted_filter_condition(
+    meta: ModelMeta,
+    dotted_field: str,
+    raw_value: Any,
+    *,
+    op: str = "eq",
+    dialect_name: str = "",
+    views_by_model: Mapping[type[Any], Any] | None = None,
+    user: Any = None,
+    auth: Any = None,
+) -> tuple[sa.ColumnElement[bool] | None, Any | None]:
+    """Build a safe filter condition across a MANYTOONE dotted relation path like ``org.tier``."""
+    if "." not in dotted_field:
+        return build_filter_condition(meta, dotted_field, raw_value, op=op, dialect_name=dialect_name), None
+    rel_name, target_col_name = dotted_field.split(".", 1)
+    rel_meta = meta.relationships_by_name.get(rel_name)
+    if rel_meta is None or rel_meta.direction != "MANYTOONE":
+        return None, None
+
+    if auth is not None and views_by_model is not None:
+        p_view = views_by_model.get(meta.model)
+        if p_view is not None:
+            p_restricted = auth.hidden_fields_for(user, p_view.meta.slug) | auth.masked_fields_for(
+                user, p_view.meta.slug
+            )
+            if rel_name in p_restricted:
+                return None, None
+        t_view = views_by_model.get(rel_meta.target_model)
+        if t_view is not None:
+            t_restricted = auth.hidden_fields_for(user, t_view.meta.slug) | auth.masked_fields_for(
+                user, t_view.meta.slug
+            )
+            if target_col_name in t_restricted or target_col_name in t_view.meta.sensitive_fields:
+                return None, None
+            target_meta = t_view.meta
+        else:
+            target_meta = introspect_model(rel_meta.target_model)
+    else:
+        target_meta = introspect_model(rel_meta.target_model)
+
+    target_fmeta = target_meta.fields_by_name.get(target_col_name)
+    if (
+        target_fmeta is None
+        or target_fmeta.is_sensitive
+        or is_sensitive_field(target_col_name)
+    ):
+        return None, None
+
+    cond = build_filter_condition(
+        target_meta, target_col_name, raw_value, op=op, dialect_name=dialect_name
+    )
+    if cond is None:
+        return None, None
+    return cond, getattr(meta.model, rel_name)
 
 
 def build_search_clause(
@@ -816,6 +908,56 @@ def _build_keyset_predicate(
     )
 
 
+def _apply_filter_params(
+    meta: ModelMeta,
+    filter_params: Mapping[str, str] | Sequence[tuple[str, str]],
+    filterable_columns: frozenset[str],
+    *,
+    dialect_name: str,
+    where_clauses: list[sa.ColumnElement[bool]],
+    joins: list[Any],
+    seen_joins: set[Any],
+    views_by_model: Mapping[type[Any], Any] | None = None,
+    user: Any = None,
+    auth: Any = None,
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    known_fields = frozenset(meta.fields_by_name.keys()) | set(filterable_columns)
+    active_filters: dict[str, str] = {}
+    applied_filter_pairs: list[tuple[str, str]] = []
+    for raw_key, raw_val in iter_filter_items(filter_params):
+        if not raw_val:
+            continue
+        fname, op = parse_filter_key(raw_key, known_fields)
+        if fname not in filterable_columns:
+            continue
+        if "." in fname:
+            cond, join_attr = build_dotted_filter_condition(
+                meta,
+                fname,
+                raw_val,
+                op=op,
+                dialect_name=dialect_name,
+                views_by_model=views_by_model,
+                user=user,
+                auth=auth,
+            )
+            if cond is not None and join_attr is not None:
+                where_clauses.append(cond)
+                jkey = getattr(join_attr, "key", id(join_attr))
+                if jkey not in seen_joins:
+                    joins.append(join_attr)
+                    seen_joins.add(jkey)
+                active_filters[raw_key] = raw_val
+                applied_filter_pairs.append((raw_key, raw_val))
+            continue
+        cond = build_filter_condition(meta, fname, raw_val, op=op, dialect_name=dialect_name)
+        if cond is not None:
+            where_clauses.append(cond)
+            active_filters[raw_key] = raw_val
+            applied_filter_pairs.append((raw_key, raw_val))
+    return active_filters, applied_filter_pairs
+
+
 def execute_list_query(
     session: Session,
     meta: ModelMeta,
@@ -842,6 +984,9 @@ def execute_list_query(
     cursor_secret: bytes = b"",
     soft_delete_column: str | None = None,
     trashed: bool = False,
+    views_by_model: Mapping[type[Any], Any] | None = None,
+    user: Any = None,
+    auth: Any = None,
 ) -> PageResult:
     """Execute an optimized, N+1-free, SQLi-safe paginated list query (Offset or Keyset Cursor)."""
     safe_page = max(1, page)
@@ -852,22 +997,32 @@ def execute_list_query(
 
     base_conditions: list[sa.ColumnElement[bool]] = list(base_stmt._where_criteria)
     joins: list[Any] = []
+    seen_joins: set[Any] = set()
 
     search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
     if search_clause is not None:
         base_conditions.append(search_clause)
-        joins.extend(search_joins)
+        for j in search_joins:
+            jkey = getattr(j, "key", id(j))
+            if jkey not in seen_joins:
+                joins.append(j)
+                seen_joins.add(jkey)
 
-    # Single-pass conditional aggregation for ALL quick tabs + optional Trash count (1 SQL query!).
-    tab_counts, trashed_count = compute_quick_tab_counts(
-        session,
-        meta,
-        base_conditions,
-        quick_tabs,
-        joins=joins,
-        dialect_name=dialect_name,
-        soft_delete_column=soft_delete_column,
-    )
+    # Skip expensive quick-tab full-table scan when count_mode == "none".
+    if count_mode == "none":
+        tab_counts: dict[str, int] = {}
+        trashed_count = 0
+    else:
+        # Single-pass conditional aggregation for ALL quick tabs + optional Trash count (1 SQL query!).
+        tab_counts, trashed_count = compute_quick_tab_counts(
+            session,
+            meta,
+            base_conditions,
+            quick_tabs,
+            joins=joins,
+            dialect_name=dialect_name,
+            soft_delete_column=soft_delete_column,
+        )
 
     where_clauses: list[sa.ColumnElement[bool]] = list(base_conditions)
     sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=trashed)
@@ -875,8 +1030,6 @@ def execute_list_query(
         where_clauses.append(sd_pred)
 
     known_fields = frozenset(meta.fields_by_name.keys())
-    active_filters: dict[str, str] = {}
-    applied_filter_pairs: list[tuple[str, str]] = []
     if active_tab_key and not trashed:
         for tab in quick_tabs:
             if tab.key == active_tab_key:
@@ -887,17 +1040,18 @@ def execute_list_query(
                         where_clauses.append(cond)
                 break
 
-    for raw_key, raw_val in iter_filter_items(filter_params):
-        if not raw_val:
-            continue
-        fname, op = parse_filter_key(raw_key, known_fields)
-        if fname not in filterable_columns:
-            continue
-        cond = build_filter_condition(meta, fname, raw_val, op=op, dialect_name=dialect_name)
-        if cond is not None:
-            where_clauses.append(cond)
-            active_filters[raw_key] = raw_val
-            applied_filter_pairs.append((raw_key, raw_val))
+    active_filters, applied_filter_pairs = _apply_filter_params(
+        meta,
+        filter_params,
+        filterable_columns,
+        dialect_name=dialect_name,
+        where_clauses=where_clauses,
+        joins=joins,
+        seen_joins=seen_joins,
+        views_by_model=views_by_model,
+        user=user,
+        auth=auth,
+    )
 
     # Strictly allowlisted sorting (zero SQL injection surface).
     chosen_sort = sort_by if (sort_by and sort_by in sortable_columns) else None
@@ -923,9 +1077,44 @@ def execute_list_query(
     total_is_estimated = False
     total_known = True
 
+    has_active_tab_filter = bool(
+        active_tab_key
+        and not trashed
+        and any(t.key == active_tab_key and t.filters for t in quick_tabs)
+    )
+    has_unscoped_only = (
+        not base_conditions
+        and not active_filters
+        and not has_active_tab_filter
+        and not trashed
+    )
+
     if use_cursor_mode and count_mode == "none":
         total_known = False
-    elif trashed and not active_filters and soft_delete_column:
+    elif count_mode == "estimated" and has_unscoped_only:
+        est = estimate_table_rows(session, meta)
+        if est is not None:
+            total = est
+            total_is_estimated = True
+        elif trashed and not active_filters and soft_delete_column:
+            total = trashed_count
+        elif not trashed and not active_filters and active_tab_key and active_tab_key in tab_counts:
+            total = tab_counts[active_tab_key]
+        elif (
+            not trashed
+            and not active_filters
+            and not active_tab_key
+            and quick_tabs
+            and not quick_tabs[0].filters
+            and quick_tabs[0].key in tab_counts
+        ):
+            total = tab_counts[quick_tabs[0].key]
+        else:
+            count_stmt = sa.select(sa.func.count()).select_from(meta.model)
+            if where_clauses:
+                count_stmt = count_stmt.where(*where_clauses)
+            total = int(session.execute(count_stmt).scalar_one() or 0)
+    elif trashed and not active_filters and soft_delete_column and count_mode != "none":
         total = trashed_count
     elif not trashed and not active_filters and active_tab_key and active_tab_key in tab_counts:
         total = tab_counts[active_tab_key]
@@ -935,16 +1124,9 @@ def execute_list_query(
         and not active_tab_key
         and quick_tabs
         and not quick_tabs[0].filters
+        and quick_tabs[0].key in tab_counts
     ):
         total = tab_counts[quick_tabs[0].key]
-    elif count_mode == "estimated" and not where_clauses:
-        est = estimate_table_rows(session, meta)
-        if est is not None:
-            total = est
-            total_is_estimated = True
-        else:
-            count_stmt = sa.select(sa.func.count()).select_from(meta.model)
-            total = int(session.execute(count_stmt).scalar_one() or 0)
     else:
         count_stmt = sa.select(sa.func.count()).select_from(meta.model)
         for rel_attr in joins:
@@ -1153,6 +1335,109 @@ def compute_page_aggregates(
     return out
 
 
+def compute_all_aggregates(
+    session: Session,
+    meta: ModelMeta,
+    *,
+    base_stmt: sa.Select[Any],
+    column_aggregates: Mapping[str, str],
+    searchable_columns: Sequence[str] = (),
+    filterable_columns: frozenset[str] = frozenset(),
+    quick_tabs: Sequence[QuickTab] = (),
+    active_tab_key: str | None = None,
+    search_term: str = "",
+    filter_params: Mapping[str, str] | Sequence[tuple[str, str]] = (),
+    soft_delete_column: str | None = None,
+    trashed: bool = False,
+    views_by_model: Mapping[type[Any], Any] | None = None,
+    user: Any = None,
+    auth: Any = None,
+) -> dict[str, tuple[str, float]]:
+    """Compute SQL aggregates (sum, avg, min, max) over the entire filtered dataset in 1 query."""
+    if not column_aggregates:
+        return {}
+    agg_exprs: list[Any] = []
+    agg_keys: list[tuple[str, str]] = []
+    for col, raw_op in column_aggregates.items():
+        op = raw_op.strip().lower()
+        if op not in {"sum", "avg", "min", "max"} or col not in meta.fields_by_name:
+            continue
+        col_attr: Any = getattr(meta.model, col)
+        agg_col_expr: Any
+        if op == "sum":
+            agg_col_expr = sa.func.sum(col_attr)
+        elif op == "avg":
+            agg_col_expr = sa.func.avg(col_attr)
+        elif op == "min":
+            agg_col_expr = sa.func.min(col_attr)
+        else:
+            agg_col_expr = sa.func.max(col_attr)
+        agg_exprs.append(agg_col_expr.label(f"agg_{col}_{op}"))
+        agg_keys.append((col, op.upper()))
+    if not agg_exprs:
+        return {}
+
+    bind = session.get_bind()
+    dialect_name = bind.dialect.name if bind is not None else ""
+    where_clauses: list[sa.ColumnElement[bool]] = list(base_stmt._where_criteria)
+    joins: list[Any] = []
+    seen_joins: set[Any] = set()
+
+    search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
+    if search_clause is not None:
+        where_clauses.append(search_clause)
+        for j in search_joins:
+            jkey = getattr(j, "key", id(j))
+            if jkey not in seen_joins:
+                joins.append(j)
+                seen_joins.add(jkey)
+
+    sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=trashed)
+    if sd_pred is not None:
+        where_clauses.append(sd_pred)
+
+    known_fields = frozenset(meta.fields_by_name.keys())
+    if active_tab_key and not trashed:
+        for tab in quick_tabs:
+            if tab.key == active_tab_key:
+                for raw_fname, fval in tab.filters.items():
+                    fname, fop = parse_filter_key(raw_fname, known_fields)
+                    cond = build_filter_condition(meta, fname, fval, op=fop, dialect_name=dialect_name)
+                    if cond is not None:
+                        where_clauses.append(cond)
+                break
+
+    _apply_filter_params(
+        meta,
+        filter_params,
+        filterable_columns,
+        dialect_name=dialect_name,
+        where_clauses=where_clauses,
+        joins=joins,
+        seen_joins=seen_joins,
+        views_by_model=views_by_model,
+        user=user,
+        auth=auth,
+    )
+
+    stmt = sa.select(*agg_exprs).select_from(meta.model)
+    for rel_attr in joins:
+        stmt = stmt.outerjoin(rel_attr)
+    if where_clauses:
+        stmt = stmt.where(*where_clauses)
+    row = session.execute(stmt).first()
+    if row is None:
+        return {}
+    out: dict[str, tuple[str, float]] = {}
+    for idx, (col, op_upper) in enumerate(agg_keys):
+        val = row[idx]
+        if val is None:
+            continue
+        with contextlib.suppress(TypeError, ValueError):
+            out[col] = (op_upper, float(val))
+    return out
+
+
 def execute_kanban_query(
     session: Session,
     meta: ModelMeta,
@@ -1166,6 +1451,9 @@ def execute_kanban_query(
     filter_params: Mapping[str, str] | Sequence[tuple[str, str]],
     limit: int = 120,
     soft_delete_column: str | None = None,
+    views_by_model: Mapping[type[Any], Any] | None = None,
+    user: Any = None,
+    auth: Any = None,
 ) -> list[dict[str, Any]]:
     """Fetch bounded, eager-loaded records grouped by enum choices for Kanban Board view."""
     fmeta = meta.fields_by_name.get(kanban_column)
@@ -1181,21 +1469,28 @@ def execute_kanban_query(
         where_clauses.append(sd_pred)
 
     joins: list[Any] = []
+    seen_joins: set[Any] = set()
     search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
     if search_clause is not None:
         where_clauses.append(search_clause)
-        joins.extend(search_joins)
+        for j in search_joins:
+            jkey = getattr(j, "key", id(j))
+            if jkey not in seen_joins:
+                joins.append(j)
+                seen_joins.add(jkey)
 
-    known_fields = frozenset(meta.fields_by_name.keys())
-    for raw_key, raw_val in iter_filter_items(filter_params):
-        if not raw_val:
-            continue
-        fname, op = parse_filter_key(raw_key, known_fields)
-        if fname not in filterable_columns:
-            continue
-        cond = build_filter_condition(meta, fname, raw_val, op=op, dialect_name=dialect_name)
-        if cond is not None:
-            where_clauses.append(cond)
+    _apply_filter_params(
+        meta,
+        filter_params,
+        filterable_columns,
+        dialect_name=dialect_name,
+        where_clauses=where_clauses,
+        joins=joins,
+        seen_joins=seen_joins,
+        views_by_model=views_by_model,
+        user=user,
+        auth=auth,
+    )
 
     stmt = sa.select(meta.model)
     for rel_attr in joins:
@@ -1218,3 +1513,203 @@ def execute_kanban_query(
         {"key": val, "label": lbl, "records": buckets[val]}
         for val, lbl in fmeta.choices
     ]
+
+
+def execute_calendar_query(
+    session: Session,
+    meta: ModelMeta,
+    *,
+    base_stmt: sa.Select[Any],
+    date_field: str,
+    month_str: str = "",
+    searchable_columns: Sequence[str] = (),
+    filterable_columns: frozenset[str] = frozenset(),
+    search_term: str = "",
+    filter_params: Mapping[str, str] | Sequence[tuple[str, str]] = (),
+    soft_delete_column: str | None = None,
+    limit: int = 300,
+    views_by_model: Mapping[type[Any], Any] | None = None,
+    user: Any = None,
+    auth: Any = None,
+) -> dict[str, Any]:
+    """Fetch bounded records for a YYYY-MM month and bucket them into 7-day calendar weeks."""
+    today = datetime.now(timezone.utc).date()
+    year, month = today.year, today.month
+    if month_str and re.fullmatch(r"\d{4}-\d{2}", month_str.strip()):
+        y_s, m_s = month_str.strip().split("-", 1)
+        y_val, m_val = int(y_s), int(m_s)
+        if 1 <= m_val <= 12 and 1900 <= y_val <= 2200:
+            year, month = y_val, m_val
+
+    prev_year, prev_m = (year - 1, 12) if month == 1 else (year, month - 1)
+    next_year, next_m = (year + 1, 1) if month == 12 else (year, month + 1)
+    month_start = date(year, month, 1)
+    month_end = date(next_year, next_m, 1)
+
+    fmeta = meta.fields_by_name.get(date_field)
+    if fmeta is None or fmeta.field_type not in {"date", "datetime"}:
+        return {
+            "year": year,
+            "month": month,
+            "month_key": f"{year:04d}-{month:02d}",
+            "month_label": month_start.strftime("%B %Y"),
+            "prev_month": f"{prev_year:04d}-{prev_m:02d}",
+            "next_month": f"{next_year:04d}-{next_m:02d}",
+            "weeks": [],
+        }
+
+    bind = session.get_bind()
+    dialect_name = bind.dialect.name if bind is not None else ""
+    where_clauses: list[sa.ColumnElement[bool]] = list(base_stmt._where_criteria)
+    sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=False)
+    if sd_pred is not None:
+        where_clauses.append(sd_pred)
+
+    joins: list[Any] = []
+    seen_joins: set[Any] = set()
+    search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
+    if search_clause is not None:
+        where_clauses.append(search_clause)
+        for j in search_joins:
+            jkey = getattr(j, "key", id(j))
+            if jkey not in seen_joins:
+                joins.append(j)
+                seen_joins.add(jkey)
+
+    _apply_filter_params(
+        meta,
+        filter_params,
+        filterable_columns,
+        dialect_name=dialect_name,
+        where_clauses=where_clauses,
+        joins=joins,
+        seen_joins=seen_joins,
+        views_by_model=views_by_model,
+        user=user,
+        auth=auth,
+    )
+
+    date_col: Any = getattr(meta.model, date_field)
+    if fmeta.field_type == "datetime":
+        start_bound: Any = datetime(year, month, 1, 0, 0, 0)
+        end_bound: Any = datetime(next_year, next_m, 1, 0, 0, 0)
+    else:
+        start_bound = month_start
+        end_bound = month_end
+
+    stmt = sa.select(meta.model)
+    for rel_attr in joins:
+        stmt = stmt.outerjoin(rel_attr)
+    where_clauses.extend([date_col >= start_bound, date_col < end_bound])
+    stmt = stmt.where(*where_clauses).order_by(date_col.asc()).limit(max(1, min(limit, 500)))
+    records = list(session.scalars(stmt).unique().all())
+
+    by_iso: dict[str, list[Any]] = {}
+    for obj in records:
+        raw_val = getattr(obj, date_field, None)
+        if isinstance(raw_val, datetime):
+            iso = raw_val.date().isoformat()
+        elif isinstance(raw_val, date):
+            iso = raw_val.isoformat()
+        else:
+            continue
+        by_iso.setdefault(iso, []).append(obj)
+
+    cal = calendar.Calendar(firstweekday=0)
+    weeks = [
+        [
+            {
+                "iso": d.isoformat(),
+                "day": d.day,
+                "in_month": d.month == month,
+                "is_today": d == today,
+                "items": by_iso.get(d.isoformat(), []),
+            }
+            for d in week
+        ]
+        for week in cal.monthdatescalendar(year, month)
+    ]
+    return {
+        "year": year,
+        "month": month,
+        "month_key": f"{year:04d}-{month:02d}",
+        "month_label": month_start.strftime("%B %Y"),
+        "prev_month": f"{prev_year:04d}-{prev_m:02d}",
+        "next_month": f"{next_year:04d}-{next_m:02d}",
+        "weeks": weeks,
+    }
+
+
+def execute_tree_query(
+    session: Session,
+    meta: ModelMeta,
+    *,
+    base_stmt: sa.Select[Any],
+    parent_field: str,
+    displayed_columns: Sequence[str] = (),
+    soft_delete_column: str | None = None,
+    limit: int = 300,
+) -> list[dict[str, Any]]:
+    """Build a bounded, cycle-safe depth-first tree node list for self-referential hierarchies."""
+    if len(meta.primary_keys) != 1 or parent_field not in meta.fields_by_name:
+        return []
+    pk_name = meta.primary_keys[0].name
+    pk_col: Any = getattr(meta.model, pk_name)
+
+    where_clauses: list[sa.ColumnElement[bool]] = list(base_stmt._where_criteria)
+    sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=False)
+    if sd_pred is not None:
+        where_clauses.append(sd_pred)
+
+    stmt = sa.select(meta.model)
+    if where_clauses:
+        stmt = stmt.where(*where_clauses)
+    stmt = stmt.order_by(pk_col.asc())
+    stmt = apply_list_load_options(stmt, meta, displayed_columns)
+    stmt = stmt.limit(max(1, min(limit, 300)))
+    records = list(session.scalars(stmt).unique().all())
+
+    by_pk: dict[Any, Any] = {getattr(obj, pk_name): obj for obj in records}
+    children_map: dict[Any, list[Any]] = {}
+    roots: list[Any] = []
+    for obj in records:
+        pk_val = getattr(obj, pk_name)
+        parent_val = getattr(obj, parent_field, None)
+        if parent_val is None or parent_val == pk_val or parent_val not in by_pk:
+            roots.append(obj)
+        else:
+            children_map.setdefault(parent_val, []).append(obj)
+
+    flattened: list[dict[str, Any]] = []
+    visited: set[Any] = set()
+
+    def _walk(seed: Any) -> None:
+        stack: list[tuple[Any, int]] = [(seed, 0)]
+        while stack:
+            node, depth = stack.pop()
+            node_pk = getattr(node, pk_name)
+            if node_pk in visited:
+                continue
+            visited.add(node_pk)
+            kids = children_map.get(node_pk, [])
+            flattened.append(
+                {
+                    "obj": node,
+                    "depth": depth,
+                    "depth_cls": f"dk-tree-d{min(depth, 5)}",
+                    "has_children": bool(kids),
+                    "child_count": len(kids),
+                }
+            )
+            for child in reversed(kids):
+                child_pk = getattr(child, pk_name)
+                if child_pk not in visited:
+                    stack.append((child, depth + 1))
+
+    for root in roots:
+        _walk(root)
+    # Also include pure cycles cleanly without infinite recursion
+    for obj in records:
+        if getattr(obj, pk_name) not in visited:
+            _walk(obj)
+    return flattened

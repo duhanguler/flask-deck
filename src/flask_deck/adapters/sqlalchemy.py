@@ -11,7 +11,7 @@ from decimal import Decimal
 from typing import Any
 from urllib.parse import quote, unquote
 
-from flask import Flask, g
+from flask import Flask, g, has_app_context
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -50,29 +50,101 @@ class ORMAdapter(ABC):
 
 
 class FlaskSQLAlchemyAdapter(ORMAdapter):
-    """Adapter for Flask-SQLAlchemy 3.x ``SQLAlchemy`` instances."""
+    """Adapter for Flask-SQLAlchemy 3.x ``SQLAlchemy`` instances (supports multi-bind)."""
 
-    __slots__ = ("_db",)
+    __slots__ = ("_app", "_bind_factories", "_binds", "_db", "_dynamic_factories", "_g_key")
 
-    def __init__(self, db: Any) -> None:
+    def __init__(self, db: Any, *, binds: Mapping[str, Engine] | None = None) -> None:
         self._db = db
+        self._app: Flask | None = getattr(db, "app", None)
+        self._binds: dict[str, Engine] = dict(binds or {})
+        self._bind_factories: dict[str, sessionmaker[Session]] = {
+            name: sessionmaker(bind=eng, autoflush=False, expire_on_commit=False)
+            for name, eng in self._binds.items()
+        }
+        self._dynamic_factories: dict[str, sessionmaker[Session]] = {}
+        self._g_key = f"_flask_deck_fsa_session_{id(self)}"
 
     def get_session(self) -> Session:
         return self._db.session  # type: ignore[no-any-return]
 
     def get_engine(self) -> Engine:
+        if not has_app_context() and self._app is not None:
+            with self._app.app_context():
+                return self._db.engine  # type: ignore[no-any-return]
         return self._db.engine  # type: ignore[no-any-return]
 
     def get_engines(self) -> dict[str, Engine]:
+        if not has_app_context() and self._app is not None:
+            with self._app.app_context():
+                return self.get_engines()
+        out: dict[str, Engine] = {}
         engines_map = getattr(self._db, "engines", None)
         if isinstance(engines_map, Mapping):
-            out: dict[str, Engine] = {}
             for k, eng in engines_map.items():
                 if isinstance(eng, Engine):
                     out["default" if k is None else str(k)] = eng
-            if out:
-                return out
-        return {"default": self.get_engine()}
+        if "default" not in out:
+            out["default"] = self.get_engine()
+        out.update(self._binds)
+        return out
+
+    def dispose(self) -> None:
+        if not has_app_context() and self._app is not None:
+            with self._app.app_context():
+                engines = list(self.get_engines().values())
+        else:
+            try:
+                engines = list(self.get_engines().values())
+            except RuntimeError:
+                engines = list(self._binds.values())
+        for eng in engines:
+            eng.dispose()
+
+    def get_session_for_bind(self, bind_key: str | None = None) -> Session:
+        if not bind_key or bind_key == "default":
+            return self.get_session()
+        factory = self._bind_factories.get(bind_key) or self._dynamic_factories.get(bind_key)
+        if factory is None:
+            engines = self.get_engines()
+            if bind_key not in engines:
+                raise KeyError(f"Unknown SQLAlchemy bind_key: {bind_key!r}")
+            factory = sessionmaker(bind=engines[bind_key], autoflush=False, expire_on_commit=False)
+            self._dynamic_factories[bind_key] = factory
+        key = f"{self._g_key}_{bind_key}"
+        existing: Session | None = getattr(g, key, None)
+        if existing is None:
+            existing = factory()
+            setattr(g, key, existing)
+        tracked: list[str] = getattr(g, f"{self._g_key}_keys", [])
+        if key not in tracked:
+            tracked.append(key)
+            setattr(g, f"{self._g_key}_keys", tracked)
+        return existing
+
+    def register_teardown(self, app: Flask) -> None:
+        self._app = app
+        keys_attr = f"{self._g_key}_keys"
+
+        @app.teardown_appcontext
+        def _close_fsa_bind_sessions(exc: BaseException | None) -> None:
+            tracked: list[str] = getattr(g, keys_attr, [])
+            for attr in tracked:
+                sess: Session | None = getattr(g, attr, None)
+                if sess is not None:
+                    try:
+                        if exc is not None:
+                            sess.rollback()
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            sess.close()
+                        finally:
+                            if hasattr(g, attr):
+                                delattr(g, attr)
+            if hasattr(g, keys_attr):
+                delattr(g, keys_attr)
 
 
 class PureSQLAlchemyAdapter(ORMAdapter):
@@ -175,7 +247,7 @@ def resolve_adapter(
         # Detect Flask-SQLAlchemy without invoking its @property `engine` outside app context.
         db_cls = type(db)
         if hasattr(db, "session") and (hasattr(db_cls, "engine") or hasattr(db, "Model")):
-            return FlaskSQLAlchemyAdapter(db)
+            return FlaskSQLAlchemyAdapter(db, binds=binds)
         raise TypeError(
             "Unsupported db argument. Pass a Flask-SQLAlchemy instance, "
             "SQLAlchemy sessionmaker, Engine, or ORMAdapter."

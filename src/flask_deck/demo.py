@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
@@ -312,6 +313,8 @@ class ProductView(ModelView):
     )
     column_aggregates = MappingProxyType({"price_cents": "avg", "stock_pct": "avg"})
     form_layout = "wizard"
+    gallery_image_field = "thumbnail_path"
+    gallery_subtitle_field = "sku"
     form_excluded_columns = ("created_at",)
     file_fields = MappingProxyType(
         {
@@ -348,6 +351,7 @@ class OrderItemInline(InlineModelView):
     model = OrderItem
     label = "Line Items"
     columns = ("product_id", "quantity", "unit_price_cents")
+    order_by = "id"
 
 
 class OrderView(ModelView):
@@ -361,6 +365,8 @@ class OrderView(ModelView):
     inlines = (OrderItemInline,)
     kanban_column = "status"
     kanban_card_fields = ("order_number", "organization", "total_cents")
+    calendar_date_field = "created_at"
+    calendar_title_field = "order_number"
     column_aggregates = MappingProxyType({"total_cents": "sum"})
     form_layout = "tabs"
     dependent_fields = MappingProxyType({"customer_id": ("organization_id", "organization_id")})
@@ -672,10 +678,14 @@ def _seed_demo_data(session_factory: sessionmaker[Any], audit_store: SQLAlchemyA
             audit_store.record(entry)
 
 
-def create_demo_app(db_uri: str = "sqlite:///:memory:") -> Flask:
+def create_demo_app(
+    db_uri: str = "sqlite:///:memory:",
+    *,
+    secret_key: str | None = None,
+) -> Flask:
     """Create the complete Acme Cloud Ops SaaS demo Flask application."""
     app = Flask(__name__)
-    app.config["SECRET_KEY"] = secrets.token_hex(32)
+    app.config["SECRET_KEY"] = secret_key or os.environ.get("FLASK_DECK_SECRET_KEY") or secrets.token_hex(32)
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
@@ -693,7 +703,7 @@ def create_demo_app(db_uri: str = "sqlite:///:memory:") -> Flask:
             conn.exec_driver_sql("PRAGMA busy_timeout=5000")
     DemoBase.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    audit_store = SQLAlchemyAuditStore(engine)
+    audit_store = SQLAlchemyAuditStore(engine, hash_chain=True)
     _seed_demo_data(session_factory, audit_store)
 
     roles = [
@@ -782,6 +792,8 @@ def create_demo_app(db_uri: str = "sqlite:///:memory:") -> Flask:
         subtitle="Cloud Infrastructure & Billing Control Plane",
         environment="staging",
         enable_sql_console=True,
+        enable_rest_api=True,
+        enable_mcp=True,
         demo_role_switcher=True,
         brand=BrandConfig(
             accent="monochrome",

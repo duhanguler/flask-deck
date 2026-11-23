@@ -71,7 +71,13 @@
           <label>{{ rel.label }} <span class="dk-tab-count dk-mono">{{ rel.count }}</span></label>
           {% if rel.records %}
           <div class="dk-chip-group">
-            {% for it in rel.records %}<span class="dk-chip">{{ it }}</span>{% endfor %}
+            {% for it in rel.records %}
+              {% if it.href %}
+              <a class="dk-chip dk-link" href="{{ it.href }}">{{ it.label }}</a>
+              {% else %}
+              <span class="dk-chip">{{ it.label }}</span>
+              {% endif %}
+            {% endfor %}
           </div>
           {% else %}
           <span class="dk-null">None</span>
@@ -79,6 +85,98 @@
         </div>
         {% else %}
         <div class="dk-subtle">No relationships defined.</div>
+        {% endfor %}
+      </div>
+    </section>
+
+    {% for sub in subtables %}
+    <section class="dk-panel dk-span-12">
+      <div class="dk-panel-head">
+        <div>
+          <h2 class="dk-panel-title">{{ sub.label }}</h2>
+          <p class="dk-page-sub dk-mono">{{ sub.total_count }} linked {{ sub.target_view.plural_label | lower }}</p>
+        </div>
+        <div class="dk-page-actions">
+          <a href="{{ sub.list_url }}" class="dk-btn dk-btn-sm">{{ _("View All") }}</a>
+          {% if sub.create_url %}
+          <a href="{{ sub.create_url }}" class="dk-btn dk-btn-sm dk-btn-primary">{{ deck_icon("plus", 12) }} {{ _("New") }} {{ sub.target_view.label }}</a>
+          {% endif %}
+        </div>
+      </div>
+      {% if sub.rows %}
+      <div class="dk-table-wrap">
+        <table class="dk-table">
+          <thead>
+            <tr>
+              {% for c in sub.cols %}<th>{{ sub.target_view.get_column_label(c) }}</th>{% endfor %}
+              <th class="dk-td-actions">Link</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in sub.rows %}
+            <tr>
+              {% for cell in row.cells %}<td>{{ cell }}</td>{% endfor %}
+              <td class="dk-td-actions"><a href="{{ row.detail_url }}" class="dk-btn dk-btn-ghost dk-btn-sm">Open</a></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="dk-chart-empty">No {{ sub.target_view.plural_label | lower }} linked yet.</div>
+      {% endif %}
+    </section>
+    {% endfor %}
+
+    <section class="dk-panel dk-span-12">
+      <div class="dk-panel-head">
+        <h2 class="dk-panel-title">Operational Notes</h2>
+        <span class="dk-mono dk-subtle">{{ record_notes | length }} note(s)</span>
+      </div>
+      <div class="dk-panel-body">
+        {% if can_write_notes %}
+        <form method="post" action="{{ url_for(bp_name ~ '.api_record_notes', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-content">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <div class="dk-field">
+            <label for="dk-record-note-body">Add Note (Markdown subset: **bold**, *italic*, `code`, [link](https://...))</label>
+            <textarea id="dk-record-note-body" name="body" rows="2" class="dk-input" maxlength="4000" required placeholder="Document incident triage, override justification, or handoff notes..."></textarea>
+          </div>
+          <div class="dk-toolbar">
+            <label class="dk-checkbox">
+              <input type="checkbox" name="pinned" value="1">
+              <span>Pin warning / note</span>
+            </label>
+            <button type="submit" class="dk-btn dk-btn-primary dk-btn-sm">{{ deck_icon("plus", 12) }} Add Note</button>
+          </div>
+        </form>
+        {% endif %}
+        {% for note in record_notes %}
+        <div class="dk-activity-row">
+          <div class="dk-activity-main">
+            <div>
+              {% if note.pinned %}<span class="dk-badge dk-badge-warn dk-mono">PINNED</span>{% endif %}
+              <strong>{{ note.author_name }}</strong>
+              <span class="dk-mono dk-subtle">{{ format_dt(note.created_at, '%Y-%m-%d %H:%M') }}</span>
+            </div>
+            <div>{{ render_note_md(note.body) }}</div>
+          </div>
+          {% if can_write_notes %}
+          <div class="dk-page-actions">
+            <form method="post" action="{{ url_for(bp_name ~ '.api_record_note_pin', slug=view.meta.slug, raw_pk=pk_str, note_id=note.id) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <button type="submit" class="dk-btn dk-btn-sm">{{ "Unpin" if note.pinned else "Pin" }}</button>
+            </form>
+            {% if is_superuser or note.author_id == current_user_id %}
+            <form method="post" action="{{ url_for(bp_name ~ '.api_record_note_delete', slug=view.meta.slug, raw_pk=pk_str, note_id=note.id) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <button type="submit" class="dk-btn dk-btn-ghost dk-btn-sm" aria-label="Delete note">{{ deck_icon("trash", 12) }}</button>
+            </form>
+            {% endif %}
+          </div>
+          {% endif %}
+        </div>
+        {% else %}
+        <div class="dk-chart-empty">No operational notes attached to this record.</div>
         {% endfor %}
       </div>
     </section>
@@ -121,4 +219,7 @@
     {% endif %}
   </div>
 </div>
+{% endblock %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-grid.js') }}"></script>
 {% endblock %}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import hashlib
 import json
 import math
 import uuid
@@ -15,6 +16,7 @@ import sqlalchemy as sa
 from markupsafe import Markup
 from sqlalchemy.orm import Session
 
+from flask_deck.audit import compute_diff, serialize_audit_value
 from flask_deck.auth import AuthProvider, DeckUser
 from flask_deck.exceptions import PermissionDeniedError, ValidationError
 from flask_deck.formatters import (
@@ -29,8 +31,9 @@ from flask_deck.formatters import (
 from flask_deck.i18n import from_user_timezone
 from flask_deck.introspection import FieldMeta, ModelMeta, humanize, introspect_model
 from flask_deck.query import CountMode, PaginationMode, QuickTab
-from flask_deck.security import check_json_depth, is_safe_display_url
+from flask_deck.security import check_json_depth, is_safe_display_url, is_sensitive_field
 from flask_deck.storage import FileFieldConfig, store_validated_upload
+from flask_deck.widgets import FormWidget
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +69,7 @@ class ActionSpec:
     require_confirm_text: bool = False
     fields: tuple[ActionField, ...] = ()
     async_job: bool = False
+    require_approval: bool = False
 
 
 def action(
@@ -81,6 +85,7 @@ def action(
     require_confirm_text: bool = False,
     fields: Sequence[ActionField] = (),
     async_job: bool = False,
+    require_approval: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator registering a custom bulk or row action on a ModelView."""
 
@@ -98,6 +103,7 @@ def action(
             require_confirm_text=require_confirm_text,
             fields=tuple(fields),
             async_job=async_job,
+            require_approval=require_approval,
         )
         func._deck_action_spec = spec  # type: ignore[attr-defined]
         return func
@@ -147,6 +153,9 @@ class InlineModelView:
     fk_column: ClassVar[str | None] = None
     label: ClassVar[str | None] = None
     columns: ClassVar[Sequence[str]] = ()
+    extra_fields: ClassVar[Sequence[str]] = ()
+    order_by: ClassVar[str | None] = None
+    searchable: ClassVar[bool] = False
     can_create: ClassVar[bool] = True
     can_edit: ClassVar[bool] = True
     can_delete: ClassVar[bool] = True
@@ -162,13 +171,18 @@ class InlineModelView:
             self.editable_columns: tuple[str, ...] = tuple(
                 c
                 for c in self.columns
-                if c in self.meta.fields_by_name and c not in self.meta.sensitive_fields
+                if c in self.meta.fields_by_name
+                and not self.meta.fields_by_name[c].is_computed
+                and c not in self.meta.sensitive_fields
             )
         else:
             self.editable_columns = tuple(
                 f.name
                 for f in self.meta.fields
-                if not f.primary_key and not f.is_sensitive and f.name != self.fk_column
+                if not f.primary_key
+                and not f.is_computed
+                and not f.is_sensitive
+                and f.name != self.fk_column
             )
 
     def resolve_fk_column(self, parent_meta: ModelMeta) -> str:
@@ -379,7 +393,7 @@ class ModelView:
     kanban_card_fields: ClassVar[Sequence[str]] = ()
     column_aggregates: ClassVar[Mapping[str, str]] = {}
     form_layout: ClassVar[Literal["stacked", "tabs", "wizard"]] = "stacked"
-    field_widgets: ClassVar[Mapping[str, str]] = {}
+    field_widgets: ClassVar[Mapping[str, str | FormWidget]] = {}
     saved_views: ClassVar[Sequence[tuple[str, str]]] = ()
     # v0.3.0 Enterprise ModelView capabilities
     pagination_mode: ClassVar[PaginationMode | None] = None
@@ -392,6 +406,20 @@ class ModelView:
     form_validator: ClassVar[
         Callable[[Mapping[str, Any], Any | None, bool], Mapping[str, list[str]]] | None
     ] = None
+    # v0.4.0 Enterprise Governance capabilities
+    approval_required: ClassVar[
+        tuple[str, ...]
+        | Callable[[DeckUser | None, str, Any, Mapping[str, Any]], bool]
+    ] = ()
+    version_column: ClassVar[str | None] = None
+    # v0.4.0 Workspace 2.0 capabilities
+    calendar_date_field: ClassVar[str | None] = None
+    calendar_title_field: ClassVar[str | None] = None
+    gallery_image_field: ClassVar[str | None] = None
+    gallery_subtitle_field: ClassVar[str | None] = None
+    tree_parent_field: ClassVar[str | None] = None
+    tree_title_field: ClassVar[str | None] = None
+    aggregate_scope: ClassVar[Literal["page", "all"]] = "page"
 
     can_view: bool = True
     can_create: bool = True
@@ -459,11 +487,21 @@ class ModelView:
             )[:4]
 
         if self.filterable_columns:
-            self.resolved_filterable: frozenset[str] = frozenset(
-                c
-                for c in self.filterable_columns
-                if c in self.meta.fields_by_name and c not in self.meta.sensitive_fields
-            )
+            resolved_filt: set[str] = set()
+            for c in self.filterable_columns:
+                if "." in c:
+                    rel_name, target_col = c.split(".", 1)
+                    rel_m = self.meta.relationships_by_name.get(rel_name)
+                    if (
+                        rel_m is not None
+                        and rel_m.direction == "MANYTOONE"
+                        and rel_name not in self.meta.sensitive_fields
+                        and not is_sensitive_field(target_col, extra_sensitive_patterns)
+                    ):
+                        resolved_filt.add(c)
+                elif c in self.meta.fields_by_name and c not in self.meta.sensitive_fields:
+                    resolved_filt.add(c)
+            self.resolved_filterable: frozenset[str] = frozenset(resolved_filt)
         else:
             self.resolved_filterable = frozenset(
                 f.name
@@ -489,8 +527,34 @@ class ModelView:
             c
             for c in self.inline_editable_columns
             if c in self.meta.fields_by_name
-            and self.meta.fields_by_name[c].field_type in {"boolean", "enum"}
+            and self.meta.fields_by_name[c].field_type
+            in {"boolean", "enum", "string", "integer", "float", "decimal", "date"}
+            and not self.meta.fields_by_name[c].primary_key
+            and not self.meta.fields_by_name[c].is_computed
+            and self.meta.fields_by_name[c].fk_target_model is None
             and c not in self.meta.sensitive_fields
+        )
+        self.resolved_calendar_field: str | None = (
+            self.calendar_date_field
+            if self.calendar_date_field
+            and self.calendar_date_field in self.meta.fields_by_name
+            and self.meta.fields_by_name[self.calendar_date_field].field_type in {"date", "datetime"}
+            else None
+        )
+        self.resolved_gallery_field: str | None = (
+            self.gallery_image_field
+            if self.gallery_image_field
+            and (
+                self.gallery_image_field in self.file_fields
+                or self.gallery_image_field in self.meta.fields_by_name
+            )
+            and self.gallery_image_field not in self.meta.sensitive_fields
+            else None
+        )
+        self.resolved_tree_field: str | None = (
+            self.tree_parent_field
+            if self.tree_parent_field and self.tree_parent_field in self.meta.fields_by_name
+            else None
         )
 
         # Form columns (scalars + M2M relationships); auto-exclude soft_delete_column to prevent bypass
@@ -502,12 +566,15 @@ class ModelView:
                 c
                 for c in self.form_columns
                 if c not in form_excluded
-                and (c in self.meta.fields_by_name or c in self.meta.relationships_by_name)
+                and (
+                    (c in self.meta.fields_by_name and not self.meta.fields_by_name[c].is_computed)
+                    or c in self.meta.relationships_by_name
+                )
             )
         else:
             auto_form: list[str] = []
             for f in self.meta.fields:
-                if f.name in form_excluded or f.autoincrement or f.field_type == "binary":
+                if f.name in form_excluded or f.autoincrement or f.is_computed or f.field_type == "binary":
                     continue
                 if f.primary_key and f.has_default:
                     continue
@@ -571,13 +638,16 @@ class ModelView:
             self.resolved_import_columns: tuple[str, ...] = tuple(
                 c
                 for c in self.import_columns
-                if c in self.meta.fields_by_name and c not in self.meta.sensitive_fields
+                if c in self.meta.fields_by_name
+                and not self.meta.fields_by_name[c].is_computed
+                and c not in self.meta.sensitive_fields
             )
         else:
             self.resolved_import_columns = tuple(
                 f.name
                 for f in self.meta.fields
                 if not f.is_sensitive
+                and not f.is_computed
                 and not f.autoincrement
                 and f.field_type != "binary"
                 and f.name != self.soft_delete_column
@@ -679,6 +749,7 @@ class ModelView:
         user: DeckUser | None,
         media_url_builder: Callable[[str, Any], str | None] | None = None,
         rel_repr: Callable[[type[Any], Any], str] | None = None,
+        rel_url_builder: Callable[[type[Any], Any], str | None] | None = None,
     ) -> Markup | str:
         """Format one table/detail cell with RBAC field masking and XSS-safe output."""
         raw_val = getattr(obj, col_name, None)
@@ -698,25 +769,33 @@ class ModelView:
         if rel_meta is not None:
             if raw_val is None:
                 return Markup('<span class="dk-null">—</span>')
+
             def _fmt_rel_item(item: Any) -> str:
                 if rel_repr is not None:
                     return rel_repr(rel_meta.target_model, item)
                 return str(item)
+
+            def _render_rel_badge(item: Any, *, chip: bool) -> str:
+                label = Markup.escape(_fmt_rel_item(item))
+                target_url = rel_url_builder(rel_meta.target_model, item) if rel_url_builder else None
+                cls = "dk-chip dk-link" if chip else "dk-rel-val dk-link"
+                if target_url:
+                    return f'<a href="{Markup.escape(target_url)}" class="{cls}">{label}</a>'
+                plain_cls = "dk-chip" if chip else "dk-rel-val"
+                return f'<span class="{plain_cls}">{label}</span>'
+
             if rel_meta.uselist:
                 items = list(raw_val)
                 if not items:
                     return Markup('<span class="dk-null">—</span>')
-                chips = "".join(
-                    f'<span class="dk-chip">{Markup.escape(_fmt_rel_item(item))}</span>'
-                    for item in items[:3]
-                )
+                chips = "".join(_render_rel_badge(item, chip=True) for item in items[:3])
                 extra = (
                     f'<span class="dk-muted dk-mono">+{len(items) - 3}</span>'
                     if len(items) > 3
                     else ""
                 )
                 return Markup(f'<span class="dk-chip-group">{chips}{extra}</span>')
-            return Markup(f'<span class="dk-rel-val">{Markup.escape(_fmt_rel_item(raw_val))}</span>')
+            return Markup(_render_rel_badge(raw_val, chip=False))
 
         if raw_val is None:
             return Markup('<span class="dk-null">—</span>')
@@ -771,6 +850,52 @@ class ModelView:
                 return None
         return None
 
+    def requires_approval(
+        self,
+        user: DeckUser | None,
+        operation: str,
+        *,
+        obj: Any | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Return True when operation (create/edit/delete/action) requires Maker-Checker approval."""
+        rule: Any = None
+        if "approval_required" in self.__dict__:
+            rule = self.__dict__["approval_required"]
+        else:
+            for cls in self.__class__.__mro__:
+                if "approval_required" in cls.__dict__:
+                    raw_r = cls.__dict__["approval_required"]
+                    rule = raw_r.__func__ if isinstance(raw_r, staticmethod) else raw_r
+                    break
+        if rule is None:
+            return False
+        if isinstance(rule, bool):
+            return rule
+        if callable(rule):
+            return bool(rule(user, operation, obj, dict(payload or {})))
+        return operation in tuple(rule)
+
+    def compute_version_token(
+        self,
+        obj: Any,
+        *,
+        auth: AuthProvider | None = None,
+        user: DeckUser | None = None,
+    ) -> str:
+        """Compute deterministic optimistic concurrency token for ``obj``."""
+        if self.version_column and hasattr(obj, self.version_column):
+            return str(getattr(obj, self.version_column, ""))
+        if auth is not None:
+            cols = sorted(self.allowed_form_fields(auth, user, mode="edit"))
+        else:
+            cols = sorted(f.name for f in self.meta.fields if not f.primary_key)
+        snapshot = [
+            (col, serialize_audit_value(getattr(obj, col, None))) for col in cols
+        ]
+        raw = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
     def _is_condition_satisfied(
         self,
         field_name: str,
@@ -801,7 +926,9 @@ class ModelView:
             vals = [str(v) for v in expected] if isinstance(expected, (list, tuple, set, frozenset)) else [str(expected)]
             return src_str in vals
         if op == "truthy":
-            return bool(src_str) and src_str not in {"false", "0"}
+            return bool(src_str) and src_str.lower() not in {"false", "0"}
+        if op == "falsy":
+            return (not src_str) or src_str.lower() in {"false", "0"}
         return True
 
     def apply_form_data(
@@ -958,6 +1085,9 @@ class ModelView:
                             orphans.append((cfg, str(existing_key)))
                     except ValueError as exc:
                         errors.setdefault(field_name, []).append(str(exc))
+                    finally:
+                        with contextlib.suppress(Exception):
+                            upload.stream.close()
                 elif clear_flag and existing_key:
                     fmeta = self.meta.fields_by_name.get(field_name)
                     if fmeta is not None and not fmeta.nullable and not fmeta.has_default:
@@ -994,12 +1124,13 @@ class ModelView:
         auth: AuthProvider,
         user: DeckUser | None,
         max_json_depth: int = 12,
-    ) -> None:
-        """Process embedded One-to-Many inline child rows with strict parent-ownership IDOR checks."""
+    ) -> list[dict[str, Any]]:
+        """Process embedded One-to-Many inline child rows with strict IDOR checks and audit diffs."""
         if not self.inline_views:
-            return
+            return []
 
         parent_pk = getattr(parent_obj, self.meta.primary_keys[0].name)
+        events: list[tuple[InlineModelView, str, Any, dict[str, Any], Any]] = []
 
         for inline in self.inline_views:
             prefix = f"inline__{inline.meta.slug}__"
@@ -1054,18 +1185,24 @@ class ModelView:
                         raise PermissionDeniedError(
                             f"Inline record {typed_pk} does not belong to this {self.label}."
                         )
+                    before_snap = {
+                        c: getattr(child_obj, c, None) for c in inline.editable_columns
+                    }
                     if marked_delete:
                         if not inline.can_delete or not auth.has_permission(
                             user, f"{inline.meta.slug}:delete", model_slug=inline.meta.slug
                         ):
                             raise PermissionDeniedError("Not authorized to delete inline items.")
                         session.delete(child_obj)
+                        events.append((inline, "delete", child_obj, before_snap, typed_pk))
                         continue
                     if not inline.can_edit or not auth.has_permission(
                         user, f"{inline.meta.slug}:edit", model_slug=inline.meta.slug
                     ):
                         continue
                     target_obj = child_obj
+                    op_kind = "edit"
+                    recorded_pk: Any = typed_pk
                 else:
                     if marked_delete:
                         continue
@@ -1083,6 +1220,9 @@ class ModelView:
                     target_obj = inline.model()
                     setattr(target_obj, fk_col_name, parent_pk)
                     session.add(target_obj)
+                    before_snap = {}
+                    op_kind = "create"
+                    recorded_pk = None
 
                 for col in inline.editable_columns:
                     fmeta = inline.meta.fields_by_name[col]
@@ -1093,5 +1233,38 @@ class ModelView:
                     except ValueError as exc:
                         errors.setdefault(f"{inline.meta.slug}[{idx}].{col}", []).append(str(exc))
 
+                if op_kind in {"create", "edit"}:
+                    events.append((inline, op_kind, target_obj, before_snap, recorded_pk))
+
             if errors:
                 raise ValidationError(errors)
+
+        session.flush()
+        out: list[dict[str, Any]] = []
+        for inline, op_kind, target_obj, before_snap, recorded_pk in events:
+            pk_val = (
+                recorded_pk
+                if recorded_pk is not None
+                else getattr(target_obj, inline.meta.primary_keys[0].name, None)
+            )
+            after_snap = (
+                {}
+                if op_kind == "delete"
+                else {c: getattr(target_obj, c, None) for c in inline.editable_columns}
+            )
+            diff = compute_diff(
+                before_snap,
+                after_snap,
+                sensitive_fields=inline.meta.sensitive_fields,
+            )
+            if diff:
+                out.append(
+                    {
+                        "inline_slug": inline.meta.slug,
+                        "inline_label": inline.display_label,
+                        "op": op_kind,
+                        "child_pk": str(pk_val) if pk_val is not None else "",
+                        "changes": diff,
+                    }
+                )
+        return out

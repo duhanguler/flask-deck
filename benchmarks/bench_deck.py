@@ -56,13 +56,23 @@ class BenchOrderView(ModelView):
 
 
 def main() -> None:
-    # 1. Asset Budget Check
+    # 1. Dual Asset Budget Check (Core Shell < 18 KB gz, Max Route Page < 24 KB gz)
     pkg_static = Path(__file__).resolve().parents[1] / "src" / "flask_deck" / "static"
     css_gz = len(gzip.compress((pkg_static / "css" / "deck.css").read_bytes(), 9))
-    js_gz = len(gzip.compress((pkg_static / "js" / "deck.js").read_bytes(), 9))
-    total_kb = (css_gz + js_gz) / 1024.0
-    print(f"[Assets] CSS: {css_gz / 1024:.2f} KB gz | JS: {js_gz / 1024:.2f} KB gz | Total: {total_kb:.2f} KB gz")
-    assert total_kb < 24.0, f"Asset budget exceeded: {total_kb:.2f} KB gz"
+    core_js_gz = len(gzip.compress((pkg_static / "js" / "deck.js").read_bytes(), 9))
+    core_kb = (css_gz + core_js_gz) / 1024.0
+    print(
+        f"[Assets Core] CSS: {css_gz / 1024:.2f} KB gz | Core JS: {core_js_gz / 1024:.2f} KB gz "
+        f"| Core Total: {core_kb:.2f} KB gz"
+    )
+    assert core_kb < 18.0, f"Core asset budget exceeded: {core_kb:.2f} KB gz"
+    for route_mod in ("deck-grid.js", "deck-form.js", "deck-ops.js"):
+        mod_path = pkg_static / "js" / route_mod
+        if mod_path.is_file():
+            mod_gz = len(gzip.compress(mod_path.read_bytes(), 9))
+            page_kb = (css_gz + core_js_gz + mod_gz) / 1024.0
+            print(f"[Assets Route] +{route_mod}: {mod_gz / 1024:.2f} KB gz -> Page Total: {page_kb:.2f} KB gz")
+            assert page_kb < 24.0, f"Route page budget exceeded for {route_mod}: {page_kb:.2f} KB gz"
 
     # 2. Seed 2,000 rows
     engine = sa.create_engine(

@@ -24,32 +24,84 @@
 
   <section class="dk-panel">
     <div class="dk-panel-head">
-      <h2 class="dk-panel-title">Step 1 · Upload CSV or JSON for Dry-Run Diff</h2>
+      <h2 class="dk-panel-title">Step 1 · Upload CSV, JSON, or XLSX</h2>
       <span class="dk-mono dk-subtle">Max {{ config.max_import_rows }} rows · {{ config.max_upload_bytes // (1024 * 1024) }} MiB</span>
     </div>
     <form method="post" enctype="multipart/form-data" class="dk-panel-body">
       <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
-      <input type="hidden" name="step" value="preview">
       <div class="dk-form-grid">
         <div class="dk-field">
-          <label for="dk-import-file">Source File (.csv or .json)</label>
-          <input type="file" id="dk-import-file" name="file" accept=".csv,.json,text/csv,application/json" class="dk-input dk-file-input" required>
+          <label for="dk-import-file">Source File (.csv, .json, or .xlsx)</label>
+          <input type="file" id="dk-import-file" name="file" accept=".csv,.json,.xlsx,text/csv,application/json,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="dk-input dk-file-input" required>
         </div>
         <div class="dk-field">
           <label for="dk-upsert-key">Upsert Match Column (optional)</label>
           <select id="dk-upsert-key" name="upsert_key" class="dk-select">
             <option value="">Insert only (always create new rows)</option>
             {% for key_col in upsert_candidates %}
-            <option value="{{ key_col }}"{% if report and report.upsert_key == key_col %} selected{% endif %}>Upsert by {{ key_col }}</option>
+            <option value="{{ key_col }}"{% if (report and report.upsert_key == key_col) or (mapping_ctx and mapping_ctx.upsert_key == key_col) %} selected{% endif %}>Upsert by {{ key_col }}</option>
             {% endfor %}
           </select>
         </div>
       </div>
       <div class="dk-form-actions">
-        <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("eye", 13) }} Run Dry-Run Diff Preview</button>
+        <button type="submit" name="step" value="preview" class="dk-btn dk-btn-primary">{{ deck_icon("eye", 13) }} Run Dry-Run Diff Preview</button>
+        <button type="submit" name="step" value="map" class="dk-btn">{{ deck_icon("columns", 13) }} Map Columns First</button>
       </div>
     </form>
   </section>
+
+  {% if mapping_ctx %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">Column Mapping · {{ mapping_ctx.filename }}</h2>
+        <p class="dk-panel-sub dk-mono">Match uploaded headers to writable {{ view.label }} fields</p>
+      </div>
+    </div>
+    <form method="post" class="dk-panel-body">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <input type="hidden" name="step" value="preview">
+      <input type="hidden" name="stage_token" value="{{ mapping_ctx.stage_token }}">
+      <input type="hidden" name="upsert_key" value="{{ mapping_ctx.upsert_key }}">
+      <div class="dk-table-wrap">
+        <table class="dk-table">
+          <thead>
+            <tr>
+              <th>Uploaded Column</th>
+              <th>Sample Values</th>
+              <th>Target Field</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for hdr in mapping_ctx.headers %}
+            <tr>
+              <td class="dk-mono">
+                <input type="hidden" name="src_header_{{ loop.index0 }}" value="{{ hdr }}">
+                <strong>{{ hdr }}</strong>
+              </td>
+              <td class="dk-mono dk-muted">
+                {% for sr in mapping_ctx.sample_rows %}{{ sr.get(hdr, '') }}{% if not loop.last %} · {% endif %}{% endfor %}
+              </td>
+              <td>
+                <select name="dst_field_{{ loop.index0 }}" class="dk-select dk-mono" aria-label="Target field for {{ hdr }}">
+                  <option value="">-- Skip Column --</option>
+                  {% for wf in mapping_ctx.writable_fields %}
+                  <option value="{{ wf }}"{% if mapping_ctx.auto_map.get(hdr) == wf %} selected{% endif %}>{{ wf }}</option>
+                  {% endfor %}
+                </select>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="dk-form-actions">
+        <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("eye", 13) }} Validate Mapping &amp; Dry-Run Diff</button>
+      </div>
+    </form>
+  </section>
+  {% endif %}
 
   {% if report %}
   <div class="dk-grid">
@@ -77,17 +129,25 @@
         <h2 class="dk-panel-title">Step 2 · Savepoint Diff Preview ({{ report.filename }})</h2>
         <p class="dk-panel-sub dk-mono">Mapped columns: {{ report.mapped_columns | length }} · Zero changes written to DB yet</p>
       </div>
-      {% if report.applicable_count > 0 %}
-      <form method="post" class="dk-toolbar-left">
-        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
-        <input type="hidden" name="step" value="commit">
-        <input type="hidden" name="preview_token" value="{{ report.token }}">
+      <div class="dk-toolbar-left">
         {% if report.errors > 0 %}
-        <label class="dk-pop-item"><input type="checkbox" name="skip_errors" value="1"> Skip {{ report.errors }} errored row(s)</label>
+        <a href="{{ url_for(bp_name ~ '.model_import_errors', slug=view.meta.slug, token=report.token) }}" class="dk-btn dk-btn-sm">{{ deck_icon("download", 12) }} Download Failed Rows CSV</a>
         {% endif %}
-        <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("check", 13) }} Commit {{ report.applicable_count }} Change(s)</button>
-      </form>
-      {% endif %}
+        {% if report.applicable_count > 0 %}
+        <form method="post" class="dk-toolbar-left">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <input type="hidden" name="step" value="commit">
+          <input type="hidden" name="preview_token" value="{{ report.token }}">
+          {% if report.errors > 0 %}
+          <label class="dk-pop-item"><input type="checkbox" name="skip_errors" value="1"> Skip {{ report.errors }} errored row(s)</label>
+          {% endif %}
+          {% if can_view_jobs %}
+          <label class="dk-pop-item"><input type="checkbox" name="async_commit" value="1"> Run as Background Job</label>
+          {% endif %}
+          <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("check", 13) }} Commit {{ report.applicable_count }} Change(s)</button>
+        </form>
+        {% endif %}
+      </div>
     </div>
     <div class="dk-table-wrap">
       <table class="dk-table">
@@ -140,4 +200,7 @@
   </section>
   {% endif %}
 </div>
+{% endblock %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-form.js') }}"></script>
 {% endblock %}

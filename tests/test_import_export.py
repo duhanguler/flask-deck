@@ -152,5 +152,11 @@ def test_json_import_and_size_limits(sa_bundle: tuple[Any, ...]) -> None:
         },
         content_type="multipart/form-data",
     )
-    assert over.status_code == 200
-    assert "exceeds maximum allowed size" in over.get_data(as_text=True)
+    try:
+        assert over.status_code == 200
+        assert "exceeds maximum allowed size" in over.get_data(as_text=True)
+    finally:
+        wsgi_input = over.request.environ.get("wsgi.input")
+        if wsgi_input is not None and hasattr(wsgi_input, "close"):
+            wsgi_input.close()
+        over.close()

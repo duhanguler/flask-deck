@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+from flask_deck._version import __version__
 from flask_deck.adapters.sqlalchemy import (
     FlaskSQLAlchemyAdapter,
     ORMAdapter,
     PureSQLAlchemyAdapter,
 )
-from flask_deck.audit import AuditEntry, AuditStore, InMemoryAuditStore, SQLAlchemyAuditStore
+from flask_deck.api_keys import (
+    APIKeyRecord,
+    APIKeyStore,
+    InMemoryAPIKeyStore,
+    SQLAlchemyAPIKeyStore,
+    api_key_allows,
+    api_key_to_user,
+    build_api_key_record,
+    generate_api_key,
+    hash_api_key,
+)
+from flask_deck.approvals import (
+    ApprovalRequest,
+    ApprovalStore,
+    InMemoryApprovalStore,
+    SQLAlchemyApprovalStore,
+    make_approval_request,
+)
+from flask_deck.audit import (
+    AuditEntry,
+    AuditStore,
+    InMemoryAuditStore,
+    SQLAlchemyAuditStore,
+    compute_audit_entry_hash,
+)
 from flask_deck.auth import (
     AuthProvider,
     BasicAuthProvider,
@@ -32,8 +57,17 @@ from flask_deck.dashboard import (
     TimelineWidget,
     Widget,
 )
-from flask_deck.deck import Deck, PageSpec, run_security_audit
-from flask_deck.events import DeckEvent, DeckEventBus, WebhookSink
+from flask_deck.deck import Deck, PageSpec
+from flask_deck.diagnostics import detect_flask_lens, run_security_audit
+from flask_deck.events import (
+    DeckEvent,
+    DeckEventBus,
+    InMemoryWebhookDeliveryStore,
+    SQLAlchemyWebhookDeliveryStore,
+    WebhookDeliveryRecord,
+    WebhookDeliveryStore,
+    WebhookSink,
+)
 from flask_deck.exceptions import (
     DeckError,
     ImportLimitError,
@@ -58,11 +92,27 @@ from flask_deck.formatters import (
     RelativeTimeFormatter,
 )
 from flask_deck.i18n import BabelTranslator, DictTranslator, Translator
-from flask_deck.jobs import JobBackend, JobContext, JobRecord, ThreadPoolJobBackend
+from flask_deck.importer import (
+    InMemoryPreviewStore,
+    PreviewStore,
+    RedisPreviewStore,
+    SQLAlchemyPreviewStore,
+    format_failed_rows_csv,
+)
+from flask_deck.jobs import (
+    JobBackend,
+    JobContext,
+    JobRecord,
+    ScheduledJobSpec,
+    SQLAlchemyJobBackend,
+    ThreadPoolJobBackend,
+)
+from flask_deck.mcp_server import DeckMCPServer, run_mcp_stdio
 from flask_deck.mfa import (
     InMemoryMFAStore,
     MFAEnrollment,
     MFAStore,
+    SecretCipher,
     SQLAlchemyMFAStore,
     build_otpauth_uri,
     compute_totp,
@@ -78,8 +128,46 @@ from flask_deck.model_view import (
     action,
     pydantic_validator,
 )
-from flask_deck.query import QuickTab
-from flask_deck.sql_console import SQLQueryResult
+from flask_deck.passkeys import (
+    InMemoryPasskeyStore,
+    PasskeyCredential,
+    PasskeyStore,
+    SQLAlchemyPasskeyStore,
+    is_webauthn_available,
+)
+from flask_deck.query import QuickTab, compute_all_aggregates
+from flask_deck.saved_views import (
+    InMemoryRecordNoteStore,
+    InMemorySavedViewStore,
+    RecordNote,
+    RecordNoteStore,
+    SavedViewRecord,
+    SavedViewStore,
+    SQLAlchemyRecordNoteStore,
+    SQLAlchemySavedViewStore,
+    render_safe_markdown,
+)
+from flask_deck.security import (
+    InMemoryRateLimitStore,
+    RateLimitStore,
+    RedisRateLimitStore,
+    SQLAlchemyRateLimitStore,
+)
+from flask_deck.sessions import (
+    InMemorySessionStore,
+    SessionRecord,
+    SessionStore,
+    SQLAlchemySessionStore,
+)
+from flask_deck.sql_console import (
+    InMemorySavedQueryStore,
+    SavedQueryRecord,
+    SavedQueryStore,
+    SQLAlchemySavedQueryStore,
+    SQLQueryResult,
+    build_sql_chart_svg,
+    introspect_engine_schema,
+)
 from flask_deck.sso import OIDCAuthProvider, OIDCProviderConfig
 from flask_deck.storage import (
     FileFieldConfig,
@@ -89,14 +177,25 @@ from flask_deck.storage import (
     StorageBackend,
     StoredFile,
 )
-
-__version__ = "0.3.0"
+from flask_deck.widgets import (
+    CodeWidget,
+    ColorWidget,
+    FormWidget,
+    JSONSchemaWidget,
+    MarkdownFormWidget,
+    SliderWidget,
+    TagInputWidget,
+)
 
 __all__ = [
     "ACCENT_PRESETS",
+    "APIKeyRecord",
+    "APIKeyStore",
     "ActionField",
     "ActionSpec",
     "ActivityWidget",
+    "ApprovalRequest",
+    "ApprovalStore",
     "AuditEntry",
     "AuditStore",
     "AuthProvider",
@@ -109,6 +208,8 @@ __all__ = [
     "CalloutWidget",
     "ChartWidget",
     "CodeFormatter",
+    "CodeWidget",
+    "ColorWidget",
     "CurrencyFormatter",
     "DashboardContext",
     "DateTimeFormatter",
@@ -117,21 +218,34 @@ __all__ = [
     "DeckError",
     "DeckEvent",
     "DeckEventBus",
+    "DeckMCPServer",
     "DeckUser",
     "DictTranslator",
     "FileFieldConfig",
     "FileFormatter",
     "FlaskLoginAuthProvider",
     "FlaskSQLAlchemyAdapter",
+    "FormWidget",
     "Formatter",
     "GaugeWidget",
     "HeatmapWidget",
     "ImageFormatter",
     "ImportLimitError",
+    "InMemoryAPIKeyStore",
+    "InMemoryApprovalStore",
     "InMemoryAuditStore",
     "InMemoryMFAStore",
+    "InMemoryPasskeyStore",
+    "InMemoryPreviewStore",
+    "InMemoryRateLimitStore",
+    "InMemoryRecordNoteStore",
+    "InMemorySavedQueryStore",
+    "InMemorySavedViewStore",
+    "InMemorySessionStore",
+    "InMemoryWebhookDeliveryStore",
     "InlineModelView",
     "InvalidPKError",
+    "JSONSchemaWidget",
     "JobBackend",
     "JobContext",
     "JobRecord",
@@ -140,6 +254,7 @@ __all__ = [
     "LocalFileStorage",
     "MFAEnrollment",
     "MFAStore",
+    "MarkdownFormWidget",
     "MarkdownWidget",
     "MemoryFileStorage",
     "ModelView",
@@ -148,37 +263,83 @@ __all__ = [
     "ORMAdapter",
     "OpenAuthProvider",
     "PageSpec",
+    "PasskeyCredential",
+    "PasskeyStore",
     "PermissionDeniedError",
+    "PreviewStore",
     "ProgressBarFormatter",
     "PureSQLAlchemyAdapter",
     "QuickTab",
     "RBACAccount",
     "RBACAuthProvider",
+    "RateLimitStore",
     "ReadOnlyError",
+    "RecordNote",
+    "RecordNoteStore",
+    "RedisPreviewStore",
+    "RedisRateLimitStore",
     "RelativeTimeFormatter",
     "Role",
     "S3StorageBackend",
+    "SQLAlchemyAPIKeyStore",
+    "SQLAlchemyApprovalStore",
     "SQLAlchemyAuditStore",
+    "SQLAlchemyJobBackend",
     "SQLAlchemyMFAStore",
+    "SQLAlchemyPasskeyStore",
+    "SQLAlchemyPreviewStore",
+    "SQLAlchemyRateLimitStore",
+    "SQLAlchemyRecordNoteStore",
+    "SQLAlchemySavedQueryStore",
+    "SQLAlchemySavedViewStore",
+    "SQLAlchemySessionStore",
+    "SQLAlchemyWebhookDeliveryStore",
     "SQLQueryResult",
+    "SavedQueryRecord",
+    "SavedQueryStore",
+    "SavedViewRecord",
+    "SavedViewStore",
+    "ScheduledJobSpec",
+    "SecretCipher",
     "SecurityConfigurationError",
+    "SessionRecord",
+    "SessionStore",
+    "SliderWidget",
     "StatBarWidget",
     "StorageBackend",
     "StoredFile",
     "TableWidget",
+    "TagInputWidget",
     "ThreadPoolJobBackend",
     "TimelineWidget",
     "Translator",
     "ValidationError",
+    "WebhookDeliveryRecord",
+    "WebhookDeliveryStore",
     "WebhookSink",
     "Widget",
     "__version__",
     "action",
+    "api_key_allows",
+    "api_key_to_user",
+    "build_api_key_record",
     "build_otpauth_uri",
+    "build_sql_chart_svg",
+    "compute_all_aggregates",
+    "compute_audit_entry_hash",
     "compute_totp",
+    "detect_flask_lens",
+    "format_failed_rows_csv",
+    "generate_api_key",
     "generate_totp_secret",
+    "hash_api_key",
+    "introspect_engine_schema",
+    "is_webauthn_available",
+    "make_approval_request",
     "pydantic_validator",
     "render_qr_svg",
+    "render_safe_markdown",
+    "run_mcp_stdio",
     "run_security_audit",
     "verify_totp",
 ]

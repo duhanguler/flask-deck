@@ -11,6 +11,8 @@ from flask_deck.introspection import ModelMeta
 def render_schema_erd_svg(
     metas: Sequence[ModelMeta],
     row_counts: Mapping[str, int],
+    *,
+    model_urls: Mapping[str, str] | None = None,
 ) -> Markup:
     """Render a crisp, strict-CSP pure SVG Entity-Relationship Diagram from frozen ModelMeta."""
     if not metas:
@@ -58,7 +60,7 @@ def render_schema_erd_svg(
 
     parts: list[str] = [
         '<div class="dk-erd-wrap">',
-        f'<svg class="dk-erd-svg" viewBox="0 0 {int(svg_w)} {int(svg_h)}" role="img" aria-label="SQLAlchemy schema relationship diagram">',
+        f'<svg class="dk-erd-svg" data-erd-svg data-base-vb="0 0 {int(svg_w)} {int(svg_h)}" viewBox="0 0 {int(svg_w)} {int(svg_h)}" role="img" aria-label="SQLAlchemy schema relationship diagram">',
         '<defs>'
         '<marker id="dk-erd-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
         '<path d="M 1 1 L 9 5 L 1 9 z" class="dk-erd-arrow-head"/>'
@@ -101,12 +103,18 @@ def render_schema_erd_svg(
     # Draw model table nodes
     for meta, x, y, w, h in node_data:
         count = row_counts.get(meta.slug, 0)
+        target_url = model_urls.get(meta.slug) if model_urls else None
+        title_text = f'<text class="dk-erd-title" x="{x + 10:.1f}" y="{y + 19:.1f}">{escape(meta.name)}</text>'
+        if target_url:
+            title_node = f'<a href="{escape(target_url)}" class="dk-erd-link">{title_text}</a>'
+        else:
+            title_node = title_text
         parts.append(
             f'<g class="dk-erd-node">'
             f'<rect class="dk-erd-card" x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="5"/>'
             f'<rect class="dk-erd-head" x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{header_h:.1f}" rx="5"/>'
             f'<line class="dk-erd-div" x1="{x:.1f}" y1="{y + header_h:.1f}" x2="{x + w:.1f}" y2="{y + header_h:.1f}"/>'
-            f'<text class="dk-erd-title" x="{x + 10:.1f}" y="{y + 19:.1f}">{escape(meta.name)}</text>'
+            f"{title_node}"
             f'<text class="dk-erd-count" x="{x + w - 10:.1f}" y="{y + 19:.1f}" text-anchor="end">{count:,} rows</text>'
         )
         for f_idx, f in enumerate(meta.fields[:max_fields_shown]):

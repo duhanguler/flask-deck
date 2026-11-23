@@ -23,6 +23,7 @@
   <link rel="stylesheet" href="{{ css_href }}">
   {% endfor %}
   <script defer src="{{ asset_url('js/deck.js') }}"></script>
+  {% block extra_scripts %}{% endblock %}
   {% for js_src in brand.extra_js %}
   <script defer src="{{ js_src }}" nonce="{{ csp_nonce }}"></script>
   {% endfor %}
@@ -47,7 +48,7 @@
         {% endif %}
         <span>{{ config.title }}</span>
       </a>
-      <span class="dk-ver dk-mono">v0.3</span>
+      <span class="dk-ver dk-mono">v{{ deck_version_short }}</span>
       {% block breadcrumbs %}
       <span class="dk-crumb-sep">/</span>
       <span class="dk-crumb dk-crumb-cur">{{ page_title or _("Dashboard") }}</span>
@@ -216,11 +217,47 @@
             <span class="dk-nav-left">{{ deck_icon("cpu", 14) }}<span class="dk-nav-label">{{ _("Background Jobs") }}</span></span>
           </a>
           {% endif %}
+          {% if can_view_webhooks %}
+          <a href="{{ url_for(bp_name ~ '.webhooks_list') }}"
+             class="dk-nav-item{% if active_nav == '_webhooks' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Webhooks') }}" data-subtitle="Delivery logs, retries &amp; DLQ">
+            <span class="dk-nav-left">{{ deck_icon("send", 14) }}<span class="dk-nav-label">{{ _("Webhooks") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_view_approvals %}
+          <a href="{{ url_for(bp_name ~ '.approvals_list') }}"
+             class="dk-nav-item{% if active_nav == '_approvals' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Approvals') }}" data-subtitle="Four-eyes maker-checker review queue">
+            <span class="dk-nav-left">{{ deck_icon("check-circle", 14) }}<span class="dk-nav-label">{{ _("Approvals") }}</span></span>
+            {% if pending_approvals_count %}<span class="dk-nav-count dk-mono">{{ pending_approvals_count }}</span>{% endif %}
+          </a>
+          {% endif %}
           {% if can_manage_mfa %}
           <a href="{{ url_for(bp_name ~ '.security_mfa') }}"
              class="dk-nav-item{% if active_nav == '_mfa' %} is-active{% endif %}"
              data-deck-quick-nav data-title="{{ _('2FA Security') }}" data-subtitle="TOTP authenticator &amp; recovery codes">
             <span class="dk-nav-left">{{ deck_icon("shield-check", 14) }}<span class="dk-nav-label">{{ _("2FA Security") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_manage_sessions %}
+          <a href="{{ url_for(bp_name ~ '.security_sessions') }}"
+             class="dk-nav-item{% if active_nav == '_sessions' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Active Sessions') }}" data-subtitle="Device registry &amp; instant revocation">
+            <span class="dk-nav-left">{{ deck_icon("activity", 14) }}<span class="dk-nav-label">{{ _("Active Sessions") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_manage_passkeys %}
+          <a href="{{ url_for(bp_name ~ '.security_passkeys') }}"
+             class="dk-nav-item{% if active_nav == '_passkeys' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('Passkeys') }}" data-subtitle="FIDO2 / WebAuthn hardware &amp; platform keys">
+            <span class="dk-nav-left">{{ deck_icon("key", 14) }}<span class="dk-nav-label">{{ _("Passkeys") }}</span></span>
+          </a>
+          {% endif %}
+          {% if can_manage_api_keys %}
+          <a href="{{ url_for(bp_name ~ '.security_api_keys') }}"
+             class="dk-nav-item{% if active_nav == '_api_keys' %} is-active{% endif %}"
+             data-deck-quick-nav data-title="{{ _('API Keys') }}" data-subtitle="Scoped REST v1 &amp; MCP Bearer tokens">
+            <span class="dk-nav-left">{{ deck_icon("key", 14) }}<span class="dk-nav-label">{{ _("API Keys") }}</span></span>
           </a>
           {% endif %}
           {% if can_view_diagnostics %}
@@ -257,7 +294,8 @@
         </form>
         {% endfor %}
       </div>
-      {% elif impersonate_targets %}
+      {% endif %}
+      {% if impersonate_targets %}
       <div class="dk-role-switcher">
         <div class="dk-role-sw-head dk-mono">
           <span>VIEW AS</span>

@@ -1,0 +1,108 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("Approvals") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ _("Approval Queue") }}</h1>
+    <p class="dk-page-sub">Four-eyes Maker-Checker governance across human operators and AI agents</p>
+  </div>
+  <div class="dk-page-actions">
+    <div class="dk-tabs">
+      {% for st in ['pending', 'approved', 'rejected', 'all'] %}
+      <a href="{{ url_for(bp_name ~ '.approvals_list', status=st, model=model_filter or None) }}"
+         class="dk-tab{% if status_filter == st %} is-active{% endif %}">{{ st | capitalize }}</a>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+{% if requests_list %}
+<div class="dk-content">
+  {% for item in requests_list %}
+  {% set req = item.req %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <div>
+        <span class="dk-badge dk-badge-{{ 'warn' if req.status == 'pending' else ('ok' if req.status == 'approved' else 'danger') }} dk-mono">{{ req.status }}</span>
+        <span class="dk-badge dk-badge-info dk-mono">{{ req.operation }}</span>
+        <strong>{{ req.model_label }}</strong>
+        <span class="dk-muted">· {{ req.record_repr }}</span>
+        <span class="dk-mono dk-subtle">(#{{ req.id }})</span>
+      </div>
+      <div class="dk-page-actions">
+        <span class="dk-badge dk-mono">{{ req.actor_type }}</span>
+        <span class="dk-muted">{{ req.requester_name }}</span>
+        <span class="dk-mono dk-subtle">{{ format_dt(req.created_at, '%Y-%m-%d %H:%M:%S') }}</span>
+      </div>
+    </div>
+    <div class="dk-panel-body">
+      {% if req.reason %}
+      <div class="dk-alert dk-alert-info">
+        <strong>Reason:</strong> {{ req.reason }}
+      </div>
+      {% endif %}
+
+      {% if item.diff %}
+      <div class="dk-diff-list">
+        {% for fname, delta in item.diff.items() %}
+        <div class="dk-diff-row">
+          <span class="dk-diff-key">{{ fname }}:</span>
+          {% if delta.old is not none %}<span class="dk-diff-old">{{ delta.old }}</span>{% endif %}
+          <span class="dk-subtle">→</span>
+          <span class="dk-diff-new">{{ delta.new }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="dk-muted">No structured field diff recorded.</div>
+      {% endif %}
+
+      {% if req.status == 'pending' %}
+        {% if can_review %}
+          {% if req.requester_id == current_user_id %}
+          <div class="dk-toolbar">
+            <span class="dk-badge dk-badge-warn">Awaiting peer reviewer (four-eyes blocks self-approval)</span>
+          </div>
+          {% else %}
+          <div class="dk-toolbar">
+            <form method="post" action="{{ url_for(bp_name ~ '.approval_approve', approval_id=req.id) }}" class="dk-toolbar-left">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <input type="text" name="review_note" class="dk-input" maxlength="500" placeholder="Review note (optional)">
+              <button type="submit" class="dk-btn dk-btn-primary dk-btn-sm">{{ deck_icon("check", 12) }} Approve &amp; Execute</button>
+            </form>
+            <form method="post" action="{{ url_for(bp_name ~ '.approval_reject', approval_id=req.id) }}" class="dk-toolbar-right">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <input type="text" name="review_note" class="dk-input" maxlength="500" placeholder="Rejection reason (optional)">
+              <button type="submit" class="dk-btn dk-btn-danger dk-btn-sm">{{ deck_icon("x", 12) }} Reject</button>
+            </form>
+          </div>
+          {% endif %}
+        {% else %}
+        <div class="dk-toolbar">
+          <span class="dk-badge dk-badge-info">Pending peer review</span>
+        </div>
+        {% endif %}
+      {% else %}
+      <div class="dk-muted dk-mono">
+        Reviewed by {{ req.reviewer_name or 'System' }}
+        {% if req.reviewed_at %} at {{ format_dt(req.reviewed_at, '%Y-%m-%d %H:%M:%S') }}{% endif %}
+        {% if req.review_note %} · Note: "{{ req.review_note }}"{% endif %}
+      </div>
+      {% endif %}
+    </div>
+  </section>
+  {% endfor %}
+</div>
+{% else %}
+<div class="dk-panel">
+  <div class="dk-chart-empty">No approval requests match status "{{ status_filter }}".</div>
+</div>
+{% endif %}
+{% endblock %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-ops.js') }}"></script>
+{% endblock %}

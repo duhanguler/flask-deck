@@ -30,6 +30,7 @@ class DeckConfig:
     default_pagination_mode: PaginationMode = "offset"
     max_upload_bytes: int = 5 * 1024 * 1024  # 5 MiB
     max_import_rows: int = 5000
+    max_sync_import_rows: int = 2000
     max_import_columns: int = 100
     max_json_depth: int = 12
     import_preview_ttl_seconds: int = 900  # 15 minutes
@@ -64,6 +65,16 @@ class DeckConfig:
     csp_img_sources: tuple[str, ...] = ()
     csp_nonce_getter: Callable[[], str] | None = None
     extra_sensitive_patterns: tuple[re.Pattern[str], ...] = field(default_factory=tuple)
+    # v0.4.0 Scale & Security
+    encryption_key: str | None = None
+    encryption_fallback_keys: tuple[str, ...] = ()
+    enable_webhooks_ui: bool = True
+    # v0.4.0 Headless API & MCP Server
+    enable_rest_api: bool = False
+    enable_mcp: bool = False
+    mcp_require_approval: bool = True
+    api_rate_limit_max: int = 120
+    api_rate_limit_window_seconds: int = 60
 
     def __post_init__(self) -> None:
         if self.page_size < 1 or self.page_size > self.max_page_size:

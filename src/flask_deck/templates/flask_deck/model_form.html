@@ -19,10 +19,56 @@
 
 <form method="post" class="dk-content"{% if has_file_fields %} enctype="multipart/form-data"{% endif %} data-deck-form-root{% if view.form_layout == 'wizard' and fieldsets | length > 1 %} data-deck-wizard{% endif %}>
   <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+  <input type="hidden" name="_deck_version" value="{{ occ_version or '' }}">
 
   {% if errors.get('__all__') %}
   <div class="dk-alert dk-alert-danger" role="alert">
     {% for msg in errors['__all__'] %}<div>{{ msg }}</div>{% endfor %}
+  </div>
+  {% endif %}
+
+  {% if occ_conflict %}
+  <section class="dk-panel" aria-label="Optimistic concurrency conflict resolution">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">3-Way Concurrent Edit Conflict</h2>
+      <span class="dk-badge dk-badge-danger dk-mono">HTTP 409</span>
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead>
+          <tr>
+            <th>Field</th>
+            <th>Your Submitted Value</th>
+            <th>Current Database Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in occ_conflict %}
+          <tr>
+            <td><strong>{{ row.label }}</strong> <span class="dk-mono dk-subtle">({{ row.field }})</span></td>
+            <td class="dk-mono">{{ row.submitted }}</td>
+            <td class="dk-mono">{{ row.current }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="dk-panel-body">
+      <label class="dk-checkbox">
+        <input type="checkbox" name="_deck_force_overwrite" value="1">
+        <span>Force overwrite concurrent changes with my submission</span>
+      </label>
+    </div>
+  </section>
+  {% endif %}
+
+  {% if requires_approval_hint %}
+  <div class="dk-alert dk-alert-warn" role="status">
+    <strong>Four-Eyes Approval Required:</strong> Submitting this form validates constraints and queues the mutation in <em>Approvals</em> for peer review instead of writing immediately.
+    <div class="dk-field">
+      <label for="dk-approval-reason">Reason for Approval (optional)</label>
+      <input id="dk-approval-reason" type="text" name="approval_reason" class="dk-input" maxlength="500" placeholder="Context for reviewer">
+    </div>
   </div>
   {% endif %}
 
@@ -78,7 +124,7 @@
         {% for col in fs_cols %}
         {% set spec = field_specs[col] %}
         {% set wtype = spec.widget %}
-        <div class="dk-field{% if spec.kind in ['text', 'json', 'm2m', 'file', 'array'] or wtype in ['markdown', 'json_kv', 'segmented'] %} dk-field-full{% endif %}"
+        <div class="dk-field{% if spec.widget_full or spec.kind in ['text', 'json', 'm2m', 'file', 'array'] or wtype in ['markdown', 'json_kv', 'segmented'] %} dk-field-full{% endif %}"
              {% if spec.show_when_json %}data-show-when="{{ spec.show_when_json }}"{% endif %}>
           <label for="fld_{{ spec.name }}">
             <span>{{ spec.label }}</span>
@@ -90,7 +136,9 @@
             {% endif %}
           </label>
 
-          {% if spec.kind == 'file' %}
+          {% if spec.custom_widget_html is not none %}
+          {{ spec.custom_widget_html }}
+          {% elif spec.kind == 'file' %}
           <div class="dk-dropzone" data-deck-dropzone>
             <div class="dk-dropzone-current">
               {% if spec.media_url and spec.file_kind == 'image' %}
@@ -248,6 +296,9 @@
           {% elif spec.kind == 'date' %}
           <input type="date" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
 
+          {% elif spec.kind == 'time' %}
+          <input type="time" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+
           {% elif spec.kind == 'datetime' %}
           <input type="datetime-local" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
 
@@ -386,4 +437,7 @@
     <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-btn">{{ _("Cancel") }}</a>
   </div>
 </form>
+{% endblock %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-form.js') }}"></script>
 {% endblock %}

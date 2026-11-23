@@ -25,23 +25,26 @@ def test_fail_closed_in_production_without_auth_or_secret() -> None:
     engine = sa.create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
-    SampleBase.metadata.create_all(engine)
+    try:
+        SampleBase.metadata.create_all(engine)
 
-    app_no_auth = Flask(__name__)
-    app_no_auth.config["SECRET_KEY"] = "a" * 40
-    app_no_auth.debug = False
-    app_no_auth.testing = False
+        app_no_auth = Flask(__name__)
+        app_no_auth.config["SECRET_KEY"] = "a" * 40
+        app_no_auth.debug = False
+        app_no_auth.testing = False
 
-    with pytest.raises(SecurityConfigurationError, match="AuthProvider"):
-        Deck(app_no_auth, engine=engine, environment="production")
+        with pytest.raises(SecurityConfigurationError, match="AuthProvider"):
+            Deck(app_no_auth, engine=engine, environment="production")
 
-    app_no_secret = Flask(__name__)
-    app_no_secret.debug = False
-    app_no_secret.testing = False
-    auth = BasicAuthProvider.from_plain_passwords({"admin": "pw"})
+        app_no_secret = Flask(__name__)
+        app_no_secret.debug = False
+        app_no_secret.testing = False
+        auth = BasicAuthProvider.from_plain_passwords({"admin": "pw"})
 
-    with pytest.raises(SecurityConfigurationError, match="secret_key"):
-        Deck(app_no_secret, engine=engine, auth=auth, environment="production")
+        with pytest.raises(SecurityConfigurationError, match="secret_key"):
+            Deck(app_no_secret, engine=engine, auth=auth, environment="production")
+    finally:
+        engine.dispose()
 
 
 def test_rbac_four_levels_masking_scoping_and_matrix(sa_bundle: tuple[Any, ...]) -> None:
@@ -118,19 +121,22 @@ def test_read_only_mode_blocks_all_mutations() -> None:
         allow_insecure_open=True,
         read_only=True,
     )
-    deck.register(Tenant)
+    try:
+        deck.register(Tenant)
 
-    client = app.test_client()
-    page = client.get("/admin/tenants/")
-    assert page.status_code == 200
-    assert "READ-ONLY" in page.get_data(as_text=True)
-    csrf = extract_csrf(page.get_data(as_text=True))
+        client = app.test_client()
+        page = client.get("/admin/tenants/")
+        assert page.status_code == 200
+        assert "READ-ONLY" in page.get_data(as_text=True)
+        csrf = extract_csrf(page.get_data(as_text=True))
 
-    create = client.post(
-        "/admin/tenants/new",
-        data={"_csrf_token": csrf, "name": "Blocked", "slug": "blocked"},
-    )
-    assert create.status_code == 403
+        create = client.post(
+            "/admin/tenants/new",
+            data={"_csrf_token": csrf, "name": "Blocked", "slug": "blocked"},
+        )
+        assert create.status_code == 403
+    finally:
+        deck.close()
 
 
 def test_flask_login_auth_provider_integration() -> None:
@@ -161,10 +167,13 @@ def test_flask_login_auth_provider_integration() -> None:
 
     auth = FlaskLoginAuthProvider(roles=[Role(name="viewer", permissions=frozenset({"*:view"}))])
     deck = Deck(app, engine=engine, auth=auth)
-    deck.register(Tenant)
+    try:
+        deck.register(Tenant)
 
-    client = app.test_client()
-    assert client.get("/admin/").status_code == 403
+        client = app.test_client()
+        assert client.get("/admin/").status_code == 403
 
-    client.get("/force-login")
-    assert client.get("/admin/tenants/").status_code == 200
+        client.get("/force-login")
+        assert client.get("/admin/tenants/").status_code == 200
+    finally:
+        deck.close()

@@ -22,15 +22,31 @@
     <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(trashed=(None if trashed else '1'), page=1, after=None, before=None) }}"
        class="dk-btn{% if trashed %} dk-btn-primary{% endif %}">
       {{ deck_icon("archive", 13) }} {{ _("Trash") }}
+      {% if view.count_mode != 'none' %}
       <span class="dk-tab-count dk-mono dk-tabular">{{ result.trashed_count }}</span>
+      {% endif %}
     </a>
     {% endif %}
-    {% if supports_kanban and not trashed %}
+    {% if (supports_kanban or supports_calendar or supports_gallery or supports_tree) and not trashed %}
     <div class="dk-seg" role="group" aria-label="View mode">
       <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='table', after=None, before=None) }}"
          class="dk-seg-btn{% if view_mode == 'table' %} is-active{% endif %}">{{ deck_icon("table", 12) }} {{ _("Table") }}</a>
+      {% if supports_kanban %}
       <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='board', after=None, before=None) }}"
          class="dk-seg-btn{% if view_mode == 'board' %} is-active{% endif %}">{{ deck_icon("kanban", 12) }} {{ _("Board") }}</a>
+      {% endif %}
+      {% if supports_calendar %}
+      <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='calendar', after=None, before=None) }}"
+         class="dk-seg-btn{% if view_mode == 'calendar' %} is-active{% endif %}">{{ deck_icon("calendar", 12) }} {{ _("Calendar") }}</a>
+      {% endif %}
+      {% if supports_gallery %}
+      <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='gallery', after=None, before=None) }}"
+         class="dk-seg-btn{% if view_mode == 'gallery' %} is-active{% endif %}">{{ deck_icon("eye", 12) }} {{ _("Gallery") }}</a>
+      {% endif %}
+      {% if supports_tree %}
+      <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='tree', after=None, before=None) }}"
+         class="dk-seg-btn{% if view_mode == 'tree' %} is-active{% endif %}">{{ deck_icon("git-branch", 12) }} {{ _("Tree") }}</a>
+      {% endif %}
     </div>
     {% endif %}
     {% if can_import %}
@@ -43,6 +59,7 @@
         <a class="dk-pop-item" href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='csv') }}{{ qs() }}">{{ deck_icon("file-text", 13) }} Export CSV</a>
         <a class="dk-pop-item" href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='json') }}{{ qs() }}">{{ deck_icon("file-text", 13) }} Export JSON</a>
         <a class="dk-pop-item" href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='jsonl') }}{{ qs() }}">{{ deck_icon("file-text", 13) }} Export JSONL</a>
+        <a class="dk-pop-item" href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='xlsx') }}{{ qs() }}">{{ deck_icon("file-text", 13) }} Export XLSX</a>
         {% if can_view_jobs %}
         <form method="post" action="{{ url_for(bp_name ~ '.model_export_async', slug=view.meta.slug) }}">
           <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
@@ -79,7 +96,9 @@
     {% else %}
     <span>{{ tab.label }}</span>
     {% endif %}
+    {% if tab.key in result.tab_counts %}
     <span class="dk-tab-count dk-mono dk-tabular">{{ "{:,}".format(result.tab_counts.get(tab.key, 0)) }}</span>
+    {% endif %}
   </a>
   {% endfor %}
 </div>
@@ -89,7 +108,7 @@
   <form method="get" action="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-toolbar-left">
     {% if trashed %}<input type="hidden" name="trashed" value="1">{% endif %}
     {% if active_tab %}<input type="hidden" name="tab" value="{{ active_tab }}">{% endif %}
-    {% if view_mode == 'board' %}<input type="hidden" name="view" value="board">{% endif %}
+    {% if view_mode != 'table' %}<input type="hidden" name="view" value="{{ view_mode }}">{% endif %}
     {% for fk, fv in result.active_filters.items() %}
     <input type="hidden" name="f_{{ fk }}" value="{{ fv }}">
     {% endfor %}
@@ -111,8 +130,42 @@
       {{ deck_icon("filter", 13) }} {{ _("Filters") }}{% if result.active_filters %} ({{ result.active_filters | length }}){% endif %}
     </button>
     {% endif %}
-    <button type="button" class="dk-btn" data-deck-save-view data-model-slug="{{ view.meta.slug }}" title="Save current filter slice">
-      {{ deck_icon("bookmark", 13) }} {{ _("Save View") }}
+    {% if can_save_views %}
+    <div class="dk-popover-wrap">
+      <button type="button" class="dk-btn" data-deck-toggle="dk-save-view-pop" title="Save view to server">
+        {{ deck_icon("bookmark", 13) }} {{ _("Save Shared View") }}
+      </button>
+      <div class="dk-popover" id="dk-save-view-pop" hidden="hidden">
+        <form method="post" action="{{ url_for(bp_name ~ '.api_saved_views', slug=view.meta.slug) }}" class="dk-content">
+          <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+          <input type="hidden" name="query_string" value="{{ current_query_string }}">
+          <div class="dk-field">
+            <label for="dk-sv-name">View Name</label>
+            <input id="dk-sv-name" type="text" name="name" class="dk-input" required maxlength="120" placeholder="High priority slice">
+          </div>
+          <div class="dk-field">
+            <label for="dk-sv-scope">Scope</label>
+            <select id="dk-sv-scope" name="scope" class="dk-select">
+              <option value="personal">Personal</option>
+              {% if can_manage_shared_views %}
+              <option value="team">Team (shared)</option>
+              <option value="role">Role Default</option>
+              {% endif %}
+            </select>
+          </div>
+          {% if can_manage_shared_views %}
+          <div class="dk-field">
+            <label for="dk-sv-role">Role (if Role Default)</label>
+            <input id="dk-sv-role" type="text" name="default_for_role" class="dk-input" maxlength="64" placeholder="support">
+          </div>
+          {% endif %}
+          <button type="submit" class="dk-btn dk-btn-primary dk-btn-sm">Save View</button>
+        </form>
+      </div>
+    </div>
+    {% endif %}
+    <button type="button" class="dk-btn" data-deck-save-view data-model-slug="{{ view.meta.slug }}" title="Save current filter slice in browser">
+      {{ deck_icon("bookmark", 13) }} {{ _("Quick Bookmark") }}
     </button>
     {% if view_mode == 'table' %}
     <button type="button" class="dk-btn dk-btn-icon" data-deck-density-toggle title="Toggle Compact / Comfortable density" aria-label="Toggle row density">
@@ -133,11 +186,31 @@
   </div>
 </div>
 
-<!-- Saved Filter Views Strip (Declarative + Browser-Persisted) -->
-<div class="dk-saved-bar" id="dk-saved-views-bar" data-deck-saved-views data-model-slug="{{ view.meta.slug }}" data-base-url="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}"{% if not view.saved_views %} hidden="hidden"{% endif %}>
+{% if active_role_default_view %}
+<div class="dk-alert dk-alert-info">
+  <span>Showing role default view <strong>{{ active_role_default_view.name }}</strong> (role: <code>{{ active_role_default_view.default_for_role }}</code>).</span>
+  <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug, _no_default='1') }}" class="dk-btn dk-btn-sm">Clear Default View</a>
+</div>
+{% endif %}
+
+<!-- Saved Filter Views Strip (Declarative + Server-Backed + Browser-Persisted) -->
+<div class="dk-saved-bar" id="dk-saved-views-bar" data-deck-saved-views data-model-slug="{{ view.meta.slug }}" data-base-url="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}"{% if not view.saved_views and not saved_views_records %} hidden="hidden"{% endif %}>
   <span class="dk-subtle dk-mono">Views:</span>
   {% for sv_label, sv_qs in view.saved_views %}
   <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ sv_qs }}" class="dk-filter-chip">{{ deck_icon("bookmark", 11) }} {{ sv_label }}</a>
+  {% endfor %}
+  {% for sv in saved_views_records %}
+  <span class="dk-filter-chip">
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{% if sv.query_string %}?{{ sv.query_string }}{% endif %}">
+      {{ deck_icon("bookmark", 11) }} {{ sv.name }} <span class="dk-badge dk-mono">{{ sv.scope }}</span>
+    </a>
+    {% if is_superuser or sv.owner_id == current_user_id %}
+    <form method="post" action="{{ url_for(bp_name ~ '.api_saved_view_delete', slug=view.meta.slug, view_id=sv.id) }}">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <button type="submit" class="dk-btn dk-btn-ghost dk-btn-sm" aria-label="Delete saved view">{{ deck_icon("x", 11) }}</button>
+    </form>
+    {% endif %}
+  </span>
   {% endfor %}
   <span id="dk-saved-custom-host" class="dk-chip-group"></span>
 </div>
@@ -147,7 +220,7 @@
   {% if trashed %}<input type="hidden" name="trashed" value="1">{% endif %}
   {% if search_term %}<input type="hidden" name="q" value="{{ search_term }}">{% endif %}
   {% if active_tab %}<input type="hidden" name="tab" value="{{ active_tab }}">{% endif %}
-  {% if view_mode == 'board' %}<input type="hidden" name="view" value="board">{% endif %}
+  {% if view_mode != 'table' %}<input type="hidden" name="view" value="{{ view_mode }}">{% endif %}
   {% for f in filter_specs %}
   <div class="dk-filter-group">
     <label for="f_{{ f.name }}">{{ f.label }}</label>
@@ -279,7 +352,7 @@
           {% for cf in kanban_card_fields %}
           <div class="dk-kanban-field">
             <span class="dk-subtle">{{ view.get_column_label(cf) }}</span>
-            <span>{{ view.format_cell(cf, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}</span>
+            <span>{{ view.format_cell(cf, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}</span>
           </div>
           {% endfor %}
         </div>
@@ -289,6 +362,109 @@
     </div>
   </section>
   {% endfor %}
+</div>
+{% elif view_mode == 'calendar' %}
+<!-- Monthly Calendar View -->
+<div class="dk-toolbar">
+  <div class="dk-toolbar-left">
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='calendar', month=calendar_data.prev_month) }}" class="dk-btn dk-btn-sm">{{ deck_icon("chevron-left", 13) }} Prev</a>
+    <strong class="dk-mono">{{ calendar_data.month_label }}</strong>
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(view='calendar', month=calendar_data.next_month) }}" class="dk-btn dk-btn-sm">Next {{ deck_icon("chevron-right", 13) }}</a>
+  </div>
+  <span class="dk-subtle dk-mono">Field: {{ view.get_column_label(calendar_date_field) }}</span>
+</div>
+<div class="dk-content">
+  <div class="dk-cal-grid">
+    {% for wd in ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] %}
+    <div class="dk-cal-head dk-mono">{{ wd }}</div>
+    {% endfor %}
+    {% for week in calendar_data.weeks %}
+      {% for cell in week %}
+      <div class="dk-cal-cell{% if not cell.in_month %} is-muted{% endif %}{% if cell.is_today %} is-today{% endif %}">
+        <div class="dk-cal-day dk-mono dk-tabular">{{ cell.day }}</div>
+        {% for obj in cell['items'][:6] %}
+        {% set pk_str = encode_pk(extract_pk(obj, view.meta)) %}
+        <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-cal-item">
+          {{ (obj | attr(calendar_title_field)) if calendar_title_field else view.format_record_repr(obj, auth=deck.auth, user=current_user) }}
+        </a>
+        {% endfor %}
+      </div>
+      {% endfor %}
+    {% endfor %}
+  </div>
+</div>
+{% elif view_mode == 'gallery' %}
+<!-- Visual Gallery Cards View -->
+<div class="dk-content">
+  <div class="dk-gallery-grid">
+    {% for obj in result.items %}
+    {% set pk_str = encode_pk(extract_pk(obj, view.meta)) %}
+    {% set murl = media_url_builder(gallery_media_field, obj) %}
+    <article class="dk-gallery-card">
+      <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-gallery-media">
+        {% if murl %}
+        <img src="{{ murl }}" alt="{{ view.format_record_repr(obj, auth=deck.auth, user=current_user) }}" class="dk-gallery-img">
+        {% else %}
+        <div class="dk-gallery-placeholder">{{ deck_icon(view.icon, 24) }}</div>
+        {% endif %}
+      </a>
+      <div class="dk-gallery-body">
+        <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-kanban-title">
+          {{ view.format_record_repr(obj, auth=deck.auth, user=current_user) }}
+        </a>
+        {% if gallery_subtitle_field %}
+        <div class="dk-subtle">{{ view.format_cell(gallery_subtitle_field, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}</div>
+        {% endif %}
+        <div class="dk-row-actions">
+          <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn dk-btn-sm">View</a>
+          {% if can_edit %}<a href="{{ url_for(bp_name ~ '.model_edit', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn dk-btn-sm">Edit</a>{% endif %}
+        </div>
+      </div>
+    </article>
+    {% else %}
+    <div class="dk-chart-empty">No {{ view.plural_label | lower }} match the current criteria.</div>
+    {% endfor %}
+  </div>
+</div>
+{% elif view_mode == 'tree' %}
+<!-- Hierarchical Self-Referential Tree View -->
+<div class="dk-table-wrap">
+  <table class="dk-table">
+    <thead>
+      <tr>
+        {% for col in visible_cols %}<th>{{ view.get_column_label(col) }}</th>{% endfor %}
+        <th class="dk-td-actions">{{ _("Actions") }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for node in tree_nodes %}
+      {% set obj = node.obj %}
+      {% set pk_str = encode_pk(extract_pk(obj, view.meta)) %}
+      <tr>
+        {% for col in visible_cols %}
+        <td>
+          {% if loop.first %}
+          <span class="dk-tree-indent {{ node.depth_cls }}">{{ deck_icon("folder" if node.has_children else "chevron-right", 12) }}</span>
+          <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-mono">
+            {{ view.format_cell(tree_title_field or col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
+          </a>
+          {% else %}
+          {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
+          {% endif %}
+        </td>
+        {% endfor %}
+        <td class="dk-td-actions">
+          <div class="dk-row-actions">
+            <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn dk-btn-ghost dk-btn-icon" aria-label="View {{ pk_str }}">{{ deck_icon("eye", 14) }}</a>
+            {% if can_edit %}<a href="{{ url_for(bp_name ~ '.model_edit', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-btn dk-btn-ghost dk-btn-icon" aria-label="Edit {{ pk_str }}">{{ deck_icon("edit", 14) }}</a>{% endif %}
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="{{ visible_cols | length + 1 }}" class="dk-chart-empty">No hierarchical {{ view.plural_label | lower }} found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </div>
 {% else %}
 <!-- Precision Hairline Data Table -->
@@ -339,7 +515,7 @@
                     data-field="{{ col }}"
                     data-next="{{ 'false' if cur_val else 'true' }}"
                     title="Click to toggle {{ col }}">
-              {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}
+              {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
             </button>
             {% elif fmeta.field_type == 'enum' %}
             {% set cur_enum = cur_val.value if (cur_val is not none and cur_val.value is defined) else cur_val %}
@@ -352,15 +528,26 @@
               <option value="{{ val }}"{% if cur_enum|string == val %} selected{% endif %}>{{ lbl }}</option>
               {% endfor %}
             </select>
+            {% elif fmeta.field_type in ['string', 'integer', 'float', 'decimal', 'date'] %}
+            {% set raw_edit_val = cur_val.isoformat() if (fmeta.field_type == 'date' and cur_val is not none) else (cur_val if cur_val is not none else '') %}
+            <input type="{{ 'number' if fmeta.field_type in ['integer', 'float', 'decimal'] else ('date' if fmeta.field_type == 'date' else 'text') }}"
+                   {% if fmeta.field_type in ['float', 'decimal'] %}step="any"{% endif %}
+                   class="dk-input dk-inline-input dk-mono"
+                   aria-label="Quick edit {{ col }}"
+                   value="{{ raw_edit_val }}"
+                   data-prev-val="{{ raw_edit_val }}"
+                   data-deck-quick-input
+                   data-url="{{ url_for(bp_name ~ '.api_quick_edit', slug=view.meta.slug, raw_pk=pk_str) }}"
+                   data-field="{{ col }}">
             {% else %}
-            {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}
+            {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
             {% endif %}
           {% elif (loop.first and col not in view.file_fields) or (loop.index == 2 and visible_cols[0] in view.file_fields) %}
           <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-mono">
-            {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}
+            {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
           </a>
           {% else %}
-          {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr) }}
+          {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
           {% endif %}
         </td>
         {% endfor %}
@@ -372,6 +559,15 @@
               <button type="submit" class="dk-btn dk-btn-sm">{{ deck_icon("rotate-ccw", 12) }} {{ _("Restore") }}</button>
             </form>
             {% else %}
+            {% for act in row_actions %}
+            <form method="post" action="{{ url_for(bp_name ~ '.model_action', slug=view.meta.slug, action_name=act.name) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <input type="hidden" name="selected_pks" value="{{ pk_str }}">
+              <button type="submit"
+                      class="dk-btn dk-btn-sm{% if act.variant == 'danger' %} dk-btn-danger{% endif %}"
+                      {% if act.confirm %}data-deck-confirm-form data-confirm-title="{{ act.label }}" data-confirm-msg="Apply '{{ act.label }}' to {{ pk_str }}?"{% endif %}>{{ act.label }}</button>
+            </form>
+            {% endfor %}
             <button type="button"
                     class="dk-btn dk-btn-ghost dk-btn-icon"
                     title="Quick Peek Drawer (Space)"
@@ -400,18 +596,18 @@
       </tr>
       {% endfor %}
     </tbody>
-    {% if page_aggregates %}
+    {% if aggregates_display %}
     <tfoot>
       <tr class="dk-tfoot-row dk-mono dk-tabular">
         <td></td>
         {% for col in visible_cols %}
         <td data-col="{{ col }}">
-          {% if col in page_aggregates %}
-          {% set agg_op, agg_val = page_aggregates[col] %}
+          {% if col in aggregates_display %}
+          {% set agg_op, agg_disp = aggregates_display[col] %}
           <span class="dk-subtle">{{ agg_op }}:</span>
-          <strong>{{ "{:,.2f}".format(agg_val / 100.0) if col.endswith('_cents') else ("{:,.1f}".format(agg_val)) }}</strong>
+          <strong>{{ agg_disp }}</strong>
           {% elif loop.first %}
-          <span class="dk-subtle">{{ _("Page Summary") }}</span>
+          <span class="dk-subtle">{{ _("All Filtered Summary") if view.aggregate_scope == 'all' else _("Page Summary") }}</span>
           {% endif %}
         </td>
         {% endfor %}
@@ -421,7 +617,8 @@
     {% endif %}
   </table>
 </div>
-
+{% endif %}
+{% if view_mode in ['table', 'gallery'] %}
 <div class="dk-pagination dk-mono dk-tabular">
   {% if result.pagination_mode == 'cursor' %}
   <span>Cursor stream · {{ result.items | length }} rows{% if result.total_known %} · {% if result.total_is_estimated %}~{% endif %}{{ "{:,}".format(result.total) }} total{% endif %} · j/k navigate</span>
@@ -460,7 +657,29 @@
   {% if can_export %}
   <a class="dk-btn dk-btn-sm" data-deck-export-selected data-base-href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='csv', trashed=('1' if trashed else None)) }}">Export CSV</a>
   {% endif %}
-  {% if not trashed %}
+  {% if trashed %}
+  {% if can_edit %}
+  <button type="button"
+          class="dk-btn dk-btn-sm dk-btn-primary"
+          data-deck-bulk-action
+          data-url="{{ url_for(bp_name ~ '.model_action', slug=view.meta.slug, action_name='restore') }}"
+          data-label="Restore Selected"
+          data-confirm="true">
+    {{ deck_icon("rotate-ccw", 12) }} {{ _("Restore") }}
+  </button>
+  {% endif %}
+  {% if can_force_delete %}
+  <button type="button"
+          class="dk-btn dk-btn-sm dk-btn-danger"
+          data-deck-bulk-action
+          data-url="{{ url_for(bp_name ~ '.model_action', slug=view.meta.slug, action_name='force_delete') }}"
+          data-label="Force Delete Selected"
+          data-confirm="true"
+          {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="DELETE {n}"{% endif %}>
+    {{ deck_icon("trash", 12) }} Force Delete
+  </button>
+  {% endif %}
+  {% else %}
   {% for act in bulk_actions %}
   <button type="button"
           class="dk-btn dk-btn-sm{% if act.variant == 'danger' %} dk-btn-danger{% endif %}"
@@ -473,8 +692,7 @@
     {{ deck_icon(act.icon, 12) }} {{ act.label }}
   </button>
   {% endfor %}
-  {% endif %}
-  {% if can_delete and not trashed %}
+  {% if can_delete %}
   <button type="button"
           class="dk-btn dk-btn-sm dk-btn-danger"
           data-deck-bulk-action
@@ -485,5 +703,9 @@
     {{ deck_icon("trash", 12) }} {{ _("Delete") }}
   </button>
   {% endif %}
+  {% endif %}
 </div>
+{% endblock %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-grid.js') }}"></script>
 {% endblock %}

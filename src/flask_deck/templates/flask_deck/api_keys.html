@@ -1,0 +1,118 @@
+{% extends "flask_deck/base.html" %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-ops.js') }}"></script>
+{% endblock %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("API Keys") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ _("Scoped API Keys") }}</h1>
+    <p class="dk-page-sub">Bearer tokens for headless REST API v1 and AI-Agent MCP endpoints (SHA-256 hashed at rest).</p>
+  </div>
+</div>
+
+<div class="dk-content">
+  {% if new_plaintext %}
+  <div class="dk-alert dk-alert-warn" role="alert">
+    <strong>Copy this API key now — it will never be displayed again:</strong>
+    <div><code class="dk-code" data-deck-new-api-key>{{ new_plaintext }}</code></div>
+  </div>
+  {% endif %}
+
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">Create API Key</h2>
+    </div>
+    <div class="dk-panel-body">
+      <form method="post" action="{{ url_for(bp_name ~ '.security_api_keys_create') }}" class="dk-content">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+        <div class="dk-grid">
+          <div class="dk-field dk-span-4">
+            <label for="dk-key-name">Key Name</label>
+            <input id="dk-key-name" type="text" name="name" class="dk-input" required maxlength="120" placeholder="claude-agent-ops">
+          </div>
+          <div class="dk-field dk-span-4">
+            <label for="dk-key-scopes">Scopes (comma-separated patterns)</label>
+            <input id="dk-key-scopes" type="text" name="scopes" class="dk-input dk-mono" value="*:view">
+          </div>
+          <div class="dk-field dk-span-4">
+            <label for="dk-key-roles">Effective Roles (comma-separated)</label>
+            <input id="dk-key-roles" type="text" name="roles" class="dk-input dk-mono" value="{{ available_roles[0] if available_roles else 'viewer' }}">
+          </div>
+          <div class="dk-field dk-span-4">
+            <label for="dk-key-ips">Allowed IPs / CIDR (optional)</label>
+            <input id="dk-key-ips" type="text" name="allowed_ips" class="dk-input dk-mono" placeholder="127.0.0.1, 10.0.0.0/8">
+          </div>
+          <div class="dk-field dk-span-4">
+            <label for="dk-key-ttl">Expiration (days, optional)</label>
+            <input id="dk-key-ttl" type="number" min="1" max="3650" name="ttl_days" class="dk-input dk-mono" placeholder="90">
+          </div>
+          {% if can_grant_superuser %}
+          <div class="dk-field dk-span-4">
+            <label class="dk-checkbox">
+              <input type="checkbox" name="is_superuser" value="1">
+              <span>Grant superuser bypass (use with caution)</span>
+            </label>
+          </div>
+          {% endif %}
+        </div>
+        <div>
+          <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("key", 13) }} Generate API Key</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <div class="dk-table-wrap">
+    <table class="dk-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Prefix</th>
+          <th>Scopes</th>
+          <th>Roles</th>
+          <th>Status</th>
+          <th>Last Used</th>
+          <th class="dk-td-actions">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for rec in keys %}
+        <tr>
+          <td><strong>{{ rec.name }}</strong></td>
+          <td class="dk-mono">{{ rec.prefix }}…</td>
+          <td class="dk-mono">{{ rec.scopes | join(", ") }}</td>
+          <td class="dk-mono">{{ rec.roles | join(", ") }}</td>
+          <td>
+            <span class="dk-badge dk-badge-{{ 'ok' if rec.is_active else 'danger' }} dk-mono">
+              {{ "ACTIVE" if rec.is_active else ("REVOKED" if rec.revoked_at else "EXPIRED") }}
+            </span>
+          </td>
+          <td class="dk-mono dk-subtle">{{ format_dt(rec.last_used_at) if rec.last_used_at else "Never" }}</td>
+          <td class="dk-td-actions">
+            {% if rec.is_active %}
+            <form method="post" action="{{ url_for(bp_name ~ '.security_api_keys_revoke', key_id=rec.id) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger" data-deck-confirm-form
+                      data-confirm-title="Revoke API Key"
+                      data-confirm-msg="Immediately invalidate {{ rec.name }} ({{ rec.prefix }}...)?">
+                {{ deck_icon("trash", 12) }} Revoke
+              </button>
+            </form>
+            {% else %}
+            <span class="dk-null">—</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="dk-chart-empty">No API keys created yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

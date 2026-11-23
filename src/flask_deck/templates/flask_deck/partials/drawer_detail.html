@@ -3,6 +3,7 @@
     <button type="button" class="dk-tab is-active" data-deck-drawer-tab="fields">Overview</button>
     <button type="button" class="dk-tab" data-deck-drawer-tab="relations">Relations <span class="dk-tab-count dk-mono">{{ relations_display | length }}</span></button>
     <button type="button" class="dk-tab" data-deck-drawer-tab="history">Audit <span class="dk-tab-count dk-mono">{{ history | length }}</span></button>
+    <button type="button" class="dk-tab" data-deck-drawer-tab="notes">Notes <span class="dk-tab-count dk-mono">{{ record_notes | length }}</span></button>
   </div>
 
   <div data-deck-drawer-panel="fields">
@@ -36,7 +37,13 @@
         <label>{{ rel.label }} <span class="dk-tab-count dk-mono">{{ rel.count }}</span></label>
         {% if rel.records %}
         <div class="dk-chip-group">
-          {% for it in rel.records %}<span class="dk-chip">{{ it }}</span>{% endfor %}
+          {% for it in rel.records %}
+            {% if it.href %}
+            <a class="dk-chip dk-link" href="{{ it.href }}">{{ it.label }}</a>
+            {% else %}
+            <span class="dk-chip">{{ it.label }}</span>
+            {% endif %}
+          {% endfor %}
         </div>
         {% else %}
         <span class="dk-null">None</span>
@@ -89,5 +96,34 @@
     {% else %}
     <div class="dk-chart-empty">No recorded audit history for this record.</div>
     {% endfor %}
+  </div>
+
+  <div data-deck-drawer-panel="notes" hidden="hidden">
+    <div class="dk-panel-body">
+      {% if can_write_notes %}
+      <form method="post" action="{{ url_for(bp_name ~ '.api_record_notes', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-content">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+        <textarea name="body" rows="2" class="dk-input" maxlength="4000" required placeholder="Add internal note..."></textarea>
+        <div class="dk-toolbar">
+          <label class="dk-checkbox"><input type="checkbox" name="pinned" value="1"> <span>Pin</span></label>
+          <button type="submit" class="dk-btn dk-btn-primary dk-btn-sm">{{ deck_icon("plus", 11) }} Add Note</button>
+        </div>
+      </form>
+      {% endif %}
+      {% for note in record_notes %}
+      <div class="dk-activity-row">
+        <div class="dk-activity-main">
+          <div>
+            {% if note.pinned %}<span class="dk-badge dk-badge-warn dk-mono">PINNED</span>{% endif %}
+            <strong>{{ note.author_name }}</strong>
+            <span class="dk-mono dk-subtle">{{ format_dt(note.created_at, '%m-%d %H:%M') }}</span>
+          </div>
+          <div>{{ render_note_md(note.body) }}</div>
+        </div>
+      </div>
+      {% else %}
+      <div class="dk-chart-empty">No notes recorded for this record.</div>
+      {% endfor %}
+    </div>
   </div>
 </div>

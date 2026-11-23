@@ -23,12 +23,15 @@ from flask_deck import (
     DeckUser,
     InlineModelView,
     InMemoryAuditStore,
+    InMemorySessionStore,
     ModelView,
     QuickTab,
     RBACAuthProvider,
     Role,
     action,
 )
+from flask_deck.approvals import InMemoryApprovalStore
+from flask_deck.saved_views import InMemoryRecordNoteStore, InMemorySavedViewStore
 
 _CSRF_RE = re.compile(r'name="_csrf_token"\s+value="([^"]+)"|name="deck-csrf"\s+content="([^"]+)"')
 
@@ -321,10 +324,15 @@ def sa_bundle() -> Iterator[tuple[Flask, Deck, Engine, sessionmaker[Any], InMemo
         engine=engine,
         auth=auth,
         audit_store=audit_store,
+        session_store=InMemorySessionStore(),
+        approval_store=InMemoryApprovalStore(),
+        saved_view_store=InMemorySavedViewStore(),
+        note_store=InMemoryRecordNoteStore(),
         title="Test Deck",
     )
     deck.register(Tenant, Tag, ItemView, CompositeMembership)
     yield app, deck, engine, SessionLocal, audit_store
+    deck.close()
     engine.dispose()
 
 
@@ -351,6 +359,7 @@ def fsa_app() -> Iterator[tuple[Flask, SQLAlchemy, Deck]]:
     deck = Deck(app, db, allow_insecure_open=True, title="FSA Deck")
     deck.register(WidgetModel)
     yield app, db, deck
+    deck.close()
     with app.app_context():
         db.session.remove()
         db.engine.dispose()

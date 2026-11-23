@@ -908,13 +908,16 @@ def test_formatters_charts_i18n_edge_cases_and_example_app() -> None:
     from examples.pure_sqlalchemy_app import create_app as create_example_app
 
     example_app = create_example_app()
-    example_app.config["TESTING"] = True
-    ex_client = example_app.test_client()
-    tok = login_as(ex_client, "admin", "super-secret-password")
-    assert ex_client.get("/admin/api-keys/").status_code == 200
-    r_create = ex_client.post(
-        "/admin/api-keys/new",
-        data={"_csrf_token": tok, "name": "CI Key", "prefix": "dk_ci", "is_active": "true"},
-        follow_redirects=False,
-    )
-    assert r_create.status_code == 302
+    try:
+        example_app.config["TESTING"] = True
+        ex_client = example_app.test_client()
+        tok = login_as(ex_client, "admin", "super-secret-password")
+        assert ex_client.get("/admin/api-keys/").status_code == 200
+        r_create = ex_client.post(
+            "/admin/api-keys/new",
+            data={"_csrf_token": tok, "name": "CI Key", "prefix": "dk_ci", "is_active": "true"},
+            follow_redirects=False,
+        )
+        assert r_create.status_code == 302
+    finally:
+        example_app.extensions["flask_deck"]["deck"].close()

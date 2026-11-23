@@ -28,16 +28,115 @@
 
     <form method="post" class="dk-panel-body">
       <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <div class="dk-toolbar-left">
+        <label for="dk-sql-bind" class="dk-subtle dk-mono">Bind:</label>
+        <select id="dk-sql-bind" name="bind_key" class="dk-select dk-mono">
+          {% for bk, blbl in bind_options %}
+          <option value="{{ bk }}"{% if selected_bind == bk %} selected{% endif %}>{{ blbl }}</option>
+          {% endfor %}
+        </select>
+        <label for="dk-sql-chart" class="dk-subtle dk-mono">Chart:</label>
+        <select id="dk-sql-chart" name="chart_type" class="dk-select dk-mono">
+          <option value="bar"{% if chart_type == 'bar' %} selected{% endif %}>Bar Chart</option>
+          <option value="line"{% if chart_type == 'line' %} selected{% endif %}>Line Chart</option>
+          <option value="table"{% if chart_type == 'table' %} selected{% endif %}>Table Only</option>
+        </select>
+      </div>
       <div class="dk-field">
         <textarea id="dk-sql-editor" name="sql" class="dk-textarea dk-mono dk-sql-editor" rows="5" placeholder="SELECT id, name FROM ... LIMIT 25">{{ sql_text }}</textarea>
       </div>
       <div class="dk-form-actions">
         <button type="submit" name="output" value="table" class="dk-btn dk-btn-primary">{{ deck_icon("play", 12) }} Run Query</button>
+        <button type="submit" name="output" value="explain" class="dk-btn">{{ deck_icon("terminal", 12) }} Explain Plan</button>
         <button type="submit" name="output" value="csv" class="dk-btn">{{ deck_icon("download", 13) }} Run &amp; Export CSV</button>
         <span class="dk-subtle dk-mono">Every execution is audited in the Audit Ledger.</span>
       </div>
     </form>
   </section>
+
+  {% if can_save_queries %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">Save &amp; Pin to Dashboard</h2>
+    </div>
+    <form method="post" action="{{ url_for(bp_name ~ '.sql_save') }}" class="dk-panel-body">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <input type="hidden" name="sql" value="{{ sql_text }}">
+      <input type="hidden" name="bind_key" value="{{ selected_bind }}">
+      <input type="hidden" name="chart_type" value="{{ chart_type }}">
+      <div class="dk-toolbar-left">
+        <input type="text" name="name" class="dk-input" required maxlength="120" placeholder="Saved query name (e.g. Daily Orders)">
+        <label class="dk-checkbox">
+          <input type="checkbox" name="pin" value="1">
+          <span>Pin to Dashboard</span>
+        </label>
+        <button type="submit" class="dk-btn dk-btn-sm dk-btn-primary">{{ deck_icon("bookmark", 12) }} Save Query</button>
+      </div>
+    </form>
+  </section>
+  {% endif %}
+
+  {% if saved_queries %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">Saved BI Queries</h2>
+      <span class="dk-mono dk-subtle">{{ saved_queries | length }} saved</span>
+    </div>
+    <div>
+      {% for sq in saved_queries %}
+      <div class="dk-activity-row">
+        <div class="dk-activity-main">
+          <div>
+            <a href="{{ url_for(bp_name ~ '.sql_console', saved=sq.id) }}" class="dk-link"><strong>{{ sq.name }}</strong></a>
+            <span class="dk-badge dk-mono">{{ sq.bind_key or 'default' }}</span>
+            <span class="dk-badge dk-mono">{{ sq.chart_type }}</span>
+            {% if sq.is_pinned_to_dashboard %}<span class="dk-badge dk-badge-ok dk-mono">PINNED</span>{% endif %}
+          </div>
+          <div class="dk-mono dk-subtle">{{ sq.sql[:120] }}</div>
+        </div>
+        {% if can_save_queries and (is_superuser or sq.owner_id == current_user_id) %}
+        <div class="dk-page-actions">
+          <form method="post" action="{{ url_for(bp_name ~ '.sql_pin', query_id=sq.id) }}">
+            <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+            <button type="submit" class="dk-btn dk-btn-sm">{{ "Unpin" if sq.is_pinned_to_dashboard else "Pin" }}</button>
+          </form>
+          <form method="post" action="{{ url_for(bp_name ~ '.sql_delete', query_id=sq.id) }}">
+            <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+            <button type="submit" class="dk-btn dk-btn-ghost dk-btn-sm" aria-label="Delete saved query">{{ deck_icon("trash", 12) }}</button>
+          </form>
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% if schema_tables %}
+  <details class="dk-panel dk-sql-schema">
+    <summary class="dk-panel-head dk-mono">Schema Browser ({{ schema_tables | length }} tables)</summary>
+    <div class="dk-panel-body">
+      {% for tbl in schema_tables %}
+      <div class="dk-sql-schema-row">
+        <button type="button" class="dk-chip dk-mono" data-deck-sql-preset="SELECT * FROM {{ tbl.name }} LIMIT 25">{{ tbl.name }}</button>
+        <span class="dk-sql-cols dk-mono dk-subtle">
+          {% for col in tbl.columns[:10] %}{{ col.name }} ({{ col.type }}){% if not loop.last %}, {% endif %}{% endfor %}
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+
+  {% if chart_svg %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">Query Visualization</h2>
+      <span class="dk-badge dk-mono">{{ chart_type | upper }}</span>
+    </div>
+    <div class="dk-panel-body">{{ chart_svg }}</div>
+  </section>
+  {% endif %}
 
   {% if result %}
   {% if result.error %}
@@ -84,4 +183,7 @@
   {% endif %}
   {% endif %}
 </div>
+{% endblock %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-ops.js') }}"></script>
 {% endblock %}

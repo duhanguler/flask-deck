@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -398,6 +399,123 @@ def render_qr_svg(data: str, *, pixel_size: int = 184) -> Markup:
 
 
 # ---------------------------------------------------------------------------
+# At-Rest Secret Encryption & Key Rotation
+# ---------------------------------------------------------------------------
+
+_ENC_PREFIX = "enc:v1:"
+
+
+class SecretCipher:
+    """Authenticated symmetric encryption for persisted TOTP secrets (stdlib-only)."""
+
+    __slots__ = ("_fallback_keys", "_primary_key")
+
+    def __init__(
+        self,
+        primary_key: str | None = None,
+        fallback_keys: Sequence[str] = (),
+    ) -> None:
+        self._primary_key = primary_key or None
+        self._fallback_keys = tuple(k for k in fallback_keys if k)
+
+    @property
+    def enabled(self) -> bool:
+        return self._primary_key is not None
+
+    @staticmethod
+    def _derive_keys(key_material: str) -> tuple[bytes, bytes]:
+        enc_key = hashlib.sha256(
+            ("flask-deck:mfa:enc:v1:" + key_material).encode("utf-8")
+        ).digest()
+        mac_key = hashlib.sha256(
+            ("flask-deck:mfa:mac:v1:" + key_material).encode("utf-8")
+        ).digest()
+        return enc_key, mac_key
+
+    @staticmethod
+    def _xor_ctr(enc_key: bytes, nonce: bytes, data: bytes) -> bytes:
+        out = bytearray(len(data))
+        offset = 0
+        counter = 0
+        while offset < len(data):
+            block = hashlib.sha256(
+                enc_key + nonce + struct.pack(">I", counter)
+            ).digest()
+            take = min(len(block), len(data) - offset)
+            for idx in range(take):
+                out[offset + idx] = data[offset + idx] ^ block[idx]
+            offset += take
+            counter += 1
+        return bytes(out)
+
+    @staticmethod
+    def _encrypt_with(key_material: str, plaintext: str) -> str:
+        enc_key, mac_key = SecretCipher._derive_keys(key_material)
+        nonce = secrets.token_bytes(16)
+        raw = plaintext.encode("utf-8")
+        ciphertext = SecretCipher._xor_ctr(enc_key, nonce, raw)
+        tag = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()
+        token = base64.urlsafe_b64encode(nonce + ciphertext + tag).decode("ascii")
+        return f"{_ENC_PREFIX}{token}"
+
+    @staticmethod
+    def _try_decrypt_with(key_material: str, token: str) -> str | None:
+        try:
+            blob = base64.urlsafe_b64decode(token.encode("ascii"))
+        except Exception:
+            return None
+        if len(blob) < 48:
+            return None
+        nonce = blob[:16]
+        ciphertext = blob[16:-32]
+        tag = blob[-32:]
+        enc_key, mac_key = SecretCipher._derive_keys(key_material)
+        expected = hmac.new(mac_key, nonce + ciphertext, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, tag):
+            return None
+        raw = SecretCipher._xor_ctr(enc_key, nonce, ciphertext)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    def encrypt(self, plaintext: str) -> str:
+        """Encrypt plaintext with primary_key when enabled, otherwise return plaintext."""
+        if self._primary_key is None:
+            return plaintext
+        if plaintext.startswith(_ENC_PREFIX):
+            return plaintext
+        return self._encrypt_with(self._primary_key, plaintext)
+
+    def decrypt_with_status(self, stored: str) -> tuple[str, bool]:
+        """Return ``(plaintext, needs_rotation)``.
+
+        Handles both ``enc:v1:...`` tokens (trying primary then fallback keys) and
+        legacy unencrypted Base32 secrets cleanly.
+        """
+        if not stored.startswith(_ENC_PREFIX):
+            return stored, self._primary_key is not None
+        token = stored[len(_ENC_PREFIX) :]
+        if self._primary_key is not None:
+            plain = self._try_decrypt_with(self._primary_key, token)
+            if plain is not None:
+                return plain, False
+        for fb in self._fallback_keys:
+            plain = self._try_decrypt_with(fb, token)
+            if plain is not None:
+                return plain, self._primary_key is not None
+        if self._primary_key is None and not self._fallback_keys:
+            raise ValueError(
+                "Encrypted MFA secret cannot be decrypted because encryption_key is not set."
+            )
+        raise ValueError("Unable to decrypt MFA secret with configured encryption keys.")
+
+    def decrypt(self, stored: str) -> str:
+        plain, _ = self.decrypt_with_status(stored)
+        return plain
+
+
+# ---------------------------------------------------------------------------
 # MFA Persistence Stores
 # ---------------------------------------------------------------------------
 
@@ -470,23 +588,68 @@ class MFAStore(ABC):
 class InMemoryMFAStore(MFAStore):
     """Thread-safe in-memory MFA store suitable for demos and tests."""
 
-    __slots__ = ("_lock", "_records")
+    __slots__ = ("_cipher", "_lock", "_records")
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        encryption_key: str | None = None,
+        encryption_fallback_keys: Sequence[str] = (),
+    ) -> None:
         self._records: dict[str, MFAEnrollment] = {}
         self._lock = threading.Lock()
+        self._cipher = SecretCipher(encryption_key, encryption_fallback_keys)
 
     def get(self, user_id: str) -> MFAEnrollment | None:
         with self._lock:
-            return self._records.get(user_id)
+            rec = self._records.get(user_id)
+            if rec is None:
+                return None
+            return MFAEnrollment(
+                user_id=rec.user_id,
+                secret=self._cipher.decrypt(rec.secret),
+                enabled=rec.enabled,
+                last_step=rec.last_step,
+                recovery_hashes=rec.recovery_hashes,
+                created_at=rec.created_at,
+            )
 
     def save(self, enrollment: MFAEnrollment) -> None:
+        encrypted = self._cipher.encrypt(enrollment.secret)
+        stored = MFAEnrollment(
+            user_id=enrollment.user_id,
+            secret=encrypted,
+            enabled=enrollment.enabled,
+            last_step=enrollment.last_step,
+            recovery_hashes=enrollment.recovery_hashes,
+            created_at=enrollment.created_at,
+        )
         with self._lock:
-            self._records[enrollment.user_id] = enrollment
+            self._records[enrollment.user_id] = stored
 
     def delete(self, user_id: str) -> None:
         with self._lock:
             self._records.pop(user_id, None)
+
+    def rotate_secrets(self) -> int:
+        """Re-encrypt legacy plaintext or fallback-encrypted secrets with the active key."""
+        if not self._cipher.enabled:
+            return 0
+        rotated = 0
+        with self._lock:
+            for uid, rec in list(self._records.items()):
+                plain, needs_rotation = self._cipher.decrypt_with_status(rec.secret)
+                if needs_rotation:
+                    self._records[uid] = MFAEnrollment(
+                        user_id=rec.user_id,
+                        secret=self._cipher.encrypt(plain),
+                        enabled=rec.enabled,
+                        last_step=rec.last_step,
+                        recovery_hashes=rec.recovery_hashes,
+                        created_at=rec.created_at,
+                    )
+                    rotated += 1
+        return rotated
 
     def verify_and_record(
         self,
@@ -501,8 +664,9 @@ class InMemoryMFAStore(MFAStore):
             if enrollment is None or not enrollment.enabled:
                 return False
 
+            plain_secret = self._cipher.decrypt(enrollment.secret)
             step = verify_totp(
-                enrollment.secret,
+                plain_secret,
                 code,
                 timestamp=timestamp,
                 last_step=enrollment.last_step,
@@ -540,16 +704,24 @@ class InMemoryMFAStore(MFAStore):
 class SQLAlchemyMFAStore(MFAStore):
     """Persistent SQLAlchemy 2.0 MFA enrollment store (auto-creates `_flask_deck_mfa`)."""
 
-    __slots__ = ("_engine", "_table")
+    __slots__ = ("_cipher", "_engine", "_table")
 
-    def __init__(self, engine: Engine, *, table_name: str = "_flask_deck_mfa") -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        table_name: str = "_flask_deck_mfa",
+        encryption_key: str | None = None,
+        encryption_fallback_keys: Sequence[str] = (),
+    ) -> None:
         self._engine = engine
+        self._cipher = SecretCipher(encryption_key, encryption_fallback_keys)
         metadata = sa.MetaData()
         self._table = sa.Table(
             table_name,
             metadata,
             sa.Column("user_id", sa.String(128), primary_key=True),
-            sa.Column("secret", sa.String(128), nullable=False),
+            sa.Column("secret", sa.String(512), nullable=False),
             sa.Column("enabled", sa.Boolean, nullable=False, default=True),
             sa.Column("last_step", sa.Integer, nullable=True),
             sa.Column("recovery_hashes_json", sa.Text, nullable=False, default="[]"),
@@ -567,7 +739,7 @@ class SQLAlchemyMFAStore(MFAStore):
             raw_hashes = json.loads(str(row["recovery_hashes_json"] or "[]"))
             return MFAEnrollment(
                 user_id=str(row["user_id"]),
-                secret=str(row["secret"]),
+                secret=self._cipher.decrypt(str(row["secret"])),
                 enabled=bool(row["enabled"]),
                 last_step=int(row["last_step"]) if row["last_step"] is not None else None,
                 recovery_hashes=tuple(str(h) for h in raw_hashes),
@@ -577,6 +749,7 @@ class SQLAlchemyMFAStore(MFAStore):
     def save(self, enrollment: MFAEnrollment) -> None:
         now = enrollment.created_at or datetime.now(timezone.utc)
         hashes_json = json.dumps(list(enrollment.recovery_hashes))
+        encrypted_secret = self._cipher.encrypt(enrollment.secret)
         with Session(self._engine) as sess:
             existing = sess.execute(
                 sa.select(self._table.c.user_id).where(self._table.c.user_id == enrollment.user_id)
@@ -585,7 +758,7 @@ class SQLAlchemyMFAStore(MFAStore):
                 sess.execute(
                     self._table.insert().values(
                         user_id=enrollment.user_id,
-                        secret=enrollment.secret,
+                        secret=encrypted_secret,
                         enabled=enrollment.enabled,
                         last_step=enrollment.last_step,
                         recovery_hashes_json=hashes_json,
@@ -597,7 +770,7 @@ class SQLAlchemyMFAStore(MFAStore):
                     self._table.update()
                     .where(self._table.c.user_id == enrollment.user_id)
                     .values(
-                        secret=enrollment.secret,
+                        secret=encrypted_secret,
                         enabled=enrollment.enabled,
                         last_step=enrollment.last_step,
                         recovery_hashes_json=hashes_json,
@@ -609,6 +782,28 @@ class SQLAlchemyMFAStore(MFAStore):
         with Session(self._engine) as sess:
             sess.execute(self._table.delete().where(self._table.c.user_id == user_id))
             sess.commit()
+
+    def rotate_secrets(self) -> int:
+        """Re-encrypt legacy plaintext or fallback-encrypted secrets with the primary key."""
+        if not self._cipher.enabled:
+            return 0
+        rotated = 0
+        with Session(self._engine) as sess:
+            rows = sess.execute(
+                sa.select(self._table.c.user_id, self._table.c.secret)
+            ).mappings().all()
+            for row in rows:
+                plain, needs_rotation = self._cipher.decrypt_with_status(str(row["secret"]))
+                if needs_rotation:
+                    sess.execute(
+                        self._table.update()
+                        .where(self._table.c.user_id == row["user_id"])
+                        .values(secret=self._cipher.encrypt(plain))
+                    )
+                    rotated += 1
+            if rotated:
+                sess.commit()
+        return rotated
 
     def verify_and_record(
         self,
@@ -629,7 +824,7 @@ class SQLAlchemyMFAStore(MFAStore):
             if row is None or not bool(row["enabled"]):
                 return False
 
-            secret = str(row["secret"])
+            secret = self._cipher.decrypt(str(row["secret"]))
             last_step = int(row["last_step"]) if row["last_step"] is not None else None
             old_hashes_json = str(row["recovery_hashes_json"] or "[]")
             raw_hashes = tuple(str(h) for h in json.loads(old_hashes_json))

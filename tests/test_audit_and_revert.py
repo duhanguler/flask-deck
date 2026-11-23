@@ -24,39 +24,42 @@ def test_sqlalchemy_audit_store_persistence_and_filtering() -> None:
     engine = sa.create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
-    store = SQLAlchemyAuditStore(engine)
-    e1 = make_audit_entry(
-        actor_id="u1",
-        actor_name="Alice",
-        actor_ip="127.0.0.1",
-        action="update",
-        model_slug="orders",
-        model_label="Order",
-        record_pk="10",
-        record_repr="ORD-10",
-        changes={"status": {"old": "pending", "new": "paid"}},
-    )
-    e2 = make_audit_entry(
-        actor_id="u2",
-        actor_name="Bob",
-        actor_ip="127.0.0.1",
-        action="delete",
-        model_slug="users",
-        model_label="User",
-        record_pk="5",
-        record_repr="bob@acme.dev",
-    )
-    store.record(e1)
-    store.record(e2)
+    try:
+        store = SQLAlchemyAuditStore(engine)
+        e1 = make_audit_entry(
+            actor_id="u1",
+            actor_name="Alice",
+            actor_ip="127.0.0.1",
+            action="update",
+            model_slug="orders",
+            model_label="Order",
+            record_pk="10",
+            record_repr="ORD-10",
+            changes={"status": {"old": "pending", "new": "paid"}},
+        )
+        e2 = make_audit_entry(
+            actor_id="u2",
+            actor_name="Bob",
+            actor_ip="127.0.0.1",
+            action="delete",
+            model_slug="users",
+            model_label="User",
+            record_pk="5",
+            record_repr="bob@acme.dev",
+        )
+        store.record(e1)
+        store.record(e2)
 
-    all_entries, total = store.list_entries()
-    assert total == 2
-    assert len(all_entries) == 2
+        all_entries, total = store.list_entries()
+        assert total == 2
+        assert len(all_entries) == 2
 
-    only_orders, count_o = store.list_entries(model_slug="orders", action="update", search="paid")
-    assert count_o == 1
-    assert only_orders[0].id == e1.id
-    assert store.get_entry(e1.id) is not None
+        only_orders, count_o = store.list_entries(model_slug="orders", action="update", search="paid")
+        assert count_o == 1
+        assert only_orders[0].id == e1.id
+        assert store.get_entry(e1.id) is not None
+    finally:
+        engine.dispose()
 
 
 def test_audit_ledger_and_one_click_revert_flow(sa_bundle: tuple[Any, ...]) -> None:

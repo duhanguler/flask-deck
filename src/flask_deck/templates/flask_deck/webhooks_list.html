@@ -1,0 +1,118 @@
+{% extends "flask_deck/base.html" %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-ops.js') }}"></script>
+{% endblock %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("Webhooks & DLQ") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ _("Webhooks & Dead-Letter Queue") }}</h1>
+    <p class="dk-page-sub">Registered SSRF-hardened HMAC-SHA256 destinations, delivery status, and one-click redelivery.</p>
+  </div>
+  <div class="dk-page-actions">
+    <a href="{{ url_for(bp_name ~ '.webhooks_list') }}" class="dk-btn{% if not active_status %} is-active{% endif %}">All</a>
+    <a href="{{ url_for(bp_name ~ '.webhooks_list', status='dead_letter') }}" class="dk-btn{% if active_status == 'dead_letter' %} is-active{% endif %}">Dead Letter</a>
+    <a href="{{ url_for(bp_name ~ '.webhooks_list', status='delivered') }}" class="dk-btn{% if active_status == 'delivered' %} is-active{% endif %}">Delivered</a>
+  </div>
+</div>
+
+<div class="dk-content">
+  <div class="dk-card dk-mb-md">
+    <div class="dk-card-head">
+      <div>
+        <div class="dk-card-title">Registered Webhook Sinks</div>
+        <div class="dk-card-sub">Configured via <code>deck.add_webhook(WebhookSink(...))</code></div>
+      </div>
+    </div>
+    <div class="dk-table-wrap">
+      <table class="dk-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Destination URL</th>
+            <th>Events</th>
+            <th>Mode</th>
+            <th class="dk-td-actions">Test</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for sink in sinks %}
+          <tr>
+            <td class="dk-mono">#{{ loop.index }}</td>
+            <td class="dk-mono">{{ sink.url }}</td>
+            <td class="dk-mono dk-subtle">{{ sink.events | join(', ') }}</td>
+            <td>
+              <span class="dk-badge dk-badge-neutral dk-mono">
+                {{ "async" if sink.async_delivery else "sync" }} · retries={{ sink.max_retries }}
+              </span>
+            </td>
+            <td class="dk-td-actions">
+              <form method="post" action="{{ url_for(bp_name ~ '.webhooks_test') }}">
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+                <input type="hidden" name="sink_index" value="{{ loop.index0 }}">
+                <button type="submit" class="dk-btn dk-btn-sm">{{ deck_icon("send", 12) }} Send Test</button>
+              </form>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="5" class="dk-chart-empty">No webhook sinks registered.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="dk-table-wrap">
+    <table class="dk-table">
+      <thead>
+        <tr>
+          <th>Delivery</th>
+          <th>Event</th>
+          <th>Status</th>
+          <th>Attempts</th>
+          <th>HTTP / Error</th>
+          <th>Updated</th>
+          <th class="dk-td-actions">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in deliveries %}
+        {% set tone = 'ok' if d.status == 'delivered' else ('danger' if d.status == 'dead_letter' else 'warn') %}
+        <tr>
+          <td>
+            <div class="dk-mono"><strong>#{{ d.id }}</strong></div>
+            <div class="dk-mono dk-subtle">{{ d.webhook_url }}</div>
+          </td>
+          <td class="dk-mono">{{ d.event_name }}</td>
+          <td><span class="dk-badge dk-badge-{{ tone }} dk-mono"><span class="dk-dot"></span>{{ d.status }}</span></td>
+          <td class="dk-mono dk-tabular">{{ d.attempts }} / {{ d.max_attempts }}</td>
+          <td class="dk-mono dk-subtle">
+            {% if d.last_status_code %}HTTP {{ d.last_status_code }} {% endif %}
+            {{ d.last_error or "OK" }}
+          </td>
+          <td class="dk-mono dk-tabular dk-subtle">{{ format_dt(d.updated_at) }}</td>
+          <td class="dk-td-actions">
+            {% if d.status in ['dead_letter', 'retrying', 'pending'] %}
+            <form method="post" action="{{ url_for(bp_name ~ '.webhook_redeliver', delivery_id=d.id) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <button type="submit" class="dk-btn dk-btn-sm">{{ deck_icon("refresh-cw", 12) }} Redeliver</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="7" class="dk-chart-empty">No webhook deliveries recorded yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

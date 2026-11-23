@@ -14,7 +14,9 @@ import sqlalchemy as sa
 from flask import Response, stream_with_context
 from sqlalchemy.orm import Session
 
+from flask_deck.adapters.sqlalchemy import extract_pk
 from flask_deck.auth import AuthProvider, DeckUser
+from flask_deck.introspection import introspect_model
 from flask_deck.model_view import ModelView
 from flask_deck.query import (
     build_filter_condition,
@@ -23,7 +25,7 @@ from flask_deck.query import (
     parse_filter_key,
     soft_delete_predicate,
 )
-from flask_deck.security import sanitize_csv_cell
+from flask_deck.security import is_sensitive_field, sanitize_csv_cell
 
 
 def _serialize_export_value(value: Any) -> Any:
@@ -51,7 +53,9 @@ def _build_export_statement(
     selected_pks: Sequence[tuple[Any, ...]] = (),
     dialect_name: str = "",
     trashed: bool = False,
-) -> sa.Select[Any]:
+    searchable_columns: Sequence[str] | None = None,
+    views_by_model: Mapping[type[Any], ModelView] | None = None,
+) -> tuple[sa.Select[Any], bool]:
     meta = view.meta
     stmt = view.scope_query(sa.select(view.model), user)
     sd_pred = soft_delete_predicate(meta, view.soft_delete_column, trashed=trashed)
@@ -59,9 +63,35 @@ def _build_export_statement(
         stmt = stmt.where(sd_pred)
 
     restricted = auth.hidden_fields_for(user, meta.slug) | auth.masked_fields_for(user, meta.slug)
-    allowed_searchable = tuple(
-        c for c in view.resolved_searchable if c.split(".", 1)[0] not in restricted
-    )
+    if searchable_columns is not None:
+        allowed_searchable = tuple(searchable_columns)
+    else:
+        allowed_items: list[str] = []
+        for col_spec in view.resolved_searchable:
+            if "." in col_spec:
+                rel_name, target_col = col_spec.split(".", 1)
+                if rel_name in restricted or is_sensitive_field(target_col):
+                    continue
+                rel_meta = meta.relationships_by_name.get(rel_name)
+                if rel_meta is not None:
+                    t_view = views_by_model.get(rel_meta.target_model) if views_by_model else None
+                    if t_view is not None:
+                        t_restricted = auth.hidden_fields_for(user, t_view.meta.slug) | auth.masked_fields_for(
+                            user, t_view.meta.slug
+                        )
+                        if target_col in t_restricted or target_col in t_view.meta.sensitive_fields:
+                            continue
+                    else:
+                        t_meta = introspect_model(rel_meta.target_model)
+                        t_restricted = auth.hidden_fields_for(user, t_meta.slug) | auth.masked_fields_for(
+                            user, t_meta.slug
+                        )
+                        if target_col in t_restricted or target_col in t_meta.sensitive_fields:
+                            continue
+                allowed_items.append(col_spec)
+            elif col_spec not in restricted:
+                allowed_items.append(col_spec)
+        allowed_searchable = tuple(allowed_items)
     allowed_filterable = view.resolved_filterable - restricted
     known_fields = frozenset(meta.fields_by_name.keys())
 
@@ -99,7 +129,8 @@ def _build_export_statement(
             pk_cols = [getattr(view.model, pk.name) for pk in meta.primary_keys]
             stmt = stmt.where(sa.tuple_(*pk_cols).in_(selected_pks))
 
-    return stmt.order_by(getattr(view.model, meta.primary_keys[0].name).asc())
+    pk_orders = [getattr(view.model, pk.name).asc() for pk in meta.primary_keys]
+    return stmt.order_by(*pk_orders), bool(search_joins)
 
 
 def export_columns_for_user(
@@ -129,13 +160,15 @@ def iter_export_chunks(
     sanitize_csv: bool = True,
     chunk_size: int = 500,
     trashed: bool = False,
-) -> tuple[Iterator[str], str, str]:
+    searchable_columns: Sequence[str] | None = None,
+    views_by_model: Mapping[type[Any], ModelView] | None = None,
+) -> tuple[Iterator[Any], str, str]:
     """Yield formatted export chunks in O(1) memory without requiring a Flask request context."""
     cols = export_columns_for_user(view, auth, user)
     masked = auth.masked_fields_for(user, view.meta.slug)
     bind = session.get_bind()
     dialect_name = bind.dialect.name if bind is not None else ""
-    stmt = _build_export_statement(
+    stmt, has_joins = _build_export_statement(
         view,
         auth=auth,
         user=user,
@@ -145,7 +178,19 @@ def iter_export_chunks(
         selected_pks=selected_pks,
         dialect_name=dialect_name,
         trashed=trashed,
+        searchable_columns=searchable_columns,
+        views_by_model=views_by_model,
     )
+
+    def _iter_objects() -> Iterator[Any]:
+        last_pk: tuple[Any, ...] | None = None
+        for obj in session.scalars(stmt).yield_per(chunk_size):
+            if has_joins:
+                pk = extract_pk(obj, view.meta)
+                if pk == last_pk:
+                    continue
+                last_pk = pk
+            yield obj
 
     def _row_dict(obj: Any) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -157,6 +202,46 @@ def iter_export_chunks(
         return out
 
     fmt_clean = fmt.lower()
+    if fmt_clean == "xlsx":
+        try:
+            import openpyxl  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "XLSX export requires openpyxl. Install with: pip install 'flask-deck[excel]'"
+            ) from exc
+
+        def _gen_xlsx() -> Iterator[bytes]:
+            wb = openpyxl.Workbook(write_only=True)
+            try:
+                ws = wb.create_sheet(title=view.plural_label[:31] or "Export")
+                ws.append([sanitize_csv_cell(c, enabled=sanitize_csv) for c in cols])
+                for obj in _iter_objects():
+                    row_data = _row_dict(obj)
+                    ws.append(
+                        [
+                            sanitize_csv_cell(
+                                json.dumps(row_data[c], separators=(",", ":"))
+                                if isinstance(row_data[c], (dict, list))
+                                else row_data[c],
+                                enabled=sanitize_csv,
+                            )
+                            for c in cols
+                        ]
+                    )
+                buf = io.BytesIO()
+                wb.save(buf)
+                yield buf.getvalue()
+            finally:
+                close_fn = getattr(wb, "close", None)
+                if callable(close_fn):
+                    close_fn()
+
+        return (
+            _gen_xlsx(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            f"{view.meta.slug}.xlsx",
+        )
+
     if fmt_clean == "csv":
 
         def _gen_csv() -> Iterator[str]:
@@ -167,7 +252,7 @@ def iter_export_chunks(
             buf.seek(0)
             buf.truncate(0)
 
-            for obj in session.scalars(stmt).yield_per(chunk_size):
+            for obj in _iter_objects():
                 row_data = _row_dict(obj)
                 cells = [
                     sanitize_csv_cell(
@@ -188,7 +273,7 @@ def iter_export_chunks(
     if fmt_clean == "jsonl":
 
         def _gen_jsonl() -> Iterator[str]:
-            for obj in session.scalars(stmt).yield_per(chunk_size):
+            for obj in _iter_objects():
                 yield json.dumps(_row_dict(obj), separators=(",", ":")) + "\n"
 
         return _gen_jsonl(), "application/x-ndjson; charset=utf-8", f"{view.meta.slug}.jsonl"
@@ -196,7 +281,7 @@ def iter_export_chunks(
     def _gen_json() -> Iterator[str]:
         yield "[\n"
         first = True
-        for obj in session.scalars(stmt).yield_per(chunk_size):
+        for obj in _iter_objects():
             prefix = "" if first else ",\n"
             first = False
             yield prefix + "  " + json.dumps(_row_dict(obj), separators=(",", ":"))
@@ -219,6 +304,8 @@ def stream_export_response(
     sanitize_csv: bool = True,
     chunk_size: int = 500,
     trashed: bool = False,
+    searchable_columns: Sequence[str] | None = None,
+    views_by_model: Mapping[type[Any], ModelView] | None = None,
 ) -> Response:
     """Stream filtered model records in O(1) memory as CSV, JSON, or JSONL."""
     gen, mimetype, filename = iter_export_chunks(
@@ -234,6 +321,8 @@ def stream_export_response(
         sanitize_csv=sanitize_csv,
         chunk_size=chunk_size,
         trashed=trashed,
+        searchable_columns=searchable_columns,
+        views_by_model=views_by_model,
     )
     resp = Response(stream_with_context(gen), mimetype=mimetype)
     resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'

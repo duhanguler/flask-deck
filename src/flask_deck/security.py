@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import re
 import secrets
 import threading
@@ -8,10 +9,12 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
+import sqlalchemy as sa
 from flask import Request, Response, session
+from sqlalchemy.engine import Engine
 from werkzeug.security import check_password_hash, generate_password_hash
 
 CSRF_SESSION_KEY = "_deck_csrf_token"
@@ -288,6 +291,35 @@ def check_json_depth(value: Any, max_depth: int, _current: int = 0) -> bool:
     return True
 
 
+def _bucket_keys(ip: str, username: str) -> tuple[str, ...]:
+    clean_ip = (ip or "unknown").strip()[:64]
+    clean_user = (username or "").strip().lower()[:128]
+    if clean_user:
+        return (f"ip:{clean_ip}", f"pair:{clean_ip}:{clean_user}", f"user:{clean_user}")
+    return (f"ip:{clean_ip}", f"pair:{clean_ip}:")
+
+
+def _bucket_limit(key: str, max_attempts: int) -> int:
+    # IP-only bucket allows 3x threshold (shared NATs); per-user bucket allows 2x
+    # to defeat distributed IP-rotation brute force without trivial single-typo lockouts.
+    if key.startswith("ip:"):
+        return max_attempts * 3
+    if key.startswith("user:"):
+        return max_attempts * 2
+    return max_attempts
+
+
+@runtime_checkable
+class RateLimitStore(Protocol):
+    """Multi-worker login brute-force rate limiting contract."""
+
+    def is_locked(self, ip: str, username: str = "") -> tuple[bool, int]: ...
+
+    def record_failure(self, ip: str, username: str = "") -> None: ...
+
+    def record_success(self, ip: str, username: str = "") -> None: ...
+
+
 class LoginRateLimiter:
     """Thread-safe bounded sliding-window login brute-force throttler."""
 
@@ -321,18 +353,11 @@ class LoginRateLimiter:
         while len(store) > self._max_keys:
             store.popitem(last=False)
 
-    def _keys(self, ip: str, username: str) -> tuple[str, ...]:
-        clean_ip = (ip or "unknown").strip()[:64]
-        clean_user = (username or "").strip().lower()[:128]
-        if clean_user:
-            return (f"ip:{clean_ip}", f"pair:{clean_ip}:{clean_user}", f"user:{clean_user}")
-        return (f"ip:{clean_ip}", f"pair:{clean_ip}:")
-
     def is_locked(self, ip: str, username: str = "") -> tuple[bool, int]:
         """Return (locked, retry_after_seconds)."""
         now = time.monotonic()
         with self._lock:
-            for key in self._keys(ip, username):
+            for key in _bucket_keys(ip, username):
                 until = self._lockouts.get(key)
                 if until is not None:
                     if until > now:
@@ -345,15 +370,8 @@ class LoginRateLimiter:
         now = time.monotonic()
         cutoff = now - self._window_seconds
         with self._lock:
-            for key in self._keys(ip, username):
-                # IP-only bucket allows 3x threshold (shared NATs); per-user bucket allows 2x
-                # to defeat distributed IP-rotation brute force without trivial single-typo lockouts.
-                if key.startswith("ip:"):
-                    limit = self._max_attempts * 3
-                elif key.startswith("user:"):
-                    limit = self._max_attempts * 2
-                else:
-                    limit = self._max_attempts
+            for key in _bucket_keys(ip, username):
+                limit = _bucket_limit(key, self._max_attempts)
                 timestamps = [t for t in self._attempts.get(key, []) if t >= cutoff]
                 timestamps.append(now)
                 self._attempts[key] = timestamps
@@ -366,8 +384,165 @@ class LoginRateLimiter:
 
     def record_success(self, ip: str, username: str = "") -> None:
         """Clear pair and per-user failure history after a successful authentication."""
-        keys = self._keys(ip, username)
+        keys = _bucket_keys(ip, username)
         with self._lock:
             for key in keys[1:]:
                 self._attempts.pop(key, None)
                 self._lockouts.pop(key, None)
+
+
+InMemoryRateLimitStore = LoginRateLimiter
+
+
+class SQLAlchemyRateLimitStore:
+    """Multi-worker SQLAlchemy sliding-window login rate limiter."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        max_attempts: int = 5,
+        window_seconds: int = 300,
+        lockout_seconds: int = 300,
+        table_name: str = "_flask_deck_rate_limits",
+    ) -> None:
+        self._engine = engine
+        self._max_attempts = max(1, int(max_attempts))
+        self._window_seconds = max(1, int(window_seconds))
+        self._lockout_seconds = max(1, int(lockout_seconds))
+        self._lock = threading.Lock()
+        self._meta = sa.MetaData()
+        self._table = sa.Table(
+            table_name,
+            self._meta,
+            sa.Column("bucket_key", sa.String(255), primary_key=True),
+            sa.Column("attempts_json", sa.Text, nullable=False, default="[]"),
+            sa.Column("locked_until", sa.Float, nullable=True),
+        )
+        self._meta.create_all(engine, checkfirst=True)
+
+    def is_locked(self, ip: str, username: str = "") -> tuple[bool, int]:
+        now = time.time()
+        keys = _bucket_keys(ip, username)
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(self._table.c.bucket_key, self._table.c.locked_until).where(
+                    self._table.c.bucket_key.in_(keys)
+                )
+            ).all()
+        for _k, locked_until in rows:
+            if locked_until is not None and float(locked_until) > now:
+                return True, max(1, int(float(locked_until) - now))
+        return False, 0
+
+    def record_failure(self, ip: str, username: str = "") -> None:
+        now = time.time()
+        cutoff = now - self._window_seconds
+        with self._lock, self._engine.begin() as conn:
+            for key in _bucket_keys(ip, username):
+                limit = _bucket_limit(key, self._max_attempts)
+                row = conn.execute(
+                    sa.select(self._table.c.attempts_json).where(self._table.c.bucket_key == key)
+                ).first()
+                try:
+                    ts_raw = json.loads(row[0]) if row and row[0] else []
+                except Exception:
+                    ts_raw = []
+                timestamps = [float(t) for t in ts_raw if float(t) >= cutoff]
+                timestamps.append(now)
+                locked_until = (now + self._lockout_seconds) if len(timestamps) >= limit else None
+                payload = json.dumps(timestamps)
+                if row is None:
+                    conn.execute(
+                        self._table.insert().values(
+                            bucket_key=key,
+                            attempts_json=payload,
+                            locked_until=locked_until,
+                        )
+                    )
+                else:
+                    conn.execute(
+                        self._table.update()
+                        .where(self._table.c.bucket_key == key)
+                        .values(attempts_json=payload, locked_until=locked_until)
+                    )
+
+    def record_success(self, ip: str, username: str = "") -> None:
+        keys = _bucket_keys(ip, username)[1:]
+        with self._engine.begin() as conn:
+            conn.execute(self._table.delete().where(self._table.c.bucket_key.in_(keys)))
+
+
+class RedisRateLimitStore:
+    """Optional Redis multi-worker login rate limiter (requires optional `redis` package or client)."""
+
+    def __init__(
+        self,
+        redis_url_or_client: str | Any,
+        *,
+        max_attempts: int = 5,
+        window_seconds: int = 300,
+        lockout_seconds: int = 300,
+        key_prefix: str = "flask_deck:rl:",
+    ) -> None:
+        self._max_attempts = max(1, int(max_attempts))
+        self._window_seconds = max(1, int(window_seconds))
+        self._lockout_seconds = max(1, int(lockout_seconds))
+        self._prefix = key_prefix
+        if isinstance(redis_url_or_client, str):
+            try:
+                import redis as redis_lib  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise RuntimeError(
+                    "redis is required for RedisRateLimitStore. Install with: pip install 'flask-deck[redis]'"
+                ) from exc
+            self._client: Any = redis_lib.Redis.from_url(redis_url_or_client, decode_responses=True)
+        else:
+            self._client = redis_url_or_client
+
+    def _rkey(self, bucket: str) -> str:
+        return f"{self._prefix}{bucket}"
+
+    def is_locked(self, ip: str, username: str = "") -> tuple[bool, int]:
+        now = time.time()
+        for key in _bucket_keys(ip, username):
+            raw = self._client.get(self._rkey(key))
+            if not raw:
+                continue
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            try:
+                data = json.loads(raw)
+                until = data.get("locked_until")
+                if until is not None and float(until) > now:
+                    return True, max(1, int(float(until) - now))
+            except Exception:
+                continue
+        return False, 0
+
+    def record_failure(self, ip: str, username: str = "") -> None:
+        now = time.time()
+        cutoff = now - self._window_seconds
+        ttl = max(self._window_seconds, self._lockout_seconds) + 10
+        for key in _bucket_keys(ip, username):
+            rkey = self._rkey(key)
+            limit = _bucket_limit(key, self._max_attempts)
+            raw = self._client.get(rkey)
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+            timestamps = [float(t) for t in data.get("attempts", []) if float(t) >= cutoff]
+            timestamps.append(now)
+            locked_until = (now + self._lockout_seconds) if len(timestamps) >= limit else None
+            self._client.set(
+                rkey,
+                json.dumps({"attempts": timestamps, "locked_until": locked_until}),
+                ex=ttl,
+            )
+
+    def record_success(self, ip: str, username: str = "") -> None:
+        for key in _bucket_keys(ip, username)[1:]:
+            self._client.delete(self._rkey(key))

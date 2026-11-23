@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="deck-csrf" content="{{ csrf_token }}">
   {% if brand.favicon_url %}
   <link rel="icon" href="{{ brand.favicon_url }}">
   {% else %}
@@ -20,6 +21,9 @@
   <link rel="stylesheet" href="{{ css_href }}">
   {% endfor %}
   <script defer src="{{ asset_url('js/deck.js') }}"></script>
+  {% if passkey_login_enabled %}
+  <script defer src="{{ asset_url('js/deck-ops.js') }}"></script>
+  {% endif %}
 </head>
 <body>
 <div class="dk-login-wrap">
@@ -57,6 +61,19 @@
     </div>
     {% endif %}
 
+    {% if passkey_login_enabled %}
+    <div class="dk-diff-list">
+      <button type="button" class="dk-btn dk-sso-btn"
+              data-deck-passkey-login
+              data-options-url="{{ url_for(bp_name ~ '.passkey_login_options') }}"
+              data-verify-url="{{ url_for(bp_name ~ '.passkey_login_verify') }}"
+              data-next-url="{{ next_url }}">
+        {{ deck_icon("key", 13) }} {{ _("Sign in with Passkey") }}
+      </button>
+    </div>
+    {% endif %}
+
+    {% if show_password_form %}
     <form method="post" action="{{ url_for(bp_name ~ '.login') }}" class="dk-diff-list">
       <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
       <input type="hidden" name="next" value="{{ next_url }}">
@@ -73,8 +90,9 @@
 
       <button type="submit" class="dk-btn dk-btn-primary">{{ _("Sign in") }}</button>
     </form>
+    {% endif %}
 
-    {% if demo_credentials %}
+    {% if demo_credentials and show_password_form %}
     <div class="dk-demo-creds">
       <div class="dk-rail-group-title">Demo RBAC Profiles</div>
       {% for uname, pwd, desc in demo_credentials %}

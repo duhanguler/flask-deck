@@ -1,0 +1,97 @@
+{% extends "flask_deck/base.html" %}
+{% block extra_scripts %}
+<script defer src="{{ asset_url('js/deck-ops.js') }}"></script>
+{% endblock %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ _("Passkeys") }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ _("Passkeys (FIDO2 / WebAuthn)") }}</h1>
+    <p class="dk-page-sub">Phishing-resistant hardware &amp; platform passkey credentials attached to your account.</p>
+  </div>
+  <div class="dk-page-actions">
+    {% if webauthn_available %}
+    <span class="dk-badge dk-badge-ok dk-mono"><span class="dk-dot"></span>WEBAUTHN READY</span>
+    {% else %}
+    <span class="dk-badge dk-badge-warn dk-mono"><span class="dk-dot"></span>OPTIONAL EXTRA NOT INSTALLED</span>
+    {% endif %}
+  </div>
+</div>
+
+<div class="dk-content">
+  {% if not webauthn_available %}
+  <div class="dk-alert dk-alert-neutral" role="note">
+    {{ deck_icon("key", 13) }} Install optional WebAuthn support with <code>pip install 'flask-deck[webauthn]'</code> to register hardware or platform passkeys.
+  </div>
+  {% else %}
+  <section class="dk-panel dk-mb-md">
+    <div class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">Register New Passkey</h2>
+        <p class="dk-panel-sub">Create a WebAuthn credential bound to this origin for passwordless sign-in.</p>
+      </div>
+    </div>
+    <div class="dk-panel-body">
+      <div class="dk-inline-row">
+        <div class="dk-field">
+          <label for="dk-passkey-label">Device Label</label>
+          <input type="text" id="dk-passkey-label" class="dk-input" placeholder="MacBook Touch ID / YubiKey" value="Security Key">
+        </div>
+        <button type="button" class="dk-btn dk-btn-primary"
+                data-deck-passkey-register
+                data-options-url="{{ url_for(bp_name ~ '.passkey_register_options') }}"
+                data-verify-url="{{ url_for(bp_name ~ '.passkey_register_verify') }}"
+                data-label-input="dk-passkey-label">
+          {{ deck_icon("key", 13) }} Register Passkey
+        </button>
+      </div>
+      <div class="dk-subtle dk-mono" data-passkey-status role="status" aria-live="polite"></div>
+    </div>
+  </section>
+  {% endif %}
+
+  <div class="dk-table-wrap">
+    <table class="dk-table">
+      <thead>
+        <tr>
+          <th>Label</th>
+          <th>Credential ID</th>
+          <th>Sign Count</th>
+          <th>Created</th>
+          <th>Last Used</th>
+          <th class="dk-td-actions">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for cred in credentials %}
+        <tr>
+          <td><strong>{{ cred.label }}</strong></td>
+          <td class="dk-mono dk-subtle">{{ cred.credential_id[:20] }}...</td>
+          <td class="dk-mono dk-tabular">{{ cred.sign_count }}</td>
+          <td class="dk-mono dk-tabular dk-subtle">{{ format_dt(cred.created_at) }}</td>
+          <td class="dk-mono dk-tabular dk-subtle">{{ format_dt(cred.last_used_at) if cred.last_used_at else "Never" }}</td>
+          <td class="dk-td-actions">
+            <form method="post" action="{{ url_for(bp_name ~ '.passkey_delete', credential_id=cred.credential_id) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger" data-deck-confirm-form
+                      data-confirm-title="Remove Passkey"
+                      data-confirm-msg="Delete this passkey credential?">
+                {{ deck_icon("trash", 12) }} Remove
+              </button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="6" class="dk-chart-empty">No passkeys registered for this account yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

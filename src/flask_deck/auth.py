@@ -75,6 +75,7 @@ class AuthProvider(ABC):
     """Pluggable authentication & 4-level RBAC provider contract."""
 
     supports_login_form: bool = False
+    supports_password_login: bool = True
 
     @abstractmethod
     def get_current_user(
@@ -172,11 +173,17 @@ class AuthProvider(ABC):
         _ = user_id
         return None
 
+    def get_impersonatable_users(self, actor: DeckUser) -> Sequence[DeckUser]:
+        """Return candidate non-superuser accounts that ``actor`` may impersonate."""
+        _ = actor
+        return ()
+
 
 class OpenAuthProvider(AuthProvider):
     """Explicit opt-in open access provider for local development and tests only."""
 
     supports_login_form = False
+    supports_password_login = False
 
     def __init__(self, user: DeckUser | None = None) -> None:
         self._user = user or DeckUser(
@@ -210,6 +217,7 @@ class BasicAuthProvider(AuthProvider):
     """Password-hash authenticated provider with built-in login form."""
 
     supports_login_form = True
+    supports_password_login = True
 
     def __init__(self, password_hashes: Mapping[str, str]) -> None:
         self._hashes = dict(password_hashes)
@@ -223,6 +231,14 @@ class BasicAuthProvider(AuthProvider):
             )
             for username in password_hashes
         }
+
+    def get_user_by_id(self, user_id: str) -> DeckUser | None:
+        return self._users.get(user_id)
+
+    def get_impersonatable_users(self, actor: DeckUser) -> Sequence[DeckUser]:
+        if not actor.is_superuser:
+            return ()
+        return tuple(u for u in self._users.values() if u.id != actor.id and not u.is_superuser)
 
     @classmethod
     def from_plain_passwords(cls, credentials: Mapping[str, str]) -> BasicAuthProvider:
@@ -254,9 +270,6 @@ class BasicAuthProvider(AuthProvider):
             return None
         return self._users.get(user_id)
 
-    def get_user_by_id(self, user_id: str) -> DeckUser | None:
-        return self._users.get(user_id)
-
     def has_permission(
         self,
         user: DeckUser | None,
@@ -285,6 +298,7 @@ class RBACAuthProvider(AuthProvider):
         self._accounts_by_id: dict[str, RBACAccount] = {acc.user.id: acc for acc in accounts}
         self._user_loader = user_loader
         self.supports_login_form = bool(accounts)
+        self.supports_password_login = bool(accounts)
 
     @classmethod
     def make_account(
@@ -401,6 +415,15 @@ class RBACAuthProvider(AuthProvider):
 
     def get_user_by_id(self, user_id: str) -> DeckUser | None:
         return self.get_account_by_id(user_id)
+
+    def get_impersonatable_users(self, actor: DeckUser) -> Sequence[DeckUser]:
+        if not actor.is_superuser:
+            return ()
+        return tuple(
+            acc.user
+            for acc in self._accounts_by_id.values()
+            if acc.user.id != actor.id and not acc.user.is_superuser
+        )
 
 
 class FlaskLoginAuthProvider(RBACAuthProvider):
