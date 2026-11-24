@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flask-deck"
-version = "0.5.0"
+version = "0.6.0"
 description = "Enterprise & AI-Agent Operations Control Plane for Flask and SQLAlchemy 2.0 — zero Node build, zero CDN, SSO/Passkeys/MFA, four-eyes approvals, hash-chained audit, REST API & MCP server."
 readme = "README.md"
 license = { text = "MIT" }
@@ -16,13 +16,18 @@ keywords = [
     "flask",
     "admin",
     "flask-admin",
+    "django-admin",
     "sqlalchemy",
     "wsgi",
     "dashboard",
     "crud",
     "rbac",
+    "iam",
     "audit-log",
     "command-palette",
+    "mcp",
+    "rest-api",
+    "passkeys",
     "django-unfold",
     "sqladmin",
 ]
@@ -101,6 +106,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/duhanguler/flask-deck"
+Demo = "https://flask-deck.vercel.app"
 Repository = "https://github.com/duhanguler/flask-deck"
 Documentation = "https://github.com/duhanguler/flask-deck#readme"
 Issues = "https://github.com/duhanguler/flask-deck/issues"

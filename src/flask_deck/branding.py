@@ -30,6 +30,10 @@ VALID_TEMPLATE_SLOTS: frozenset[str] = frozenset(
         "rail_bottom",
         "dashboard_top",
         "list_above_table",
+        "form_above",
+        "form_below",
+        "detail_above",
+        "detail_below",
         "login_footer",
     }
 )

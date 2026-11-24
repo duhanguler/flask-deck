@@ -1,0 +1,66 @@
+{% extends "flask_deck/base.html" %}
+{% block breadcrumbs %}
+<span class="dk-crumb-sep">/</span>
+<span class="dk-crumb dk-crumb-cur">{{ category_name }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="dk-page-head">
+  <div>
+    <h1 class="dk-page-title">{{ category_name }}</h1>
+    <p class="dk-page-sub dk-mono">{{ model_cards | length }} resource(s) in this category</p>
+  </div>
+  <div class="dk-page-actions">
+    <a href="{{ url_for(bp_name ~ '.index') }}" class="dk-btn">{{ deck_icon("arrow-left", 13) }} {{ _("Dashboard") }}</a>
+  </div>
+</div>
+
+<div class="dk-content">
+  <div class="dk-cat-grid">
+    {% for card in model_cards %}
+    <section class="dk-panel dk-cat-card">
+      <div class="dk-panel-head">
+        <div class="dk-top-left">
+          {{ deck_icon(card.icon, 15) }}
+          <h2 class="dk-panel-title">{{ card.label }}</h2>
+        </div>
+        {% if card.count is not none %}
+        <span class="dk-badge dk-badge-neutral dk-mono dk-tabular">{{ "{:,}".format(card.count) }}</span>
+        {% endif %}
+      </div>
+      <div class="dk-panel-body">
+        <div class="dk-page-actions">
+          <a href="{{ card.list_url }}" class="dk-btn dk-btn-sm">{{ deck_icon("table", 12) }} {{ _("Open") }}</a>
+          {% if card.create_url %}
+          <a href="{{ card.create_url }}" class="dk-btn dk-btn-sm dk-btn-primary">{{ deck_icon("plus", 12) }} {{ _("New") }} {{ card.singular }}</a>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+    {% endfor %}
+  </div>
+
+  {% if recent_audit %}
+  <section class="dk-panel">
+    <div class="dk-panel-head">
+      <h2 class="dk-panel-title">{{ _("Recent Events") }} · {{ category_name }}</h2>
+      <a href="{{ url_for(bp_name ~ '.audit_list') }}" class="dk-subtle dk-mono">{{ _("All →") }}</a>
+    </div>
+    <div>
+      {% for entry in recent_audit %}
+      <div class="dk-activity-row">
+        <div class="dk-activity-main">
+          <div>
+            <span class="dk-badge dk-badge-{{ 'ok' if entry.action == 'create' else ('danger' if entry.action == 'delete' else 'warn') }} dk-mono">{{ entry.action }}</span>
+            <strong>{{ entry.model_label }}</strong> · {{ entry.record_repr }}
+            <span class="dk-subtle dk-mono">by {{ entry.actor_name }}</span>
+          </div>
+        </div>
+        <span class="dk-mono dk-subtle dk-tabular">{{ format_dt(entry.timestamp, '%Y-%m-%d %H:%M') }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

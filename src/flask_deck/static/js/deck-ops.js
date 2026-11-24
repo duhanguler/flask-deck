@@ -4,6 +4,22 @@
   const D = window.__deck;
   if (!D) return;
 
+  document.addEventListener("submit", (e) => {
+    const f = e.target;
+    if (!(f instanceof HTMLFormElement)) return;
+    const sqlHid = f.querySelector('input[type="hidden"][name="sql"]');
+    const ed = document.getElementById("dk-sql-editor");
+    if (sqlHid && ed) {
+      sqlHid.value = ed.value;
+      const bindEl = document.getElementById("dk-sql-bind");
+      const bindHid = f.querySelector('input[type="hidden"][name="bind_key"]');
+      if (bindEl && bindHid) bindHid.value = bindEl.value;
+      const chartEl = document.getElementById("dk-sql-chart");
+      const chartHid = f.querySelector('input[type="hidden"][name="chart_type"]');
+      if (chartEl && chartHid) chartHid.value = chartEl.value;
+    }
+  });
+
   document.addEventListener("click", (e) => {
     const t = e.target;
     if (!(t instanceof Element)) return;
@@ -164,8 +180,9 @@
           response: { authenticatorData: b64e(cred.response.authenticatorData), clientDataJSON: b64e(cred.response.clientDataJSON), signature: b64e(cred.response.signature), userHandle: cred.response.userHandle ? b64e(cred.response.userHandle) : null }
         };
         const v = await fetch(pkLog.getAttribute("data-verify-url"), { method: "POST", headers: csrfHdr(), body: JSON.stringify({ credential: res, next: pkLog.getAttribute("data-next-url") || "" }) }).then((r) => r.json());
-        if (v.ok && v.redirect) window.location.assign(v.redirect);
-      } catch (err) { if (D.toast) D.toast(String(err.message || err), "danger"); }
+        if (!v.ok || !v.redirect) throw new Error(v.error || "Passkey sign-in failed");
+        window.location.assign(v.redirect);
+      } catch (err) { if (D.showToast) D.showToast(String(err.message || err), "danger"); }
     });
   }
 })();

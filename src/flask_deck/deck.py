@@ -4,13 +4,14 @@ import base64
 import enum
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,7 @@ from flask_deck.audit import (
 )
 from flask_deck.auth import AuthProvider, DeckUser, OpenAuthProvider
 from flask_deck.branding import render_brand_css, render_safe_slot
+from flask_deck.checks import check_model_view, run_model_view_checks
 from flask_deck.config import DeckConfig
 from flask_deck.dashboard import (
     DashboardBuilder,
@@ -84,6 +86,7 @@ from flask_deck.events import (
     WebhookSink,
 )
 from flask_deck.exceptions import (
+    ConfigurationError,
     InvalidPKError,
     PermissionDeniedError,
     ReadOnlyError,
@@ -102,6 +105,7 @@ from flask_deck.i18n import (
     TZ_SESSION_KEY,
     DictTranslator,
     Translator,
+    get_js_catalog,
     is_valid_timezone,
     normalize_locale,
     set_request_locale_tz,
@@ -127,7 +131,13 @@ from flask_deck.mfa import (
     MFAStore,
     SQLAlchemyMFAStore,
 )
-from flask_deck.model_view import ModelView
+from flask_deck.model_view import (
+    ActionField,
+    ActionSpec,
+    ModelURL,
+    ModelView,
+    is_safe_template_name,
+)
 from flask_deck.passkeys import (
     InMemoryPasskeyStore,
     PasskeyStore,
@@ -135,11 +145,13 @@ from flask_deck.passkeys import (
     is_webauthn_available,
 )
 from flask_deck.query import (
+    apply_base_stmt_extras,
     apply_list_load_options,
     attach_sql_telemetry,
     begin_request_telemetry,
     estimate_table_rows,
     get_request_telemetry,
+    parse_search_column_spec,
     prepare_scoped_clauses,
     soft_delete_predicate,
 )
@@ -211,6 +223,7 @@ _RESERVED_MODEL_SLUGS: frozenset[str] = frozenset(
         "_impersonate",
         "_demo",
         "_mcp",
+        "_category",
     }
 )
 
@@ -271,6 +284,7 @@ class Deck:
         job_storage: StorageBackend | None = None,
         preview_store: PreviewStore | None = None,
         rate_limit_store: RateLimitStore | None = None,
+        password_reset_notifier: Callable[[DeckUser, str, str], None] | None = None,
         config: DeckConfig | None = None,
         demo_credentials: Sequence[tuple[str, str, str]] = (),
         sql_presets: Sequence[tuple[str, str]] = (),
@@ -335,6 +349,13 @@ class Deck:
         self.blueprint: Blueprint | None = None
         self.views: dict[str, ModelView] = {}
         self._views_by_model: dict[type[Any], ModelView] = {}
+        self._site_actions: dict[str, tuple[ActionSpec, Callable[..., Any]]] = {}
+        self._disabled_site_actions: set[str] = set()
+        self._context_processors: list[Callable[[], Mapping[str, Any]]] = []
+        self._mounted_custom_urls: set[str] = set()
+        self.password_reset_notifier: Callable[[DeckUser, str, str], None] | None = (
+            password_reset_notifier
+        )
         self.custom_pages: dict[str, PageSpec] = {}
         self.scheduled_jobs: dict[str, ScheduledJobSpec] = {}
         self._dashboard_builder: DashboardBuilder | None = None
@@ -579,6 +600,21 @@ class Deck:
                 for eng in self.adapter.get_engines().values():
                     attach_sql_telemetry(eng)
 
+        if isinstance(self.job_backend, SQLAlchemyJobBackend):
+            prev_resolver = self.job_backend._callable_resolver
+
+            def _chained_resolver(
+                name: str,
+                _prev: Any = prev_resolver,
+            ) -> Any:
+                fn = self._resolve_scheduled_callable(name)
+                if fn is not None:
+                    return fn
+                return _prev(name) if _prev is not None else None
+
+            self.job_backend.set_callable_resolver(_chained_resolver)
+            self.job_backend.set_default_app(app)
+
         self._asset_hashes = {
             "css/deck.css": _file_hash(_STATIC_DIR / "css" / "deck.css"),
             "js/deck.js": _file_hash(_STATIC_DIR / "js" / "deck.js"),
@@ -586,6 +622,8 @@ class Deck:
             "js/deck-form.js": _file_hash(_STATIC_DIR / "js" / "deck-form.js"),
             "js/deck-ops.js": _file_hash(_STATIC_DIR / "js" / "deck-ops.js"),
         }
+
+        self._run_startup_view_checks()
 
         bp = self._build_blueprint()
         self.blueprint = bp
@@ -597,6 +635,82 @@ class Deck:
     # ------------------------------------------------------------------
     # Registration API
     # ------------------------------------------------------------------
+
+    def _run_startup_view_checks(self, single_view: ModelView | None = None) -> None:
+        """Run ModelViewChecks (warn in dev/testing; fail-fast in production or strict_view_checks)."""
+        findings = (
+            check_model_view(
+                single_view,
+                extra_sensitive_patterns=tuple(self.config.extra_sensitive_patterns),
+            )
+            if single_view is not None
+            else run_model_view_checks(self)
+        )
+        errors = [f for f in findings if f.severity == "error"]
+        warns = [f for f in findings if f.severity == "warn"]
+        for w in warns:
+            logger.warning("[%s] %s", w.code, w.message)
+        if errors:
+            strict = self.config.environment == "production" or self.config.strict_view_checks
+            if strict:
+                details = "; ".join(f"[{e.code}] {e.message}" for e in errors)
+                raise ConfigurationError(f"Flask-Deck ModelView configuration errors: {details}")
+            for err in errors:
+                logger.warning("[%s] %s", err.code, err.message)
+
+    def _mount_view_urls(self, view: ModelView, *, bp: Blueprint | None = None) -> None:
+        """Mount custom sub-routes returned by ``view.get_urls()`` under Deck's auth/CSRF/CSP boundary."""
+        urls = view.get_urls()
+        if not urls:
+            return
+        bp_name = self.config.name
+        slug = view.meta.slug
+        for u in urls:
+            if not isinstance(u, ModelURL):
+                continue
+            clean_rule = u.rule.strip().lstrip("/")
+            if not clean_rule or ".." in clean_rule.split("/") or "\\" in clean_rule or "\x00" in clean_rule:
+                continue
+            if not u.endpoint or not callable(u.handler):
+                continue
+            ep_suffix = f"custom_{slug.replace('-', '_')}_{u.endpoint}"
+            full_ep = f"{bp_name}.{ep_suffix}"
+            if full_ep in self._mounted_custom_urls:
+                continue
+            methods = tuple(m.upper() for m in u.methods) or ("GET",)
+            default_perm = (
+                f"{slug}:view"
+                if all(m in {"GET", "HEAD", "OPTIONS"} for m in methods)
+                else f"{slug}:edit"
+            )
+            required_perm = u.permission if u.permission is not None else default_perm
+
+            def _wrapped_custom_url(
+                *args: Any,
+                _view: ModelView = view,
+                _handler: Callable[..., Any] = u.handler,
+                _perm: str = required_perm,
+                _slug: str = slug,
+                **kwargs: Any,
+            ) -> Any:
+                if _perm:
+                    self._require_perm(_perm, model_slug=_slug)
+                return _handler(*args, **kwargs)
+
+            _wrapped_custom_url.__name__ = ep_suffix
+            rel_rule = f"/{slug}/{clean_rule}"
+            if bp is not None:
+                bp.add_url_rule(rel_rule, endpoint=ep_suffix, view_func=_wrapped_custom_url, methods=list(methods))
+                self._mounted_custom_urls.add(full_ep)
+            elif self.app is not None and self.blueprint is not None:
+                prefix = self.config.url_prefix.rstrip("/")
+                self.app.add_url_rule(
+                    f"{prefix}{rel_rule}",
+                    endpoint=full_ep,
+                    view_func=_wrapped_custom_url,
+                    methods=list(methods),
+                )
+                self._mounted_custom_urls.add(full_ep)
 
     def register(self, *models_or_views: type[Any] | ModelView) -> Deck:
         """Register one or more SQLAlchemy model classes or ModelView classes/instances."""
@@ -616,14 +730,148 @@ class Deck:
         return self
 
     def register_view(self, view: ModelView) -> Deck:
-        """Register a concrete ModelView instance."""
-        if view.meta.slug in _RESERVED_MODEL_SLUGS:
-            raise ValueError(f"Model slug {view.meta.slug!r} conflicts with a built-in Deck route.")
-        if view.meta.slug in self.views:
-            raise ValueError(f"Duplicate Deck model slug: {view.meta.slug!r}")
+        """Register a concrete ModelView instance (supports same-model multi-view proxy registration)."""
+        slug = view.meta.slug
+        if not slug or "/" in slug or "\\" in slug or any(ch.isspace() for ch in slug):
+            raise ValueError(f"Invalid Deck model slug {slug!r}: must be non-empty without slashes or whitespace.")
+        if slug in _RESERVED_MODEL_SLUGS:
+            raise ValueError(f"Model slug {slug!r} conflicts with a built-in Deck route.")
+        if slug in self.views:
+            raise ValueError(f"Duplicate Deck model slug: {slug!r}")
+        view._deck = self
+        if not view._explicit_empty_value_display:
+            view.empty_value_display = self.config.empty_value_display  # type: ignore[misc]
+        self._run_startup_view_checks(single_view=view)
         self.views[view.meta.slug] = view
-        self._views_by_model[view.model] = view
+        if view.model not in self._views_by_model or view.is_primary_view:
+            self._views_by_model[view.model] = view
+        if self.app is not None and self.blueprint is not None:
+            self._mount_view_urls(view)
         return self
+
+    def add_action(
+        self,
+        func: Callable[..., Any],
+        name: str | None = None,
+        *,
+        label: str | None = None,
+        icon: str = "zap",
+        confirm: bool = False,
+        variant: str = "default",
+        permission: str | None = None,
+        row_action: bool = False,
+        bulk_action: bool = True,
+        require_confirm_text: bool = False,
+        fields: Sequence[ActionField] = (),
+        async_job: bool = False,
+        require_approval: bool = False,
+    ) -> Deck:
+        """Register a site-wide action available across all registered ModelViews (unless disabled)."""
+        existing_spec: ActionSpec | None = getattr(func, "_deck_action_spec", None)
+        if existing_spec is not None:
+            act_name = str(name or existing_spec.name).strip()
+            if not act_name:
+                raise ValueError("Site action requires a non-empty name")
+            spec = ActionSpec(
+                name=act_name,
+                label=label or existing_spec.label,
+                handler_name=existing_spec.handler_name or act_name,
+                icon=existing_spec.icon if icon == "zap" else icon,
+                confirm=existing_spec.confirm or confirm or bool(fields),
+                variant="danger" if (variant == "danger" or existing_spec.variant == "danger") else "default",
+                permission=permission if permission is not None else existing_spec.permission,
+                row_action=existing_spec.row_action or row_action,
+                bulk_action=existing_spec.bulk_action and bulk_action,
+                require_confirm_text=existing_spec.require_confirm_text or require_confirm_text,
+                fields=tuple(fields) if fields else existing_spec.fields,
+                async_job=existing_spec.async_job or async_job,
+                require_approval=existing_spec.require_approval or require_approval,
+            )
+        else:
+            act_name = str(name or getattr(func, "__name__", "")).strip()
+            if not act_name:
+                raise ValueError("Site action requires a non-empty name")
+            spec = ActionSpec(
+                name=act_name,
+                label=label or act_name.replace("_", " ").replace("-", " ").title(),
+                handler_name=act_name,
+                icon=icon,
+                confirm=confirm or bool(fields),
+                variant="danger" if variant == "danger" else "default",
+                permission=permission,
+                row_action=row_action,
+                bulk_action=bulk_action,
+                require_confirm_text=require_confirm_text,
+                fields=tuple(fields),
+                async_job=async_job,
+                require_approval=require_approval,
+            )
+        self._site_actions[spec.name] = (spec, func)
+        self._disabled_site_actions.discard(spec.name)
+        return self
+
+    def disable_action(self, name: str) -> Deck:
+        """Globally disable a built-in (e.g. 'delete') or site-wide action across all views."""
+        clean = name.strip()
+        if clean:
+            self._disabled_site_actions.add(clean)
+        return self
+
+    def context_processor(
+        self, fn: Callable[[], Mapping[str, Any]]
+    ) -> Callable[[], Mapping[str, Any]]:
+        """Decorator injecting extra template context variables into every Deck page."""
+        self._context_processors.append(fn)
+        return fn
+
+    def _resolve_action_spec_and_handler(
+        self,
+        view: ModelView,
+        action_name: str,
+        user: DeckUser | None,
+    ) -> tuple[ActionSpec, Callable[..., Any]] | None:
+        """Resolve an active view or site-wide action respecting ``get_actions`` and disabled lists."""
+        available = view.get_actions(user)
+        spec = available.get(action_name)
+        if spec is None:
+            return None
+        if spec.handler_name and hasattr(view, spec.handler_name):
+            bound = getattr(view, spec.handler_name)
+            if callable(bound):
+                return spec, bound
+        site_entry = self._site_actions.get(action_name)
+        if site_entry is not None:
+            _, raw_fn = site_entry
+            try:
+                sig = inspect.signature(raw_fn)
+                param_names = list(sig.parameters.keys())
+                takes_view = bool(param_names) and param_names[0] in {"view", "model_view"}
+            except (TypeError, ValueError):
+                takes_view = False
+
+            if takes_view:
+                def _bound_site_action(
+                    *args: Any,
+                    _v: ModelView = view,
+                    _f: Callable[..., Any] = raw_fn,
+                    **kwargs: Any,
+                ) -> Any:
+                    return _f(_v, *args, **kwargs)
+
+                return spec, _bound_site_action
+            return spec, raw_fn
+        return None
+
+    @staticmethod
+    def _resolve_template(override: str | None, default: str) -> str:
+        if override and is_safe_template_name(override):
+            return override.strip()
+        return default
+
+    @staticmethod
+    def _view_media_context(view: ModelView) -> dict[str, Any]:
+        css, js = view.collect_media()
+        return {"extra_media_css": css, "extra_media_js": js}
 
     def dashboard(self, fn: DashboardBuilder) -> DashboardBuilder:
         """Decorator registering a custom dashboard widget builder callback."""
@@ -783,9 +1031,14 @@ class Deck:
         )
         ev = threading.Event()
         backend = ThreadPoolJobBackend(max_workers=1)
+        backend._jobs["sync"] = rec
         try:
             ctx = JobContext(backend, "sync", ev)
-            msg = spec.fn(ctx)
+            if self.app is not None and not has_request_context():
+                with self.app.app_context():
+                    msg = spec.fn(ctx)
+            else:
+                msg = spec.fn(ctx)
             rec.status = "succeeded"
             rec.progress = 100
             rec.message = msg or "Completed"
@@ -1016,33 +1269,55 @@ class Deck:
             record_repr=entry.record_repr,
             changes=clean_changes,
             metadata=entry.metadata,
+            prev_hash=entry.prev_hash,
+            entry_hash=entry.entry_hash,
         )
 
     def _is_dotted_field_allowed(
-        self, view: ModelView, col_spec: str, user: DeckUser | None, restricted: frozenset[str]
+        self,
+        view: ModelView,
+        col_spec: str,
+        user: DeckUser | None,
+        restricted: frozenset[str],
+        *,
+        allow_multi_hop: bool = False,
     ) -> bool:
-        if "." not in col_spec:
-            return col_spec not in restricted
-        rel_name, target_col = col_spec.split(".", 1)
-        if rel_name in restricted or is_sensitive_field(
-            target_col, self.config.extra_sensitive_patterns
-        ):
+        clean_path, _ = parse_search_column_spec(col_spec) if allow_multi_hop else (col_spec, "")
+        if not clean_path:
             return False
-        rel_meta = view.meta.relationships_by_name.get(rel_name)
-        if rel_meta is None or rel_meta.direction != "MANYTOONE":
+        if "." not in clean_path:
+            return clean_path not in restricted
+        parts = clean_path.split(".")
+        if len(parts) > (3 if allow_multi_hop else 2):
             return False
-        t_view = self._views_by_model.get(rel_meta.target_model)
-        if t_view is not None:
+        if parts[0] in restricted:
+            return False
+        cur_meta = view.meta
+        for hop in parts[:-1]:
+            if is_sensitive_field(hop, self.config.extra_sensitive_patterns):
+                return False
+            rel_meta = cur_meta.relationships_by_name.get(hop)
+            if rel_meta is None:
+                return False
+            if not allow_multi_hop and rel_meta.direction != "MANYTOONE":
+                return False
+            next_view = self._views_by_model.get(rel_meta.target_model)
+            if next_view is not None:
+                cur_meta = next_view.meta
+            else:
+                cur_meta = introspect_model(rel_meta.target_model)
+        leaf = parts[-1]
+        if is_sensitive_field(leaf, self.config.extra_sensitive_patterns):
+            return False
+        leaf_view = self._views_by_model.get(cur_meta.model)
+        if leaf_view is not None:
             t_restricted = self.auth.hidden_fields_for(
-                user, t_view.meta.slug
-            ) | self.auth.masked_fields_for(user, t_view.meta.slug)
-            if target_col in t_restricted or target_col in t_view.meta.sensitive_fields:
+                user, leaf_view.meta.slug
+            ) | self.auth.masked_fields_for(user, leaf_view.meta.slug)
+            if leaf in t_restricted or leaf in leaf_view.meta.sensitive_fields:
                 return False
         else:
-            from flask_deck.introspection import introspect_model
-
-            t_meta = introspect_model(rel_meta.target_model)
-            if target_col not in t_meta.fields_by_name or target_col in t_meta.sensitive_fields:
+            if leaf not in cur_meta.fields_by_name or leaf in cur_meta.sensitive_fields:
                 return False
         return True
 
@@ -1056,7 +1331,9 @@ class Deck:
         searchable = tuple(
             col_spec
             for col_spec in view.resolved_searchable
-            if self._is_dotted_field_allowed(view, col_spec, user, restricted)
+            if self._is_dotted_field_allowed(
+                view, col_spec, user, restricted, allow_multi_hop=True
+            )
         )
         filterable = frozenset(
             col_spec
@@ -1283,15 +1560,25 @@ class Deck:
         if req.reason:
             dual_meta["reason"] = req.reason
 
+        def _scope_m2m_req(target_cls: type[Any], s: sa.Select[Any]) -> sa.Select[Any]:
+            tv = self._views_by_model.get(target_cls)
+            return tv.scope_query(s, requester) if tv is not None else s
+
         if req.operation == "create":
             raw_items = req.payload.get("form_items")
+            utc_pt = bool(req.payload.get("utc_passthrough", False))
             if raw_items is not None:
                 form_md = self._items_to_multidict(raw_items)
             else:
+                from flask_deck.rest_api import build_multidict_from_json
+
                 vals = req.payload.get("values") or {}
-                form_md = MultiDict([(str(k), str(v)) for k, v in vals.items()])
+                form_md = build_multidict_from_json(
+                    self, view, vals, user=requester, mode="create"
+                )
+                utc_pt = True
             obj = view.model()
-            view.apply_form_data(
+            vdata_create = view.apply_form_data(
                 sess,
                 obj,
                 form_md,
@@ -1300,8 +1587,10 @@ class Deck:
                 mode="create",
                 max_json_depth=self.config.max_json_depth,
                 m2m_getter=form_md.getlist,
+                m2m_scope=_scope_m2m_req,
+                utc_passthrough=utc_pt,
             )
-            view.on_model_change(obj, is_created=True, user=requester)
+            view.invoke_on_model_change(obj, is_created=True, user=requester, virtual_data=vdata_create)
             sess.add(obj)
             sess.flush()
             inline_diffs = view.apply_inline_forms(
@@ -1311,7 +1600,9 @@ class Deck:
                 auth=self.auth,
                 user=requester,
                 max_json_depth=self.config.max_json_depth,
+                views_by_model=self._views_by_model,
             )
+            view.save_related(obj, is_created=True, user=requester, inline_diffs=inline_diffs)
             sess.commit()
             pk_str = encode_pk(extract_pk(obj, view.meta))
             safe_repr = view.format_record_repr(obj, auth=self.auth, user=requester)
@@ -1362,13 +1653,28 @@ class Deck:
             if obj is None:
                 raise ValueError(f"Record {req.record_pk} no longer exists.")
             before_snap = view.extract_snapshot(obj)
+            expected_ver = str(req.payload.get("expected_version", "")).strip()
+            if expected_ver:
+                current_ver = view.compute_version_token(obj, auth=self.auth, user=requester)
+                if expected_ver != current_ver:
+                    raise ValueError(
+                        f"Record {req.record_pk} was modified while awaiting approval (version conflict)."
+                    )
             raw_items = req.payload.get("form_items")
+            is_partial = bool(req.payload.get("partial", False))
+            utc_pt = bool(req.payload.get("utc_passthrough", False))
             if raw_items is not None:
                 form_md = self._items_to_multidict(raw_items)
             else:
+                from flask_deck.rest_api import build_multidict_from_json
+
                 vals = req.payload.get("values") or {}
-                form_md = MultiDict([(str(k), str(v)) for k, v in vals.items()])
-            view.apply_form_data(
+                form_md = build_multidict_from_json(
+                    self, view, vals, user=requester, mode="edit", obj=obj
+                )
+                is_partial = True
+                utc_pt = True
+            vdata_edit = view.apply_form_data(
                 sess,
                 obj,
                 form_md,
@@ -1377,12 +1683,19 @@ class Deck:
                 mode="edit",
                 max_json_depth=self.config.max_json_depth,
                 m2m_getter=form_md.getlist,
+                m2m_scope=_scope_m2m_req,
+                partial=is_partial,
+                utc_passthrough=utc_pt,
             )
             if view.version_column:
                 vf = view.meta.fields_by_name.get(view.version_column)
                 if vf is not None and vf.field_type == "integer":
-                    setattr(obj, view.version_column, int(getattr(obj, view.version_column) or 0) + 1)
-            view.on_model_change(obj, is_created=False, user=requester)
+                    setattr(
+                        obj,
+                        view.version_column,
+                        int(before_snap.get(view.version_column) or 0) + 1,
+                    )
+            view.invoke_on_model_change(obj, is_created=False, user=requester, virtual_data=vdata_edit)
             sess.flush()
             inline_diffs = view.apply_inline_forms(
                 sess,
@@ -1391,7 +1704,9 @@ class Deck:
                 auth=self.auth,
                 user=requester,
                 max_json_depth=self.config.max_json_depth,
+                views_by_model=self._views_by_model,
             )
+            view.save_related(obj, is_created=False, user=requester, inline_diffs=inline_diffs)
             sess.commit()
             safe_repr = view.format_record_repr(obj, auth=self.auth, user=requester)
             diff = compute_diff(
@@ -1521,12 +1836,16 @@ class Deck:
 
         # action
         action_name = str(req.payload.get("action_name", ""))
-        spec = view.actions.get(action_name)
-        if spec is None:
+        resolved_act = self._resolve_action_spec_and_handler(view, action_name, requester)
+        if resolved_act is None:
             raise ValueError(f"Unknown action {action_name!r} on model {req.model_slug!r}.")
+        spec, handler = resolved_act
         raw_pks = [str(p) for p in req.payload.get("pks", [])]
         decoded = [decode_pk(p, view.meta) for p in raw_pks]
         stmt = view.scope_query(sa.select(view.model), requester)
+        sd_pred = soft_delete_predicate(view.meta, view.soft_delete_column, trashed=False)
+        if sd_pred is not None:
+            stmt = stmt.where(sd_pred)
         if len(view.meta.primary_keys) == 1:
             pk_col = getattr(view.model, view.meta.primary_keys[0].name)
             stmt = stmt.where(pk_col.in_([p[0] for p in decoded]))
@@ -1538,16 +1857,20 @@ class Deck:
         form_md = self._items_to_multidict(raw_items)
         if not raw_items and isinstance(req.payload.get("params"), Mapping):
             form_md = MultiDict([(str(k), str(v)) for k, v in req.payload["params"].items()])
-        handler = getattr(view, spec.handler_name)
         msg = handler(records, form_md, requester)
         sess.commit()
+        msg_str = (
+            f"{spec.label} ({len(records)})"
+            if isinstance(msg, Response)
+            else str(msg or f"{spec.label} ({len(records)})")
+        )
         dual_meta["action"] = action_name
         dual_meta["count"] = len(records)
         self._record_audit(
             action_name="bulk_action",
             view=view,
             record_pk=req.record_pk,
-            record_repr=msg or f"{spec.label} ({len(records)})",
+            record_repr=msg_str,
             metadata=dual_meta,
             actor=requester,
         )
@@ -1565,7 +1888,7 @@ class Deck:
             payload={"approval_id": req.id, "operation": "action", "reviewer_id": reviewer.id},
             actor=reviewer,
         )
-        return str(msg or f"Executed approved action '{spec.label}'")
+        return msg_str
 
     def _excluded_audit_models(self, user: DeckUser | None) -> frozenset[str]:
         """Return model_slug values that the viewer is NOT authorized to inspect in Audit Ledger."""
@@ -1594,8 +1917,15 @@ class Deck:
                 return True
         return False
 
+    @staticmethod
+    def _slugify_category(cat: str) -> str:
+        clean = "".join(ch if ch.isalnum() else "-" for ch in cat.strip().lower())
+        while "--" in clean:
+            clean = clean.replace("--", "-")
+        return clean.strip("-") or "models"
+
     def _sidebar_groups(self) -> list[dict[str, Any]]:
-        """Build grouped sidebar navigation while honoring each view's count_mode."""
+        """Build grouped sidebar navigation honoring ``sidebar_order``, ``nav_order``, and ``count_mode``."""
         user = self._current_user()
         authorized: list[ModelView] = [
             v
@@ -1631,19 +1961,23 @@ class Deck:
                 for idx, v in enumerate(b_views):
                     counts[v.meta.slug] = int(row[idx] or 0)
 
-        groups_map: dict[str, list[dict[str, Any]]] = {}
-        for v in authorized:
+        groups_map: dict[str, list[tuple[int, int, dict[str, Any]]]] = {}
+        for reg_idx, v in enumerate(authorized):
             groups_map.setdefault(v.category, []).append(
-                {
-                    "slug": v.meta.slug,
-                    "label": v.plural_label,
-                    "icon": v.icon,
-                    "count": counts.get(v.meta.slug),
-                    "url": url_for(f"{self.config.name}.model_list", slug=v.meta.slug),
-                    "is_page": False,
-                }
+                (
+                    v.nav_order,
+                    reg_idx,
+                    {
+                        "slug": v.meta.slug,
+                        "label": v.plural_label,
+                        "icon": v.icon,
+                        "count": counts.get(v.meta.slug),
+                        "url": url_for(f"{self.config.name}.model_list", slug=v.meta.slug),
+                        "is_page": False,
+                    },
+                )
             )
-        for p in self.custom_pages.values():
+        for p_idx, p in enumerate(self.custom_pages.values()):
             page_allowed = (
                 self.auth.has_permission(user, p.permission)
                 if p.permission
@@ -1654,16 +1988,42 @@ class Deck:
             )
             if page_allowed:
                 groups_map.setdefault(p.category, []).append(
-                    {
-                        "slug": f"_page:{p.slug}",
-                        "label": p.title,
-                        "icon": p.icon,
-                        "count": None,
-                        "url": url_for(f"{self.config.name}.custom_page", page_slug=p.slug),
-                        "is_page": True,
-                    }
+                    (
+                        200,
+                        p_idx,
+                        {
+                            "slug": f"_page:{p.slug}",
+                            "label": p.title,
+                            "icon": p.icon,
+                            "count": None,
+                            "url": url_for(f"{self.config.name}.custom_page", page_slug=p.slug),
+                            "is_page": True,
+                        },
+                    )
                 )
-        return [{"name": cat, "links": items} for cat, items in groups_map.items()]
+
+        ordered_cats: list[str] = []
+        if self.config.sidebar_order:
+            for preferred in self.config.sidebar_order:
+                if preferred in groups_map and preferred not in ordered_cats:
+                    ordered_cats.append(preferred)
+        for cat in groups_map:
+            if cat not in ordered_cats:
+                ordered_cats.append(cat)
+
+        out: list[dict[str, Any]] = []
+        for cat in ordered_cats:
+            sorted_links = [item for _, _, item in sorted(groups_map[cat], key=lambda t: (t[0], t[1]))]
+            cat_slug = self._slugify_category(cat)
+            out.append(
+                {
+                    "name": cat,
+                    "slug": cat_slug,
+                    "url": url_for(f"{self.config.name}.category_index", cat_slug=cat_slug),
+                    "links": sorted_links,
+                }
+            )
+        return out
 
     def _asset_url(self, filename: str) -> str:
         ver = self._asset_hashes.get(filename) or _file_hash(_STATIC_DIR / filename)
@@ -1811,10 +2171,34 @@ class Deck:
             "curated_timezones": CURATED_TIMEZONES,
             "rel_repr": self._rel_repr,
             "rel_url_builder": self._rel_url_builder(user),
+            "site_url": self.config.site_url,
+            "extra_media_css": (),
+            "extra_media_js": (),
+            "js_i18n_json": json.dumps(
+                get_js_catalog(self.translator), separators=(",", ":")
+            ),
+            "forgot_password_enabled": bool(
+                self.password_reset_notifier is not None
+                and hasattr(self.auth, "create_password_reset_token")
+                and not self.config.read_only
+                and not self.config.demo_safe_mode
+            ),
             "format_dt": lambda dt, fmt="%Y-%m-%d %H:%M": (
                 to_user_timezone(dt, active_tz).strftime(fmt) if isinstance(dt, datetime) else str(dt)
             ),
         }
+        protected_keys = frozenset(
+            {"deck", "config", "bp_name", "current_user", "csrf_token", "csrf_field", "csp_nonce"}
+        )
+        for proc in self._context_processors:
+            try:
+                injected = proc()
+                if isinstance(injected, Mapping):
+                    for k, v in injected.items():
+                        if k not in protected_keys:
+                            ctx[k] = v
+            except Exception as exc:
+                logger.warning("Deck context_processor %r failed: %s", proc, exc)
         ctx.update(extra)
         ctx["render_slot"] = lambda slot_name: render_safe_slot(
             self.config.brand, slot_name, ctx, template_renderer=render_template
@@ -1828,6 +2212,10 @@ class Deck:
         *,
         fallback_bind_key: str | None = None,
         current_value: Any = None,
+        owner_view: ModelView | None = None,
+        field_name: str | None = None,
+        owner_obj: Any | None = None,
+        is_m2m: bool = False,
     ) -> list[dict[str, str]]:
         user = self._current_user()
         target_view = self._views_by_model.get(target_model)
@@ -1846,6 +2234,11 @@ class Deck:
             from flask_deck.introspection import introspect_model
 
             meta = introspect_model(target_model)
+        if owner_view is not None and field_name:
+            if is_m2m:
+                stmt = owner_view.formfield_for_manytomany(field_name, stmt, user, obj=owner_obj)
+            else:
+                stmt = owner_view.formfield_for_foreignkey(field_name, stmt, user, obj=owner_obj)
         sess = self.get_session(bind_key)
         stmt = stmt.order_by(getattr(target_model, meta.primary_keys[0].name).asc()).limit(limit)
         items = list(sess.scalars(stmt).all())
@@ -1912,6 +2305,7 @@ class Deck:
                         "name": fname,
                         "label": f"{rel_meta.label} · {fm.label}",
                         "type": fm.field_type,
+                        "nullable": fm.nullable,
                         "choices": fm.choices,
                         "value": filter_params.get(fname, ""),
                         "gte": filter_params.get(f"{fname}__gte", ""),
@@ -1933,6 +2327,7 @@ class Deck:
                 "name": fname,
                 "label": view.get_column_label(fname),
                 "type": "fk" if fm.fk_target_model is not None else fm.field_type,
+                "nullable": fm.nullable,
                 "choices": fm.choices,
                 "value": filter_params.get(fname, ""),
                 "gte": filter_params.get(f"{fname}__gte", ""),
@@ -2047,6 +2442,14 @@ class Deck:
         sess = self.get_session(view.bind_key)
         dialect_name = sess.get_bind().dialect.name if sess.get_bind() is not None else ""
         base_stmt = view.scope_query(sa.select(view.model), user)
+        search_applier: Callable[[sa.Select[Any]], sa.Select[Any]] | None = None
+        if search_term and view.has_custom_search_results():
+            def _custom_search(s: sa.Select[Any]) -> sa.Select[Any]:
+                s2, _ = view.get_search_results(s, search_term, user)
+                return s2
+
+            search_applier = _custom_search
+
         _, all_where, _, joins = prepare_scoped_clauses(
             view.meta,
             base_stmt=base_stmt,
@@ -2063,12 +2466,17 @@ class Deck:
             user=user,
             auth=self.auth,
             extra_where=[dh_pred] if dh_pred is not None else (),
+            search_applier=search_applier,
+            max_search_tokens=self.config.max_search_tokens,
+            max_search_length=self.config.max_search_length,
         )
-        stmt = sa.select(view.model)
+        stmt = apply_base_stmt_extras(sa.select(view.model), base_stmt)
         for rel_attr in joins:
             stmt = stmt.outerjoin(rel_attr)
         if all_where:
             stmt = stmt.where(*all_where)
+        if search_applier is not None:
+            stmt = search_applier(stmt)
         for applier in appliers_by_param.values():
             stmt = applier(stmt)
         return stmt, active_tab
@@ -2083,16 +2491,106 @@ class Deck:
         submitted: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         user = self._current_user()
-        visible = view.visible_form_fields(self.auth, user)
+        obj_ctx = obj if mode == "edit" else None
+        visible = view.visible_form_fields(self.auth, user, mode=mode, obj=obj_ctx)
         rbac_readonly = self.auth.readonly_fields_for(user, view.meta.slug)
+        dynamic_readonly = view.effective_readonly_fields(user, obj_ctx)
         masked = self.auth.masked_fields_for(user, view.meta.slug)
-        fieldsets = view.resolve_fieldsets(visible, errors=errors)
+        fieldsets = view.resolve_fieldsets(visible, errors=errors, user=user, obj=obj_ctx)
         media_builder = self._media_url_builder(view)
         rel_url_builder = self._rel_url_builder(user)
         bp_name = self.config.name
+        raw_id_set = set(view.raw_id_fields)
 
         field_specs: dict[str, dict[str, Any]] = {}
         for col_name in visible:
+            # 1. VirtualField (non-model declarative form field)
+            vfield = view.virtual_fields_by_name.get(col_name)
+            if vfield is not None:
+                if submitted is not None:
+                    if vfield.field_type == "boolean":
+                        v_raw: Any = str(submitted.get(col_name, "")).strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "on",
+                        }
+                    elif col_name in submitted:
+                        v_raw = submitted.get(col_name)
+                    else:
+                        v_raw = vfield.default
+                else:
+                    v_raw = vfield.default
+                if isinstance(v_raw, datetime):
+                    v_raw = to_user_timezone(v_raw).strftime("%Y-%m-%dT%H:%M")
+                elif isinstance(v_raw, date):
+                    v_raw = v_raw.isoformat()
+                elif vfield.field_type == "json" and isinstance(v_raw, (dict, list)):
+                    v_raw = json.dumps(v_raw, indent=2)
+
+                cond_rule = view.field_conditions.get(col_name)
+                show_when_json = (
+                    json.dumps({"field": cond_rule[0], "op": cond_rule[1], "value": cond_rule[2]})
+                    if cond_rule is not None
+                    else ""
+                )
+                v_is_ro = (
+                    col_name in rbac_readonly
+                    or col_name in dynamic_readonly
+                    or (mode == "edit" and col_name in masked)
+                )
+                v_eff_kind = "enum" if (vfield.choices and vfield.field_type == "string") else vfield.field_type
+                widget_override = view.get_widget_for_field(col_name, v_eff_kind)
+                custom_widget_html: Any = None
+                widget_full = False
+                widget_name = widget_override if isinstance(widget_override, str) else ""
+                if isinstance(widget_override, FormWidget):
+                    widget_name = "custom_widget"
+                    widget_full = widget_override.full_width
+                    custom_widget_html = widget_override.render(
+                        name=col_name,
+                        field_id=f"fld_{col_name}",
+                        value=v_raw,
+                        readonly=v_is_ro,
+                        required=vfield.required,
+                        label=view.get_column_label(col_name),
+                    )
+                field_specs[col_name] = {
+                    "kind": v_eff_kind,
+                    "is_virtual": True,
+                    "widget": widget_name,
+                    "custom_widget_html": custom_widget_html,
+                    "widget_full": widget_full,
+                    "file_kind": "",
+                    "file_accept": "",
+                    "media_url": None,
+                    "show_when_json": show_when_json,
+                    "dependent_json": "",
+                    "help_text": view.get_field_help_text(col_name),
+                    "placeholder": vfield.placeholder,
+                    "prepopulate_json": "",
+                    "radio_layout": view.radio_fields.get(col_name, ""),
+                    "is_raw_id": False,
+                    "name": col_name,
+                    "label": view.get_column_label(col_name),
+                    "required": vfield.required,
+                    "readonly": v_is_ro,
+                    "masked": col_name in masked,
+                    "value": "" if v_raw is None else v_raw,
+                    "choices": vfield.choices,
+                    "max_length": vfield.max_length,
+                    "fk_options": [],
+                    "fk_search_url": None,
+                    "fk_lookup_url": "",
+                    "fk_current_label": "",
+                    "fk_target_slug": "",
+                    "fk_can_create": False,
+                    "fk_can_edit": False,
+                    "fk_can_view": False,
+                    "fk_can_delete": False,
+                }
+                continue
+
             d_spec = view.display_fields.get(col_name)
             if d_spec is not None and col_name not in view.meta.fields_by_name:
                 if obj is not None:
@@ -2106,7 +2604,7 @@ class Deck:
                         rel_url_builder=rel_url_builder,
                     )
                 else:
-                    formatted_preview = f"— ({d_spec.label})"
+                    formatted_preview = f"{view.empty_value_display} ({d_spec.label})"
                 field_specs[col_name] = {
                     "kind": "display_ro",
                     "widget": "",
@@ -2115,6 +2613,8 @@ class Deck:
                     "formatted_html": formatted_preview,
                     "help_text": view.get_field_help_text(col_name),
                     "prepopulate_json": "",
+                    "radio_layout": "",
+                    "is_raw_id": False,
                     "name": col_name,
                     "label": view.get_column_label(col_name),
                     "required": False,
@@ -2127,7 +2627,7 @@ class Deck:
             fmeta = view.meta.fields_by_name.get(col_name)
             rel_meta = view.meta.relationships_by_name.get(col_name)
             is_ro = (
-                col_name in view.resolved_readonly_fields
+                col_name in dynamic_readonly
                 or ((col_name in rbac_readonly or col_name in masked) and mode == "edit")
                 or (fmeta is not None and fmeta.primary_key and mode == "edit")
             )
@@ -2174,22 +2674,38 @@ class Deck:
 
                 fk_options: list[dict[str, str]] = []
                 fk_search_url: str | None = None
+                fk_lookup_url = ""
                 fk_current_label = ""
                 fk_target_slug = ""
                 fk_can_create = False
                 fk_can_edit = False
                 fk_can_view = False
+                fk_can_delete = False
                 if fmeta.fk_target_model is not None:
                     fk_options = self._fk_options_for_field(
                         fmeta.fk_target_model,
                         fallback_bind_key=view.bind_key,
                         current_value=raw_val,
+                        owner_view=view,
+                        field_name=col_name,
+                        owner_obj=obj_ctx,
                     )
                     target_v = self._views_by_model.get(fmeta.fk_target_model)
                     if target_v is not None:
                         t_slug = target_v.meta.slug
                         fk_target_slug = t_slug
-                        fk_search_url = url_for(f"{bp_name}.api_fk", slug=t_slug)
+                        fk_search_url = url_for(
+                            f"{bp_name}.api_fk",
+                            slug=t_slug,
+                            owner_slug=view.meta.slug,
+                            field_name=col_name,
+                        )
+                        fk_lookup_url = url_for(
+                            f"{bp_name}.api_lookup",
+                            slug=t_slug,
+                            owner_slug=view.meta.slug,
+                            field_name=col_name,
+                        )
                         fk_can_view = bool(
                             target_v.can_view
                             and self.auth.has_permission(user, f"{t_slug}:view", model_slug=t_slug)
@@ -2207,6 +2723,13 @@ class Deck:
                             and target_v.can_edit
                             and not target_v.file_fields
                             and self.auth.has_permission(user, f"{t_slug}:edit", model_slug=t_slug)
+                        )
+                        fk_can_delete = bool(
+                            not is_ro
+                            and not self.config.read_only
+                            and target_v.can_delete
+                            and not (self.config.demo_safe_mode and not target_v.soft_delete_column)
+                            and self.auth.has_permission(user, f"{t_slug}:delete", model_slug=t_slug)
                         )
                     if raw_val is not None:
                         for opt in fk_options:
@@ -2238,14 +2761,14 @@ class Deck:
                     else ""
                 )
 
-                widget_override = view.field_widgets.get(col_name, "")
+                widget_override = view.get_widget_for_field(col_name, fmeta.field_type)
                 is_req = (
                     not is_ro
                     and not fmeta.nullable
                     and not fmeta.has_default
                     and not fmeta.autoincrement
                 )
-                custom_widget_html: Any = None
+                custom_widget_html = None
                 widget_full = False
                 widget_name = widget_override if isinstance(widget_override, str) else ""
                 if isinstance(widget_override, FormWidget):
@@ -2266,6 +2789,7 @@ class Deck:
                 )
                 field_specs[col_name] = {
                     "kind": kind,
+                    "is_virtual": False,
                     "widget": widget_name,
                     "custom_widget_html": custom_widget_html,
                     "widget_full": widget_full,
@@ -2277,7 +2801,10 @@ class Deck:
                     "show_when_json": show_when_json,
                     "dependent_json": dependent_json,
                     "help_text": help_text,
+                    "placeholder": "",
                     "prepopulate_json": prepopulate_json,
+                    "radio_layout": view.radio_fields.get(col_name, ""),
+                    "is_raw_id": col_name in raw_id_set and fmeta.fk_target_model is not None,
                     "name": col_name,
                     "label": view.get_column_label(col_name),
                     "required": is_req,
@@ -2288,11 +2815,13 @@ class Deck:
                     "max_length": fmeta.max_length,
                     "fk_options": fk_options,
                     "fk_search_url": fk_search_url,
+                    "fk_lookup_url": fk_lookup_url,
                     "fk_current_label": fk_current_label,
                     "fk_target_slug": fk_target_slug,
                     "fk_can_create": fk_can_create,
                     "fk_can_edit": fk_can_edit,
                     "fk_can_view": fk_can_view,
+                    "fk_can_delete": fk_can_delete,
                 }
             elif rel_meta is not None and rel_meta.direction == "MANYTOMANY":
                 from flask_deck.introspection import introspect_model
@@ -2307,6 +2836,7 @@ class Deck:
                     t_sd = soft_delete_predicate(target_v.meta, target_v.soft_delete_column, trashed=False)
                     if t_sd is not None:
                         cnt_stmt = cnt_stmt.where(t_sd)
+                cnt_stmt = view.formfield_for_manytomany(col_name, cnt_stmt, user, obj=obj_ctx)
                 m2m_total = int(t_sess.execute(cnt_stmt).scalar() or 0)
 
                 if view.m2m_mode == "async" and target_v is not None:
@@ -2342,7 +2872,13 @@ class Deck:
                 options: list[dict[str, str]] = []
                 m2m_search_url: str | None = None
                 if m2m_eff_mode == "async" and target_v is not None:
-                    m2m_search_url = url_for(f"{bp_name}.api_fk", slug=target_v.meta.slug)
+                    m2m_search_url = url_for(
+                        f"{bp_name}.api_fk",
+                        slug=target_v.meta.slug,
+                        owner_slug=view.meta.slug,
+                        field_name=col_name,
+                        is_m2m="1",
+                    )
                     if submitted is not None and selected_ids and not selected_items and len(t_meta.primary_keys) == 1:
                         pk_f = t_meta.primary_keys[0]
                         from flask_deck.model_view import coerce_form_value
@@ -2372,6 +2908,10 @@ class Deck:
                         rel_meta.target_model,
                         limit=opt_limit,
                         fallback_bind_key=view.bind_key,
+                        owner_view=view,
+                        field_name=col_name,
+                        owner_obj=obj_ctx,
+                        is_m2m=True,
                     )
                     seen_opt_ids = {o["id"] for o in options}
                     for s_it in selected_items:
@@ -2396,6 +2936,8 @@ class Deck:
                     "widget_full": True,
                     "help_text": help_text,
                     "prepopulate_json": "",
+                    "radio_layout": "",
+                    "is_raw_id": col_name in raw_id_set,
                     "name": col_name,
                     "label": view.get_column_label(col_name),
                     "required": False,
@@ -2410,14 +2952,37 @@ class Deck:
                     "m2m_can_create": m2m_can_create,
                 }
 
-        # Inline child rows (routed to view.bind_key!)
+        # Rich Inlines 2.0 (routed to view.bind_key, respecting get_inlines, scope_query, soft-delete, files, readonly, @display)
         inlines_ctx: list[dict[str, Any]] = []
+        any_inline_has_files = False
         parent_pk = (
             getattr(obj, view.meta.primary_keys[0].name, None) if obj is not None else None
         )
-        for inline in view.inline_views:
+        active_inlines = view.get_inlines(user, obj_ctx)
+        for inline in active_inlines:
             fk_col = inline.resolve_fk_column(view.meta)
             inline_target_v = self._views_by_model.get(inline.model)
+            eff_child_slug = (
+                inline_target_v.meta.slug if inline_target_v is not None else inline.meta.slug
+            )
+            child_hidden = self.auth.hidden_fields_for(user, eff_child_slug)
+            child_rbac_ro = self.auth.readonly_fields_for(user, eff_child_slug)
+            child_masked = self.auth.masked_fields_for(user, eff_child_slug)
+            can_add_inline = bool(
+                inline.can_add_inline(obj_ctx, user)
+                and not self.config.read_only
+                and self.auth.has_permission(user, f"{eff_child_slug}:create", model_slug=eff_child_slug)
+            )
+            can_edit_inline = bool(
+                inline.can_edit_inline(obj_ctx, user)
+                and not self.config.read_only
+                and self.auth.has_permission(user, f"{eff_child_slug}:edit", model_slug=eff_child_slug)
+            )
+            can_del_inline = bool(
+                inline.can_delete_inline(obj_ctx, user)
+                and not self.config.read_only
+                and self.auth.has_permission(user, f"{eff_child_slug}:delete", model_slug=eff_child_slug)
+            )
             can_open_inline = bool(
                 inline.show_change_link
                 and inline_target_v is not None
@@ -2428,29 +2993,113 @@ class Deck:
                 )
             )
             col_specs: list[dict[str, Any]] = []
-            for col in inline.editable_columns:
-                fm = inline.meta.fields_by_name[col]
+            for col in inline.display_columns:
+                if col in child_hidden or col in inline.meta.sensitive_fields:
+                    continue
+                is_inline_ro = (
+                    col in inline.resolved_readonly_fields
+                    or col in child_rbac_ro
+                    or col in child_masked
+                    or col not in inline.editable_columns
+                )
+                if col in inline.display_fields and col not in inline.meta.fields_by_name:
+                    col_specs.append(
+                        {
+                            "name": col,
+                            "label": inline.get_column_label(col),
+                            "kind": "display_ro",
+                            "readonly": True,
+                            "choices": (),
+                            "fk_options": [],
+                            "fk_search_url": "",
+                            "fk_lookup_url": "",
+                            "fk_target_slug": "",
+                            "fk_can_create": False,
+                            "fk_can_edit": False,
+                            "fk_can_view": False,
+                            "file_kind": "",
+                            "file_accept": "",
+                            "widget_obj": None,
+                            "widget_name": "",
+                            "required": False,
+                            "help_text": inline.field_help_texts.get(col)
+                            or inline.display_fields[col].description,
+                        }
+                    )
+                    continue
+                fm = inline.meta.fields_by_name.get(col)
+                if fm is None:
+                    continue
+                file_cfg = inline.file_fields.get(col)
+                if file_cfg is not None:
+                    any_inline_has_files = True
                 fk_opts = (
                     self._fk_options_for_field(
                         fm.fk_target_model, fallback_bind_key=view.bind_key
                     )
-                    if fm.fk_target_model is not None
+                    if fm.fk_target_model is not None and not is_inline_ro
                     else []
                 )
                 fk_t_view = self._views_by_model.get(fm.fk_target_model) if fm.fk_target_model else None
+                fk_t_slug = fk_t_view.meta.slug if fk_t_view is not None else ""
+                w_ov = inline.field_widgets.get(col)
+                col_kind = (
+                    "display_ro"
+                    if is_inline_ro and file_cfg is None
+                    else (
+                        "file"
+                        if file_cfg is not None
+                        else ("fk" if fm.fk_target_model is not None else fm.field_type)
+                    )
+                )
                 col_specs.append(
                     {
                         "name": col,
-                        "label": fm.label,
-                        "kind": "fk" if fm.fk_target_model is not None else fm.field_type,
+                        "label": inline.get_column_label(col),
+                        "kind": col_kind,
+                        "readonly": is_inline_ro,
                         "choices": fm.choices,
                         "fk_options": fk_opts,
                         "fk_search_url": (
-                            url_for(f"{bp_name}.api_fk", slug=fk_t_view.meta.slug)
-                            if fk_t_view is not None
-                            else ""
+                            url_for(f"{bp_name}.api_fk", slug=fk_t_slug) if fk_t_slug else ""
                         ),
-                        "required": not fm.nullable and not fm.has_default and not fm.autoincrement,
+                        "fk_lookup_url": (
+                            url_for(f"{bp_name}.api_lookup", slug=fk_t_slug) if fk_t_slug else ""
+                        ),
+                        "fk_target_slug": fk_t_slug,
+                        "fk_can_create": bool(
+                            fk_t_view is not None
+                            and not is_inline_ro
+                            and not self.config.read_only
+                            and fk_t_view.can_create
+                            and not fk_t_view.file_fields
+                            and self.auth.has_permission(user, f"{fk_t_slug}:create", model_slug=fk_t_slug)
+                        ),
+                        "fk_can_edit": bool(
+                            fk_t_view is not None
+                            and not is_inline_ro
+                            and not self.config.read_only
+                            and fk_t_view.can_edit
+                            and not fk_t_view.file_fields
+                            and self.auth.has_permission(user, f"{fk_t_slug}:edit", model_slug=fk_t_slug)
+                        ),
+                        "fk_can_view": bool(
+                            fk_t_view is not None
+                            and fk_t_view.can_view
+                            and self.auth.has_permission(user, f"{fk_t_slug}:view", model_slug=fk_t_slug)
+                        ),
+                        "file_kind": file_cfg.kind if file_cfg is not None else "",
+                        "file_accept": ",".join(sorted(file_cfg.resolved_allowed_mimes()))
+                        if file_cfg is not None
+                        else "",
+                        "widget_obj": w_ov if isinstance(w_ov, FormWidget) else None,
+                        "widget_name": w_ov if isinstance(w_ov, str) else "",
+                        "required": (
+                            not is_inline_ro
+                            and not fm.nullable
+                            and not fm.has_default
+                            and not fm.autoincrement
+                        ),
                         "help_text": inline.field_help_texts.get(col) or fm.help_text,
                     }
                 )
@@ -2461,6 +3110,22 @@ class Deck:
             )
             rows_data: list[dict[str, Any]] = []
             pk_name = inline.meta.primary_keys[0].name
+
+            def _build_inline_media_url(
+                col_n: str,
+                child_pk_str: str,
+                *,
+                _inl_slug: str = inline.meta.slug,
+            ) -> str | None:
+                if not child_pk_str:
+                    return None
+                return url_for(
+                    f"{bp_name}.serve_inline_media",
+                    slug=view.meta.slug,
+                    inline_slug=_inl_slug,
+                    field_name=col_n,
+                    raw_pk=child_pk_str,
+                )
 
             def _build_change_url(
                 pk_str_val: str,
@@ -2489,14 +3154,22 @@ class Deck:
                         part = key[len(prefix) :].split("__", 1)[0]
                         if part.isdigit():
                             sub_indices.add(int(part))
-                for idx in sorted(sub_indices):
+                for out_idx, idx in enumerate(sorted(sub_indices)):
                     rp = f"{prefix}{idx}__"
+                    out_rp = f"{prefix}{out_idx}__"
                     row_pk = str(submitted.get(f"{rp}_pk", "")).strip()
+                    marked_del = str(submitted.get(f"{rp}_delete", "0")).strip() in {"1", "true", "on"}
                     vals: dict[str, Any] = {}
                     fk_labels: dict[str, str] = {}
+                    ro_html: dict[str, Any] = {}
+                    media_urls: dict[str, str | None] = {}
+                    widget_html: dict[str, Any] = {}
                     for cs in col_specs:
                         c_name = cs["name"]
-                        if cs["kind"] == "boolean":
+                        if cs["kind"] == "display_ro":
+                            ro_html[c_name] = inline.empty_value_display
+                            vals[c_name] = ""
+                        elif cs["kind"] == "boolean":
                             vals[c_name] = str(submitted.get(f"{rp}{c_name}", "")).lower() in {
                                 "1",
                                 "true",
@@ -2511,11 +3184,24 @@ class Deck:
                                     (o["label"] for o in cs["fk_options"] if o["id"] == str(vals[c_name])),
                                     str(vals[c_name]),
                                 )
+                            if cs["widget_obj"] is not None:
+                                widget_html[c_name] = cs["widget_obj"].render(
+                                    name=f"{out_rp}{c_name}",
+                                    field_id=f"fld_{out_rp}{c_name}",
+                                    value=vals[c_name],
+                                    readonly=bool(cs["readonly"] or not can_edit_inline),
+                                    required=False if not row_pk else bool(cs["required"]),
+                                    label=cs["label"],
+                                )
                     rows_data.append(
                         {
                             "pk": row_pk,
+                            "deleted": marked_del,
                             "values": vals,
                             "fk_labels": fk_labels,
+                            "ro_html": ro_html,
+                            "media_urls": media_urls,
+                            "widget_html": widget_html,
                             "change_url": _build_change_url(row_pk),
                         }
                     )
@@ -2527,23 +3213,46 @@ class Deck:
                         if inline.order_by and inline.order_by in inline.meta.fields_by_name
                         else pk_name
                     )
-                    existing_rows = list(
-                        self.get_session(view.bind_key)
-                        .scalars(
-                            sa.select(inline.model)
-                            .where(getattr(inline.model, fk_col) == parent_pk)
-                            .order_by(getattr(inline.model, order_col_name).asc())
+                    c_stmt = sa.select(inline.model).where(getattr(inline.model, fk_col) == parent_pk)
+                    if inline_target_v is not None:
+                        c_stmt = inline_target_v.scope_query(c_stmt, user)
+                        c_sd = soft_delete_predicate(
+                            inline_target_v.meta, inline_target_v.soft_delete_column, trashed=False
                         )
-                        .all()
-                    )
-                for r in existing_rows:
+                        if c_sd is not None:
+                            c_stmt = c_stmt.where(c_sd)
+                    c_stmt = inline.scope_query(c_stmt, user, obj_ctx)
+                    c_stmt = c_stmt.order_by(getattr(inline.model, order_col_name).asc())
+                    existing_rows = list(self.get_session(view.bind_key).scalars(c_stmt).all())
+                for row_idx, r in enumerate(existing_rows):
                     vals = {}
                     fk_labels = {}
-                    row_pk_str = str(getattr(r, pk_name))
+                    ro_html = {}
+                    media_urls = {}
+                    widget_html = {}
+                    row_pk_str = encode_pk(extract_pk(r, inline.meta))
+                    rp = f"{prefix}{row_idx}__"
+                    def _row_media_builder(
+                        f_n: str, _o: Any, *, _pk: str = row_pk_str
+                    ) -> str | None:
+                        return _build_inline_media_url(f_n, _pk)
+
                     for cs in col_specs:
                         col = cs["name"]
+                        if cs["kind"] == "display_ro":
+                            ro_html[col] = inline.format_inline_cell(
+                                col,
+                                r,
+                                auth=self.auth,
+                                user=user,
+                                media_url_builder=_row_media_builder,
+                            )
+                            vals[col] = ""
+                            continue
                         v = getattr(r, col, None)
-                        if isinstance(v, enum.Enum):
+                        if col in child_masked and v is not None:
+                            v = self.auth.mask_field_value(user, eff_child_slug, col, v)
+                        elif isinstance(v, enum.Enum):
                             v = v.value
                         elif isinstance(v, datetime):
                             v = to_user_timezone(v).strftime("%Y-%m-%dT%H:%M")
@@ -2553,45 +3262,98 @@ class Deck:
                             vals[col] = bool(v)
                         else:
                             vals[col] = "" if v is None else v
+                            if cs["kind"] == "file" and v:
+                                media_urls[col] = _build_inline_media_url(col, row_pk_str)
                             if cs["kind"] == "fk" and vals[col] != "":
                                 fk_labels[col] = next(
                                     (o["label"] for o in cs["fk_options"] if o["id"] == str(vals[col])),
                                     str(vals[col]),
                                 )
+                        if cs["widget_obj"] is not None:
+                            widget_html[col] = cs["widget_obj"].render(
+                                name=f"{rp}{col}",
+                                field_id=f"fld_{rp}{col}",
+                                value=vals[col],
+                                readonly=bool(cs["readonly"] or not can_edit_inline),
+                                required=bool(cs["required"]),
+                                label=cs["label"],
+                            )
                     rows_data.append(
                         {
                             "pk": row_pk_str,
                             "values": vals,
                             "fk_labels": fk_labels,
+                            "ro_html": ro_html,
+                            "media_urls": media_urls,
+                            "widget_html": widget_html,
                             "change_url": _build_change_url(row_pk_str),
                         }
                     )
 
-                desired_extra = inline.extra if mode == "create" else 0
+                desired_extra = (
+                    inline.extra
+                    if mode == "create"
+                    else (inline.extra_on_edit if inline.extra_on_edit is not None else 0)
+                )
                 target_rows = min(
                     inline.max_rows,
                     max(inline.min_num, len(rows_data) + desired_extra),
                 )
-                while inline.can_create and len(rows_data) < target_rows:
+                while can_add_inline and len(rows_data) < target_rows:
+                    r_idx_new = len(rows_data)
+                    rp_new = f"{prefix}{r_idx_new}__"
                     blank_vals = {
                         cs["name"]: (False if cs["kind"] == "boolean" else "") for cs in col_specs
                     }
+                    blank_ro = {
+                        cs["name"]: inline.empty_value_display
+                        for cs in col_specs
+                        if cs["kind"] == "display_ro"
+                    }
+                    blank_widgets: dict[str, Any] = {}
+                    for cs in col_specs:
+                        if cs["widget_obj"] is not None:
+                            blank_widgets[cs["name"]] = cs["widget_obj"].render(
+                                name=f"{rp_new}{cs['name']}",
+                                field_id=f"fld_{rp_new}{cs['name']}",
+                                value="",
+                                readonly=bool(cs["readonly"]),
+                                required=False,
+                                label=cs["label"],
+                            )
                     rows_data.append(
-                        {"pk": "", "values": blank_vals, "fk_labels": {}, "change_url": None}
+                        {
+                            "pk": "",
+                            "deleted": False,
+                            "values": blank_vals,
+                            "fk_labels": {},
+                            "ro_html": blank_ro,
+                            "media_urls": {},
+                            "widget_html": blank_widgets,
+                            "change_url": None,
+                        }
                     )
 
+            inline_has_err = bool(errors) and any(
+                k == inline.meta.slug or k.startswith(f"{inline.meta.slug}[")
+                for k in (errors or {})
+            )
             inlines_ctx.append(
                 {
                     "slug": inline.meta.slug,
                     "label": inline.display_label,
                     "layout": inline.layout,
                     "min_num": inline.min_num,
+                    "max_rows": inline.max_rows,
                     "extra": inline.extra,
                     "show_change_link": inline.show_change_link,
+                    "collapsible": inline.collapsible,
+                    "collapsed": bool(inline.collapsed and not inline_has_err),
                     "columns": col_specs,
                     "rows": rows_data,
-                    "can_create": inline.can_create,
-                    "can_delete": inline.can_delete,
+                    "can_create": can_add_inline,
+                    "can_edit": can_edit_inline,
+                    "can_delete": can_del_inline,
                 }
             )
 
@@ -2603,10 +3365,11 @@ class Deck:
             "field_specs": field_specs,
             "inlines": inlines_ctx,
             "errors": errors or {},
-            "has_file_fields": any(c in view.file_fields for c in visible),
+            "has_file_fields": any(c in view.file_fields for c in visible) or any_inline_has_files,
             "occ_version": view.compute_version_token(obj, auth=self.auth, user=user)
             if obj is not None
             else "",
+            **self._view_media_context(view),
         }
 
     # ------------------------------------------------------------------
@@ -2659,6 +3422,8 @@ class Deck:
             is_public_auth = endpoint in {
                 f"{bp_name}.login",
                 f"{bp_name}.login_mfa",
+                f"{bp_name}.forgot_password",
+                f"{bp_name}.reset_password",
                 f"{bp_name}.sso_login",
                 f"{bp_name}.sso_callback",
                 f"{bp_name}.passkey_login_options",
@@ -2723,9 +3488,22 @@ class Deck:
                     rl_resp.status_code = 429
                     rl_resp.headers["Retry-After"] = str(retry_after)
                     return rl_resp
+                from flask_deck.iam import SQLAlchemyAuthProvider
+
+                if isinstance(deck.auth, SQLAlchemyAuthProvider):
+                    owner_rec = deck.auth.get_user_record(key_rec.owner_id)
+                    if owner_rec is not None and not owner_rec.is_active:
+                        return (
+                            jsonify({"error": "API key owner account is deactivated."}),
+                            401,
+                        )  # type: ignore[return-value]
+                api_user = api_key_to_user(key_rec)
+                owner_user = deck.auth.get_user_by_id(key_rec.owner_id)
+                if owner_user is not None and owner_user.tenant_id is not None:
+                    api_user = replace(api_user, tenant_id=owner_user.tenant_id)
                 g._deck_api_key = key_rec
                 g._deck_real_user = None
-                g._deck_user = api_key_to_user(key_rec)
+                g._deck_user = api_user
                 if (
                     deck.config.demo_safe_mode
                     and endpoint.startswith(f"{bp_name}.rest_v1_")
@@ -2840,6 +3618,7 @@ class Deck:
                     f"{bp_name}.security_iam_user_update",
                     f"{bp_name}.security_iam_user_reset_password",
                     f"{bp_name}.security_iam_user_delete",
+                    f"{bp_name}.security_iam_users_bulk",
                     f"{bp_name}.security_iam_group_create",
                     f"{bp_name}.security_iam_group_update",
                     f"{bp_name}.security_iam_group_delete",
@@ -2968,6 +3747,8 @@ class Deck:
 
 
         register_all_routes(bp, self)
+        for v in self.views.values():
+            self._mount_view_urls(v, bp=bp)
         return bp
 
 

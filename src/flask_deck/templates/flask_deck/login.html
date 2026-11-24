@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="deck-csrf" content="{{ csrf_token }}">
+  <meta name="deck-i18n" content="{{ js_i18n_json }}">
   {% if brand.favicon_url %}
   <link rel="icon" href="{{ brand.favicon_url }}">
   {% else %}
@@ -47,6 +48,12 @@
     <div class="dk-alert dk-alert-neutral dk-mono" role="note">{{ brand.login_notice }}</div>
     {% endif %}
 
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in messages %}
+      <div class="dk-alert dk-alert-{{ cat if cat in ['ok', 'warn', 'danger', 'info'] else 'neutral' }}" role="status">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+
     {% if error_msg %}
     <div class="dk-alert dk-alert-danger" role="alert">{{ error_msg }}</div>
     {% endif %}
@@ -89,6 +96,11 @@
       </div>
 
       <button type="submit" class="dk-btn dk-btn-primary">{{ _("Sign in") }}</button>
+      {% if forgot_password_enabled %}
+      <div class="dk-auth-foot">
+        <a href="{{ url_for(bp_name ~ '.forgot_password') }}" class="dk-subtle">{{ _("Forgot password?") }}</a>
+      </div>
+      {% endif %}
     </form>
     {% endif %}
 
@@ -107,5 +119,6 @@
     {{ render_slot('login_footer') }}
   </div>
 </div>
+<div class="dk-toasts" id="dk-toasts" aria-live="polite"></div>
 </body>
 </html>

@@ -309,7 +309,7 @@ def encode_pk(values: tuple[Any, ...]) -> str:
     """Encode single or composite primary key values into a URL-safe string."""
     if len(values) == 1:
         text = _pk_part_to_str(values[0])
-        if "/" in text:
+        if "/" in text or text.startswith(("pk:", "ck:")):
             return f"pk:{quote(text, safe='')}"
         return text
     serialized = json.dumps([_pk_part_to_str(v) for v in values], separators=(",", ":")).encode("utf-8")

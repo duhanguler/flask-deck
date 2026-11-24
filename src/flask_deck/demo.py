@@ -44,7 +44,12 @@ from flask_deck.dashboard import (
 )
 from flask_deck.deck import Deck
 from flask_deck.events import WebhookDeliveryRecord
-from flask_deck.filters import ListFilter, RangeListFilter
+from flask_deck.filters import (
+    EmptyFieldListFilter,
+    ListFilter,
+    RangeListFilter,
+    RelatedOnlyFieldListFilter,
+)
 from flask_deck.formatters import (
     AvatarFormatter,
     BadgeFormatter,
@@ -571,10 +576,11 @@ class ProductView(ModelView):
 class OrderItemInline(InlineModelView):
     model = OrderItem
     label = "Line Items"
-    columns = ("product_id", "quantity", "unit_price_cents")
+    columns = ("product_id", "quantity", "unit_price_cents", "line_total")
     order_by = "id"
     extra = 1
     show_change_link = True
+    collapsible = True
     field_help_texts = MappingProxyType(
         {
             "quantity": "Provisioned unit quantity.",
@@ -582,19 +588,30 @@ class OrderItemInline(InlineModelView):
         }
     )
 
+    @display(label="Line Total")
+    def line_total(self, obj: OrderItem) -> str:
+        return f"${(obj.quantity * obj.unit_price_cents) / 100:,.2f}"
+
 
 class OrderView(ModelView):
     model = Order
     icon = "shopping-bag"
     category = "Commerce"
     columns = ("order_number", "organization", "customer", "status", "total_cents", "est_margin", "created_at")
-    searchable_columns = ("order_number", "organization.name", "customer.email")
-    search_help_text = "Search by order #, organization name, or customer email"
+    searchable_columns = ("^order_number", "organization.name", "=customer.email")
+    search_help_text = "Tokenized search: prefix ^order_number, organization name, or exact =customer.email"
     filterable_columns = ("status", "organization_id", "organization.plan", "total_cents", "created_at")
-    custom_filters = (OrderValueTierFilter,)
+    custom_filters = (
+        OrderValueTierFilter,
+        EmptyFieldListFilter(column="notes", title="Order Notes"),
+        RelatedOnlyFieldListFilter(column="organization_id", title="Ordering Org (Active)"),
+    )
     date_hierarchy = "created_at"
     show_facets = "auto"
+    show_full_result_count = True
+    list_select_related = ("organization", "customer")
     save_as = True
+    save_on_top = True
     inline_editable_columns = ("status",)
     inlines = (OrderItemInline,)
     kanban_column = "status"
@@ -1534,7 +1551,7 @@ def _seed_showcase_control_plane(
             SavedQueryRecord(
                 id="sq-bi-plan-mrr",
                 name="Active MRR by Plan Tier (USD)",
-                sql="SELECT plan, SUM(mrr_cents) / 100 AS mrr_usd FROM demo_organizations WHERE is_active = 1 GROUP BY plan ORDER BY mrr_usd DESC",
+                sql="SELECT plan, SUM(mrr_cents) / 100 AS mrr_usd FROM demo_organizations WHERE is_active = TRUE GROUP BY plan ORDER BY mrr_usd DESC",
                 owner_id="admin",
                 owner_name="Duhan Güler",
                 is_pinned_to_dashboard=True,
@@ -1564,7 +1581,7 @@ def _seed_showcase_control_plane(
             SavedQueryRecord(
                 id="sq-bi-seat-pressure",
                 name="High Seat Utilization Accounts (>80%)",
-                sql="SELECT name, plan, seats_used, seats_limit, ROUND(100.0 * seats_used / seats_limit, 1) AS pct_used FROM demo_organizations WHERE is_active = 1 AND (100.0 * seats_used / seats_limit) >= 80 ORDER BY pct_used DESC LIMIT 12",
+                sql="SELECT name, plan, seats_used, seats_limit, ROUND(100.0 * seats_used / seats_limit, 1) AS pct_used FROM demo_organizations WHERE is_active = TRUE AND (100.0 * seats_used / seats_limit) >= 80 ORDER BY pct_used DESC LIMIT 12",
                 owner_id="admin",
                 owner_name="Duhan Güler",
                 is_pinned_to_dashboard=False,
@@ -1574,7 +1591,7 @@ def _seed_showcase_control_plane(
             SavedQueryRecord(
                 id="sq-bi-sla-risk",
                 name="Open Critical & High SLA Tickets",
-                sql="SELECT ticket_key, priority, status, sla_health, subject FROM demo_tickets WHERE deleted_at IS NULL AND status IN ('open', 'in_progress') ORDER BY sla_health ASC LIMIT 10",
+                sql="SELECT ticket_key, priority, status, sla_health, subject FROM demo_tickets WHERE deleted_at IS NULL AND UPPER(status) IN ('OPEN', 'IN_PROGRESS') ORDER BY sla_health ASC LIMIT 10",
                 owner_id="support",
                 owner_name="Maya Chen",
                 is_pinned_to_dashboard=False,
@@ -1600,12 +1617,12 @@ def _seed_showcase_control_plane(
         "organizations", user_id="admin", roles=("superadmin",)
     ):
         team_views = [
-            SavedViewRecord(id="sv-org-ent", model_slug="organizations", name="Enterprise $4K+ MRR", query_string="?f_plan=enterprise&f_mrr_cents__gte=400000", scope="team", owner_id="admin", owner_name="Duhan Güler"),
-            SavedViewRecord(id="sv-ord-ent", model_slug="orders", name="Enterprise Plan Orders", query_string="?f_organization.plan=enterprise", scope="team", owner_id="admin", owner_name="Duhan Güler"),
-            SavedViewRecord(id="sv-ord-big", model_slug="orders", name="Large Deals ($5K+)", query_string="?f_total_cents__gte=500000", scope="team", owner_id="admin", owner_name="Duhan Güler"),
-            SavedViewRecord(id="sv-tkt-sla", model_slug="tickets", name="SLA At-Risk (<50%)", query_string="?f_sla_health__lte=50", scope="team", owner_id="support", owner_name="Maya Chen"),
-            SavedViewRecord(id="sv-prd-gpu", model_slug="products", name="Compute Gallery", query_string="?view=gallery&f_category=compute", scope="team", owner_id="admin", owner_name="Duhan Güler"),
-            SavedViewRecord(id="sv-inf-tree", model_slug="infrastructure", name="Live Fleet Tree", query_string="?view=tree", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-org-ent", model_slug="organizations", name="Enterprise $4K+ MRR", query_string="f_plan=enterprise&f_mrr_cents__gte=400000", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-ord-ent", model_slug="orders", name="Enterprise Plan Orders", query_string="f_organization.plan=enterprise", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-ord-big", model_slug="orders", name="Large Deals ($5K+)", query_string="f_total_cents__gte=500000", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-tkt-sla", model_slug="tickets", name="SLA At-Risk (<50%)", query_string="f_sla_health__lte=50", scope="team", owner_id="support", owner_name="Maya Chen"),
+            SavedViewRecord(id="sv-prd-gpu", model_slug="products", name="Compute Gallery", query_string="view=gallery&f_category=compute", scope="team", owner_id="admin", owner_name="Duhan Güler"),
+            SavedViewRecord(id="sv-inf-tree", model_slug="infrastructure", name="Live Fleet Tree", query_string="view=tree", scope="team", owner_id="admin", owner_name="Duhan Güler"),
         ]
         for sv in team_views:
             deck.saved_view_store.create(sv)
@@ -1959,6 +1976,8 @@ def create_demo_app(
         enable_mcp=True,
         demo_role_switcher=True,
         demo_safe_mode=demo_safe_mode,
+        site_url="https://github.com/duhanguler/flask-deck",
+        sidebar_order=("Customers", "Commerce", "Operations"),
         brand=BrandConfig(
             accent="monochrome",
             footer_note="Acme Cloud Ops",
@@ -2000,7 +2019,7 @@ def create_demo_app(
             ),
             (
                 "Enterprise Seat Pressure (>80%)",
-                "SELECT name, plan, seats_used, seats_limit, ROUND(100.0 * seats_used / seats_limit, 1) AS util_pct FROM demo_organizations WHERE is_active = 1 AND (100.0 * seats_used / seats_limit) >= 80 ORDER BY util_pct DESC",
+                "SELECT name, plan, seats_used, seats_limit, ROUND(100.0 * seats_used / seats_limit, 1) AS util_pct FROM demo_organizations WHERE is_active = TRUE AND (100.0 * seats_used / seats_limit) >= 80 ORDER BY util_pct DESC",
             ),
             (
                 "Fleet Topology Health",
@@ -2075,7 +2094,15 @@ def create_demo_app(
             for t in tickets_all
             if t.priority == TicketPriority.CRITICAL and t.status in {TicketStatus.OPEN, TicketStatus.IN_PROGRESS}
         )
-        critical_t = next((t for t in tickets_all if t.priority == TicketPriority.CRITICAL and t.status != TicketStatus.RESOLVED), None)
+        critical_t = next(
+            (
+                t
+                for t in tickets_all
+                if t.priority == TicketPriority.CRITICAL
+                and t.status in {TicketStatus.OPEN, TicketStatus.IN_PROGRESS}
+            ),
+            None,
+        )
         total_seats_used = sum(o.seats_used for o in orgs_all if o.is_active)
         total_seats_lim = sum(o.seats_limit for o in orgs_all if o.is_active)
         seat_util_pct = int(total_seats_used / max(1, total_seats_lim) * 100)
@@ -2438,6 +2465,8 @@ def create_demo_app(
             if isinstance(deck.job_backend, ThreadPoolJobBackend):
                 with deck.job_backend._lock:
                     deck.job_backend._jobs.clear()
+                    deck.job_backend._cancel_events.clear()
+                    deck.job_backend._callables.clear()
 
             auth.reset_all()
             _seed_demo_iam(auth)

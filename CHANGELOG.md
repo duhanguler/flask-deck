@@ -2,6 +2,48 @@
 
 All notable changes to `flask-deck` are documented in this file.
 
+## [0.6.0] - 2026-11-24
+
+### Added
+- **Search, Filters & Query Engine 2.0 (`query.py`, `filters.py`):**
+  - Tokenized multi-term AND search with quoted phrase support (`tokenize_search_query`), ReDoS-safe O(N) parsing, and configurable `max_search_tokens` / `max_search_length` caps.
+  - Django-style search prefix modifiers (`^startswith`, `=exact`, `@fulltext`, default contains) via `parse_search_column_spec` and 1–2 hop relational search across MANYTOONE (`.has()`) and ONETOMANY / MANYTOMANY (`.any()` SQL `EXISTS`) with RBAC hidden/masked/sensitive checks at every hop.
+  - Custom `ModelView.get_search_results(stmt, term, user)` hook, `list_select_related` (dotted eager-load chains up to 3 hops), and `scope_query` `.join()`/`.options()` preservation across list, aggregate, kanban, calendar, and tree queries.
+  - Built-in `EmptyFieldListFilter` and `RelatedOnlyFieldListFilter`, nullable boolean/FK `(None)` (`__null__`) filter options & facets, expanded date filter presets (`year`, `no_date`, `has_date`), numbered `page_window` pagination, and `show_full_result_count`.
+- **Dynamic `ModelView` Hooks, `VirtualField`, Hybrid Batch Edit & Actions 2.0 (`model_view.py`, `routes/crud.py`):**
+  - Per-request/per-record dynamic authoring hooks: `get_readonly_fields`, `get_fieldsets`, `get_inlines`, `get_list_display`, `get_actions`, `can_view_record`, `can_edit_record`, `can_delete_record`, `formfield_for_foreignkey`, `formfield_for_manytomany`, `get_changeform_initial_data`, `save_related`, and `validate_batch`.
+  - Declarative `VirtualField` via `ModelView.extra_form_fields` coerced into an isolated `virtual_data` dict (never `setattr`'d onto ORM models, preventing mass assignment).
+  - Form & list ergonomics: `list_display_links`, `formfield_overrides`, `radio_fields` (`horizontal`/`vertical`), `save_as_continue`, `save_on_top`, `raw_id_fields`, and `Today`/`Now` date/time shortcuts.
+  - Hybrid inline table editing (`inline_edit_mode = "instant" | "batch"`): atomic `POST /<slug>/batch-edit` commits with `validate_batch()`, full rollback on any row failure, and per-row audit diffs.
+  - `Response`-returning `@action` support (CSV/PDF/JSON downloads with automatic audit + `X-Content-Type-Options: nosniff` + `Cache-Control: private, no-store`), site-level `deck.add_action()` / `deck.disable_action()` / `ModelView.disabled_actions`, and same-model multi-view proxy registration (`is_primary_view`).
+- **Rich Inlines 2.0 & Related Controls (`model_view.py`, `routes/api.py`, `routes/ops.py`):**
+  - Inline `readonly_fields`, `@display` computed columns, `field_widgets`, `file_fields` (with magic-byte validation, rollback/orphan cleanup, and RBAC/scope-guarded `/_media/<slug>/_inline/<inline_slug>/<field>/<pk>`), `collapsible`/`collapsed`, `extra_on_edit`, `validate_rows()`, composite PK support, and child `scope_query`/soft-delete IDOR isolation.
+  - Paginated `/_api/fk/<slug>` (`page`/`has_more` with `"Load more…"`), searchable paginated FK Lookup Drawer (`/_api/<slug>/lookup`), and FK Related Delete (`×` via `/_api/<slug>/<pk>/quick-delete` with Cascade Delete Impact preview).
+- **Extensibility, Template/Media Overrides & Startup Checks (`checks.py`, `deck.py`, `diagnostics.py`):**
+  - Startup `ModelViewChecks` (`DECK-E001`..`DECK-E012`, `DECK-W001`..`DECK-W002`) — warns in dev/testing and surfaces in `/_diagnostics` & `flask deck audit`; fails fast with `ConfigurationError` in `production` or when `DeckConfig(strict_view_checks=True)`.
+  - Path-traversal-safe per-view template overrides (`list_template`, `form_template`, `detail_template`, `history_template`), same-origin `ViewMedia` / `extra_css` / `extra_js` / widget `media_css` & `media_js`, 4 new `BrandConfig.template_slots` (`form_above`, `form_below`, `detail_above`, `detail_below`), and `ModelView.get_urls()` inheriting all Deck security middleware and default RBAC guards.
+  - `DeckConfig(site_url=..., empty_value_display=..., sidebar_order=...)`, `ModelView.nav_order`, `@deck.context_processor` (with protected key tamper guard), and clickable `/_category/<cat_slug>` Category Index pages.
+- **IAM 2.0, Password Policy, Opt-In Forgot Password, CLI & Full `jsi18n` (`auth.py`, `iam.py`, `routes/iam.py`, `routes/auth.py`, `cli.py`, `i18n.py`):**
+  - Targeted SQL queries + per-request caching on `SQLAlchemyAuthProvider` hot paths (eliminating full-table user scans), SQL search/filter/pagination on `/_security/users`, bulk activate/deactivate with last-active-superuser protection, and per-user `direct_permissions` (`_flask_deck_user_permissions`).
+  - Pluggable password validators (`MinimumLengthValidator`, `CommonPasswordValidator`, `NumericPasswordValidator`, `UserAttributeSimilarityValidator`, `ComplexityValidator`) with `strict_password_policy=True` option.
+  - Opt-in Forgot Password (`Deck(..., password_reset_notifier=callable)`) with SHA-256 hashed single-use 15-minute tokens, anti-enumeration constant-time responses, rate limiting, and full session revocation on reset.
+  - CLI `flask deck createsuperuser` and `flask deck changepassword <username>` commands.
+  - Expanded EN/TR/DE/AR catalogs and strict-CSP `jsi18n` (`<meta name="deck-i18n">` + `window.__deck.t()`).
+
+### Security & Bug Fixes
+- **SQL Console Lexer & Redaction Hardening (`sql_console.py`):** Dialect-aware comment/literal parser closing `\'` SQLite/PG desyncs, nested `/* /* */`, MySQL `/*!`, PG `E'...'`, and PG `#` operator bypasses; parenthesized `(SELECT ...)` redaction; blocked internal IAM/preview/webhook tables from queries and schema browsing; multi-series grouped bar chart rendering.
+- **IAM, Impersonation & Record RBAC Guards (`routes/iam.py`, `routes/auth.py`, `routes/api.py`, `routes/ops.py`, `deck.py`):** Blocked wildcard/glob privilege escalation (`**`, `*:*`, `iam:*`, privileged group assignment/edits/deletes) for delegated non-superuser `iam:manage` users; blocked impersonation on password, session, passkey, and API-key endpoints; atomic `is_active` checks on password-reset consumption and deactivated API-key owners; enforced `can_view_record`/`can_edit_record`/soft-delete on notes, media proxy, inline media, and exporter prefix searches; hardened `render_safe_markdown` against `/\evil.com` and URL attribute injection.
+- **Data Integrity & ORM Edge Cases (`model_view.py`, `rest_api.py`, `mcp_server.py`, `routes/crud.py`, `routes/governance.py`, `query.py`, `filters.py`, `cascade.py`, `audit.py`):** Preserved existing M2M links in quick-edit drawer; prevented REST/MCP `PATCH` from wiping untouched nullable booleans or shifting naive UTC datetimes; marked inline child audit entries non-revertible and hardened `audit_revert` with dynamic readonly, FK scope, and version bump; fixed composite integer PK creation/import, `EmptyFieldListFilter` on `sa.Enum`, self-referential/multi-FK dotted filter/sort via `aliased()`, `lazy="dynamic"`/`write_only` relationships, non-PK unique FKs and cycle deduplication in cascade analysis, and inline `validate_rows()`/`max_rows` bypass prevention.
+- **UI/CSS Polish (`deck.css`, `model_list.html`, `model_form.html`, `sessions.html`, `login.html`, `i18n.py`):** Fixed quick-tabs vertical clipping when filters open, single-row audit date toolbar alignment, tree view wrapped-line indentation, wide FK inputs in 2-column fieldsets, 100% EN/TR/DE/AR template i18n coverage, and demo saved-view/SQL query fixes.
+
+## [0.5.0] - 2026-11-23
+
+### Added
+- **Django Admin Parity & Precision Operations (`v0.5.0`):**
+  - Declarative `@display` columns, collapsible/horizontal `Fieldset` grids, strict `readonly_fields`, `prepopulated_fields`, `view_on_site`, `field_help_texts`, Slide-Over Related Drawer (`+`/`✏️`/`👁️`), adaptive M2M (`pills`/`dual`/`async`), stacked & tabular inlines (`min_num`/`extra`/`show_change_link`), `save_as`, `preserve_filters`, and `⌘S` dirty-form guards.
+  - Single-query SARGable `date_hierarchy`, `ListFilter` / `RangeListFilter` / `PredicateListFilter`, lazy & QuickTab-folded facets (`show_facets="auto"`), `Shift+Click` multi-column sort, `page_size=all`, O(tables) **Cascade Delete Impact Analyzer**, and HMAC-signed cross-page `select_across`.
+  - Optional DB-backed 4-Level RBAC IAM (`SQLAlchemyAuthProvider`, `/_security/users`, `/_security/groups`, `/_security/password`) and Vercel Demo Safe Mode.
+
 ## [0.4.0] - 2026-11-23
 
 ### Added

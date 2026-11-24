@@ -7,6 +7,9 @@
   const CSRF = metaVal("deck-csrf");
   const SEARCH_URL = metaVal("deck-search-url");
   const NOTIF_URL = metaVal("deck-notif-url");
+  let I18N = {};
+  try { const rawI18n = metaVal("deck-i18n"); if (rawI18n) I18N = JSON.parse(rawI18n); } catch (_) {}
+  const t = (k) => (I18N && Object.prototype.hasOwnProperty.call(I18N, k) ? I18N[k] : k);
 
   function showToast(msg, tone) {
     const host = document.getElementById("dk-toasts");
@@ -612,6 +615,7 @@
       e.preventDefault();
       const form = confirmFormBtn.closest("form");
       if (!form) return;
+      if (typeof form.reportValidity === "function" && !form.reportValidity()) return;
       const impactUrl = confirmFormBtn.getAttribute("data-impact-url") || "";
       const impactPk = confirmFormBtn.getAttribute("data-impact-pk") || "";
       const rawForce = confirmFormBtn.getAttribute("data-impact-force") || "";
@@ -687,6 +691,7 @@
   window.__deck = {
     metaVal,
     CSRF,
+    t,
     showToast,
     openConfirm,
     closeConfirm,

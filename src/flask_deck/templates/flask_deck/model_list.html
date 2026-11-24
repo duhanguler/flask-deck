@@ -11,6 +11,9 @@
     <p class="dk-page-sub dk-mono dk-tabular">
       {% if result.total_known %}
         {% if result.total_is_estimated %}~{% endif %}{{ "{:,}".format(result.total) }} {{ _("matching records") }}
+        {% if result.full_total is not none and result.full_total != result.total %}
+          ({{ _("of") }} {{ "{:,}".format(result.full_total) }} {{ _("total") }})
+        {% endif %}
       {% else %}
         {{ result.items | length }} rows (cursor stream)
       {% endif %}
@@ -238,7 +241,7 @@
   {% endfor %}
   {% for sv in saved_views_records %}
   <span class="dk-filter-chip">
-    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{% if sv.query_string %}?{{ sv.query_string }}{% endif %}">
+    <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{% if sv.query_string %}?{{ sv.query_string.lstrip('?') }}{% endif %}">
       {{ deck_icon("bookmark", 11) }} {{ sv.name }} <span class="dk-badge dk-mono">{{ sv.scope }}</span>
     </a>
     {% if is_superuser or sv.owner_id == current_user_id %}
@@ -285,6 +288,9 @@
       <option value="">Any</option>
       <option value="true" data-facet-base="True / Active"{% if f.value == 'true' %} selected{% endif %}>True / Active{% if 'true' in f_facets %} ({{ f_facets['true'] }}){% endif %}</option>
       <option value="false" data-facet-base="False / Inactive"{% if f.value == 'false' %} selected{% endif %}>False / Inactive{% if 'false' in f_facets %} ({{ f_facets['false'] }}){% endif %}</option>
+      {% if f.nullable %}
+      <option value="__null__" data-facet-base="(None)"{% if f.value == '__null__' %} selected{% endif %}>{{ _("(None)") }}{% if '__null__' in f_facets %} ({{ f_facets['__null__'] }}){% endif %}</option>
+      {% endif %}
     </select>
     {% elif f.type == 'enum' %}
     <select id="f_{{ f.name }}" name="f_{{ f.name }}" class="dk-select" data-facet-field="{{ f.name }}">
@@ -299,14 +305,20 @@
       {% for opt in f.fk_options %}
       <option value="{{ opt.id }}" data-facet-base="{{ opt.label }}"{% if f.value == opt.id %} selected{% endif %}>{{ opt.label }}{% if opt.id in f_facets %} ({{ f_facets[opt.id] }}){% endif %}</option>
       {% endfor %}
+      {% if f.nullable %}
+      <option value="__null__" data-facet-base="(None)"{% if f.value == '__null__' %} selected{% endif %}>{{ _("(None)") }}{% if '__null__' in f_facets %} ({{ f_facets['__null__'] }}){% endif %}</option>
+      {% endif %}
     </select>
     {% elif f.type in ['datetime', 'date'] %}
     <select id="f_{{ f.name }}" name="f_{{ f.name }}__preset" class="dk-select">
       <option value="">Any time</option>
-      <option value="today"{% if f.preset == 'today' %} selected{% endif %}>Today</option>
+      <option value="today"{% if f.preset == 'today' %} selected{% endif %}>{{ _("Today") }}</option>
       <option value="7d"{% if f.preset == '7d' %} selected{% endif %}>Last 7 days</option>
       <option value="30d"{% if f.preset == '30d' %} selected{% endif %}>Last 30 days</option>
       <option value="month"{% if f.preset == 'month' %} selected{% endif %}>This month</option>
+      <option value="year"{% if f.preset == 'year' %} selected{% endif %}>{{ _("This year") }}</option>
+      <option value="no_date"{% if f.preset == 'no_date' %} selected{% endif %}>{{ _("No date") }}</option>
+      <option value="has_date"{% if f.preset == 'has_date' %} selected{% endif %}>{{ _("Has date") }}</option>
     </select>
     {% elif f.type in ['integer', 'float', 'decimal'] %}
     <div class="dk-toolbar-left">
@@ -512,10 +524,12 @@
         {% for col in visible_cols %}
         <td>
           {% if loop.first %}
-          <span class="dk-tree-indent {{ node.depth_cls }}">{{ deck_icon("folder" if node.has_children else "chevron-right", 12) }}</span>
-          <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-mono">
-            {{ view.format_cell(tree_title_field or col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
-          </a>
+          <div class="dk-tree-cell {{ node.depth_cls }}">
+            <span class="dk-tree-indent">{{ deck_icon("folder" if node.has_children else "chevron-right", 12) }}</span>
+            <a href="{{ url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str) }}" class="dk-mono">
+              {{ view.format_cell(tree_title_field or col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
+            </a>
+          </div>
           {% else %}
           {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
           {% endif %}
@@ -593,7 +607,9 @@
       </tr>
     </thead>
     <tbody>
+      {% set is_batch_mode = (inline_edit_mode == 'batch' and inline_editable and not trashed) %}
       {% for obj in result.items %}
+      {% set row_idx = loop.index0 %}
       {% set pk_str = encode_pk(extract_pk(obj, view.meta)) %}
       {% set detail_href = url_for(bp_name ~ '.model_detail', slug=view.meta.slug, raw_pk=pk_str, _return_qs=(return_qs or None)) %}
       {% set edit_href = url_for(bp_name ~ '.model_edit', slug=view.meta.slug, raw_pk=pk_str, _return_qs=(return_qs or None)) if (can_edit and not trashed) else '' %}
@@ -602,13 +618,88 @@
           data-edit-url="{{ edit_href }}"
           data-drawer-url="{{ url_for(bp_name ~ '.api_drawer', slug=view.meta.slug, raw_pk=pk_str) }}"
           data-drawer-title="{{ view.format_record_repr(obj, auth=deck.auth, user=current_user) }}">
-        <td class="dk-td-check"><input type="checkbox" value="{{ pk_str }}" data-deck-row-check aria-label="Select record {{ pk_str }}"></td>
+        <td class="dk-td-check">
+          <input type="checkbox" value="{{ pk_str }}" data-deck-row-check aria-label="Select record {{ pk_str }}">
+          {% if is_batch_mode %}
+          <input type="hidden" name="batch__{{ row_idx }}___pk" value="{{ pk_str }}" form="dk-batch-edit-form" data-batch-row-meta="{{ row_idx }}">
+          {% endif %}
+        </td>
         {% for col in visible_cols %}
         <td data-col="{{ col }}">
           {% if col in inline_editable and not trashed %}
             {% set fmeta = view.meta.fields_by_name[col] %}
             {% set cur_val = obj | attr(col) %}
-            {% if fmeta.field_type == 'boolean' %}
+            {% if is_batch_mode %}
+              {% if fmeta.field_type == 'boolean' and fmeta.nullable %}
+              {% set cur_bool_str = 'true' if cur_val is true else ('false' if cur_val is false else '') %}
+              <select class="dk-inline-select dk-mono"
+                      name="batch__{{ row_idx }}__{{ col }}"
+                      form="dk-batch-edit-form"
+                      aria-label="Edit {{ col }}"
+                      data-deck-batch-input
+                      data-batch-row="{{ row_idx }}"
+                      data-orig-val="{{ cur_bool_str }}">
+                <option value=""{% if cur_bool_str == '' %} selected{% endif %}>—</option>
+                <option value="true"{% if cur_bool_str == 'true' %} selected{% endif %}>{{ _("Yes") }}</option>
+                <option value="false"{% if cur_bool_str == 'false' %} selected{% endif %}>{{ _("No") }}</option>
+              </select>
+              {% elif fmeta.field_type == 'boolean' %}
+              <input type="hidden" name="batch__{{ row_idx }}___present_{{ col }}" value="1" form="dk-batch-edit-form" data-batch-row-meta="{{ row_idx }}">
+              <label class="dk-switch">
+                <input type="checkbox"
+                       name="batch__{{ row_idx }}__{{ col }}"
+                       value="true"
+                       form="dk-batch-edit-form"
+                       data-deck-batch-input
+                       data-batch-row="{{ row_idx }}"
+                       data-orig-val="{{ 'true' if cur_val else 'false' }}"
+                       aria-label="Edit {{ col }}"
+                       {% if cur_val %} checked{% endif %}>
+                <span class="dk-switch-track" aria-hidden="true"></span>
+              </label>
+              {% elif fmeta.field_type == 'enum' %}
+              {% set cur_enum = cur_val.value if (cur_val is not none and cur_val.value is defined) else cur_val %}
+              <select class="dk-inline-select dk-mono"
+                      name="batch__{{ row_idx }}__{{ col }}"
+                      form="dk-batch-edit-form"
+                      aria-label="Edit {{ col }}"
+                      data-deck-batch-input
+                      data-batch-row="{{ row_idx }}"
+                      data-orig-val="{{ cur_enum if cur_enum is not none else '' }}">
+                {% if fmeta.nullable %}<option value=""{% if cur_enum is none %} selected{% endif %}>—</option>{% endif %}
+                {% for val, lbl in fmeta.choices %}
+                <option value="{{ val }}"{% if cur_enum is not none and cur_enum|string == val %} selected{% endif %}>{{ lbl }}</option>
+                {% endfor %}
+              </select>
+              {% elif col in inline_fk_options %}
+              <select class="dk-inline-select dk-mono"
+                      name="batch__{{ row_idx }}__{{ col }}"
+                      form="dk-batch-edit-form"
+                      aria-label="Edit {{ col }}"
+                      data-deck-batch-input
+                      data-batch-row="{{ row_idx }}"
+                      data-orig-val="{{ cur_val if cur_val is not none else '' }}">
+                {% if fmeta.nullable %}<option value="">—</option>{% endif %}
+                {% for opt in inline_fk_options[col] %}
+                <option value="{{ opt.id }}"{% if cur_val is not none and (cur_val|string) == opt.id %} selected{% endif %}>{{ opt.label }}</option>
+                {% endfor %}
+              </select>
+              {% elif fmeta.field_type in ['string', 'integer', 'float', 'decimal', 'date'] %}
+              {% set raw_edit_val = cur_val.isoformat() if (fmeta.field_type == 'date' and cur_val is not none) else (cur_val if cur_val is not none else '') %}
+              <input type="{{ 'number' if fmeta.field_type in ['integer', 'float', 'decimal'] else ('date' if fmeta.field_type == 'date' else 'text') }}"
+                     {% if fmeta.field_type in ['float', 'decimal'] %}step="any"{% endif %}
+                     class="dk-input dk-inline-input dk-mono"
+                     name="batch__{{ row_idx }}__{{ col }}"
+                     form="dk-batch-edit-form"
+                     aria-label="Edit {{ col }}"
+                     value="{{ raw_edit_val }}"
+                     data-deck-batch-input
+                     data-batch-row="{{ row_idx }}"
+                     data-orig-val="{{ raw_edit_val }}">
+              {% else %}
+              {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
+              {% endif %}
+            {% elif fmeta.field_type == 'boolean' %}
             <button type="button"
                     class="dk-inline-toggle"
                     data-deck-quick-edit
@@ -625,8 +716,9 @@
                     data-deck-quick-select
                     data-url="{{ url_for(bp_name ~ '.api_quick_edit', slug=view.meta.slug, raw_pk=pk_str) }}"
                     data-field="{{ col }}">
+              {% if fmeta.nullable %}<option value=""{% if cur_enum is none %} selected{% endif %}>—</option>{% endif %}
               {% for val, lbl in fmeta.choices %}
-              <option value="{{ val }}"{% if cur_enum|string == val %} selected{% endif %}>{{ lbl }}</option>
+              <option value="{{ val }}"{% if cur_enum is not none and cur_enum|string == val %} selected{% endif %}>{{ lbl }}</option>
               {% endfor %}
             </select>
             {% elif col in inline_fk_options %}
@@ -654,7 +746,7 @@
             {% else %}
             {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
             {% endif %}
-          {% elif (loop.first and col not in view.file_fields) or (loop.index == 2 and visible_cols[0] in view.file_fields) %}
+          {% elif (col in list_display_links_set and col not in view.file_fields) or (view.list_display_links is none and loop.index == 2 and visible_cols[0] in view.file_fields) %}
           <a href="{{ detail_href }}" class="dk-mono">
             {{ view.format_cell(col, obj, auth=deck.auth, user=current_user, media_url_builder=media_url_builder, rel_repr=rel_repr, rel_url_builder=rel_url_builder) }}
           </a>
@@ -731,6 +823,19 @@
     {% endif %}
   </table>
 </div>
+{% if inline_edit_mode == 'batch' and inline_editable and not trashed %}
+<div class="dk-batch-bar" id="dk-batch-save-bar" hidden="hidden" role="region" aria-label="Batch table edits">
+  <form id="dk-batch-edit-form" method="post" action="{{ url_for(bp_name ~ '.model_batch_edit', slug=view.meta.slug) }}" class="dk-batch-form">
+    <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+    <input type="hidden" name="_return_qs" value="{{ return_qs or '' }}">
+    <span class="dk-badge dk-badge-warn dk-mono" id="dk-batch-dirty-count">0 changed</span>
+    <div class="dk-page-actions">
+      <button type="button" class="dk-btn dk-btn-sm" data-deck-batch-discard>{{ _("Discard") }}</button>
+      <button type="submit" class="dk-btn dk-btn-sm dk-btn-primary">{{ deck_icon("check", 12) }} {{ _("Save Table Changes") }}</button>
+    </div>
+  </form>
+</div>
+{% endif %}
 {% endif %}
 {% if view_mode in ['table', 'gallery'] %}
 <div class="dk-pagination dk-mono dk-tabular">
@@ -773,6 +878,15 @@
     {% if result.page > 1 %}
     <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(page=result.page - 1) }}" class="dk-btn dk-btn-sm">{{ deck_icon("chevron-left", 13) }} {{ _("Prev") }}</a>
     {% endif %}
+    {% for pnum in result.page_window %}
+      {% if pnum is none %}
+      <span class="dk-pag-ellipsis">…</span>
+      {% elif pnum == result.page %}
+      <span class="dk-btn dk-btn-sm dk-pag-num is-active">{{ pnum }}</span>
+      {% else %}
+      <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(page=pnum) }}" class="dk-btn dk-btn-sm dk-pag-num">{{ pnum }}</a>
+      {% endif %}
+    {% endfor %}
     {% if result.page < result.pages %}
     <a href="{{ url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}{{ qs(page=result.page + 1) }}" class="dk-btn dk-btn-sm">{{ _("Next") }} {{ deck_icon("chevron-right", 13) }}</a>
     {% endif %}
@@ -829,7 +943,7 @@
     {{ deck_icon(act.icon, 12) }} {{ act.label }}
   </button>
   {% endfor %}
-  {% if can_delete %}
+  {% if can_bulk_delete %}
   {% set bulk_del_locked = demo_safe_mode and not view.soft_delete_column %}
   <button type="button"
           class="dk-btn dk-btn-sm dk-btn-danger"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Mapping
 from dataclasses import replace
@@ -25,6 +26,7 @@ from flask_deck.api_keys import build_api_key_record
 from flask_deck.audit import make_audit_entry
 from flask_deck.auth import DeckUser
 from flask_deck.exceptions import PermissionDeniedError
+from flask_deck.iam import SQLAlchemyAuthProvider
 from flask_deck.mfa import (
     MFA_PENDING_AT_KEY,
     MFA_PENDING_NEXT_KEY,
@@ -47,7 +49,12 @@ from flask_deck.passkeys import (
     complete_passkey_registration,
     is_webauthn_available,
 )
-from flask_deck.security import is_safe_redirect_url, mask_ip_address, rotate_csrf_token
+from flask_deck.security import (
+    is_safe_redirect_url,
+    mask_ip_address,
+    rotate_csrf_token,
+    verify_password_constant_time,
+)
 from flask_deck.sessions import DECK_SID_SESSION_KEY, issue_tracked_session
 from flask_deck.sso import OIDCAuthProvider
 
@@ -154,7 +161,7 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
         pending_at = session.get(MFA_PENDING_AT_KEY)
         if not isinstance(pending_uid, str) or not pending_uid:
             return redirect(url_for(f"{bp_name}.login"))
-        if isinstance(pending_at, int) and (int(time.time()) - pending_at) > MFA_PENDING_TTL_SECONDS:
+        if not isinstance(pending_at, int) or (int(time.time()) - pending_at) > MFA_PENDING_TTL_SECONDS:
             session.pop(MFA_PENDING_USER_KEY, None)
             session.pop(MFA_PENDING_NEXT_KEY, None)
             session.pop(MFA_PENDING_AT_KEY, None)
@@ -214,6 +221,158 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
             "flask_deck/login_mfa.html",
             **deck._base_context(error_msg=error_msg),
         )
+
+    @bp.route("/login/forgot-password", methods=["GET", "POST"])
+    def forgot_password() -> Any:
+        """Opt-in anti-enumeration forgot-password request route (enabled only with password_reset_notifier)."""
+        if (
+            deck.password_reset_notifier is None
+            or not isinstance(deck.auth, SQLAlchemyAuthProvider)
+            or deck.config.read_only
+            or deck.config.demo_safe_mode
+        ):
+            abort(404)
+
+        sent_notice = ""
+        error_msg = ""
+        if request.method == "POST":
+            identifier = request.form.get("identifier", "").strip()
+            ip = _client_ip()
+            rl_key = f"pwdreset:{ip}"
+            locked, retry_after = deck._rate_limiter.is_locked(ip, rl_key)
+            if locked:
+                resp = Response(
+                    render_template(
+                        "flask_deck/forgot_password.html",
+                        **deck._base_context(
+                            page_title="Reset Password",
+                            error_msg=f"Too many reset requests. Try again in {retry_after}s.",
+                            sent_notice="",
+                        ),
+                    ),
+                    status=429,
+                )
+                resp.headers["Retry-After"] = str(retry_after)
+                return resp
+
+            # Always record a rate-limit tick so attackers cannot flood reset requests
+            deck._rate_limiter.record_failure(ip, rl_key)
+            if identifier:
+                issued = deck.auth.create_password_reset_token(identifier, ttl_seconds=900)
+                if issued is not None:
+                    urec, raw_token = issued
+                    reset_url = url_for(
+                        f"{bp_name}.reset_password",
+                        token=raw_token,
+                        _external=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        deck.password_reset_notifier(urec.to_deck_user(), reset_url, raw_token)
+                    if deck.audit_store is not None and deck.config.auto_audit:
+                        deck.audit_store.record(
+                            make_audit_entry(
+                                actor_id=urec.id,
+                                actor_name=urec.username,
+                                actor_ip=ip,
+                                action="password_reset_requested",
+                                model_slug="_auth",
+                                model_label="Password Reset",
+                                record_pk=urec.id,
+                                record_repr=urec.username,
+                            )
+                        )
+                else:
+                    # Constant-time dummy work prevents user-existence timing oracle
+                    verify_password_constant_time(None, identifier)
+
+            sent_notice = (
+                "If an active account matches that username or email, a single-use password reset link has been sent."
+            )
+
+        return render_template(
+            "flask_deck/forgot_password.html",
+            **deck._base_context(
+                page_title="Reset Password",
+                error_msg=error_msg,
+                sent_notice=sent_notice,
+            ),
+        )
+
+    @bp.route("/login/reset-password/<token>", methods=["GET", "POST"])
+    def reset_password(token: str) -> Any:
+        """Consume a single-use SHA-256-hashed password reset token and revoke all active sessions."""
+        if (
+            deck.password_reset_notifier is None
+            or not isinstance(deck.auth, SQLAlchemyAuthProvider)
+            or deck.config.read_only
+            or deck.config.demo_safe_mode
+        ):
+            abort(404)
+
+        error_msg = ""
+        token_valid = deck.auth.verify_password_reset_token(token) is not None
+        status_code = 200
+        retry_after_hdr: str | None = None
+        if request.method == "POST":
+            ip = _client_ip()
+            rl_key = f"pwdreset_use:{ip}"
+            locked, retry_after = deck._rate_limiter.is_locked(ip, rl_key)
+            if locked:
+                error_msg = f"Too many attempts. Try again in {retry_after}s."
+                status_code = 429
+                retry_after_hdr = str(retry_after)
+            else:
+                new_pwd = request.form.get("new_password", "")
+                confirm_pwd = request.form.get("confirm_password", "")
+                if new_pwd != confirm_pwd:
+                    error_msg = "New password and confirmation do not match."
+                else:
+                    ok, msg, urec = deck.auth.consume_password_reset_token(token, new_pwd)
+                    if ok and urec is not None:
+                        deck._rate_limiter.record_success(ip, rl_key)
+                        if deck.session_store is not None:
+                            deck.session_store.revoke_others(urec.id, keep_session_id=None)
+                        if deck.audit_store is not None and deck.config.auto_audit:
+                            deck.audit_store.record(
+                                make_audit_entry(
+                                    actor_id=urec.id,
+                                    actor_name=urec.username,
+                                    actor_ip=ip,
+                                    action="password_reset_completed",
+                                    model_slug="_auth",
+                                    model_label="Password Reset",
+                                    record_pk=urec.id,
+                                    record_repr=urec.username,
+                                    metadata={"sessions_revoked": deck.session_store is not None},
+                                )
+                            )
+                        flash(msg, "ok")
+                        resp_redir = redirect(url_for(f"{bp_name}.login"))
+                        resp_redir.headers["Referrer-Policy"] = "no-referrer"
+                        resp_redir.headers["Cache-Control"] = "no-store, private"
+                        return resp_redir
+                    deck._rate_limiter.record_failure(ip, rl_key)
+                    error_msg = msg
+                    token_valid = deck.auth.verify_password_reset_token(token) is not None
+
+        resp = Response(
+            render_template(
+                "flask_deck/reset_password.html",
+                **deck._base_context(
+                    page_title="Set New Password",
+                    token=token,
+                    token_valid=token_valid,
+                    error_msg=error_msg,
+                    password_rules=deck.auth.password_help_texts(),
+                ),
+            ),
+            status=status_code,
+        )
+        resp.headers["Referrer-Policy"] = "no-referrer"
+        resp.headers["Cache-Control"] = "no-store, private"
+        if retry_after_hdr is not None:
+            resp.headers["Retry-After"] = retry_after_hdr
+        return resp
 
     @bp.route("/login/sso/<provider_name>")
     def sso_login(provider_name: str) -> Any:
@@ -436,6 +595,10 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def security_sessions() -> Any:
         if deck.session_store is None or not deck.auth.supports_login_form:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "Active sessions cannot be managed while impersonating another user."
+            )
         user = deck._current_user()
         if user is None:
             abort(403)
@@ -466,6 +629,10 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def security_session_revoke(sid: str) -> Any:
         if deck.session_store is None or not deck.auth.supports_login_form:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "Active sessions cannot be managed while impersonating another user."
+            )
         user = deck._current_user()
         if user is None:
             abort(403)
@@ -496,6 +663,10 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def security_sessions_revoke_others() -> Any:
         if deck.session_store is None or not deck.auth.supports_login_form:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "Active sessions cannot be managed while impersonating another user."
+            )
         user = deck._current_user()
         if user is None:
             abort(403)
@@ -525,6 +696,10 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def security_passkeys() -> Any:
         if deck.passkey_store is None or not deck.auth.supports_login_form:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "Passkeys cannot be managed while impersonating another user."
+            )
         user = deck._current_user()
         if user is None:
             abort(403)
@@ -543,6 +718,8 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def passkey_register_options() -> Any:
         if deck.passkey_store is None or not deck.auth.supports_login_form:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            return jsonify({"error": "Passkeys cannot be managed while impersonating."}), 403
         user = deck._current_user()
         if user is None:
             return jsonify({"error": "Authentication required."}), 401
@@ -565,6 +742,8 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def passkey_register_verify() -> Any:
         if deck.passkey_store is None or not deck.auth.supports_login_form:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            return jsonify({"error": "Passkeys cannot be managed while impersonating."}), 403
         user = deck._current_user()
         if user is None:
             return jsonify({"error": "Authentication required."}), 401
@@ -611,6 +790,10 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def passkey_delete(credential_id: str) -> Any:
         if deck.passkey_store is None or not deck.auth.supports_login_form:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "Passkeys cannot be managed while impersonating another user."
+            )
         user = deck._current_user()
         if user is None:
             abort(403)
@@ -807,6 +990,10 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def security_api_keys_create() -> Any:
         if deck.api_key_store is None:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "API keys cannot be created while impersonating another user."
+            )
         user = deck._current_user()
         if user is None or not (
             user.is_superuser or deck.auth.has_permission(user, "api_keys:manage")
@@ -869,6 +1056,10 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def security_api_keys_revoke(key_id: str) -> Any:
         if deck.api_key_store is None:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "API keys cannot be revoked while impersonating another user."
+            )
         user = deck._current_user()
         if user is None or not (
             user.is_superuser or deck.auth.has_permission(user, "api_keys:manage")

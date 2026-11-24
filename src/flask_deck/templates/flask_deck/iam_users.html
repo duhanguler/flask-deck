@@ -59,6 +59,10 @@
               {% endfor %}
             </div>
           </div>
+          <div class="dk-field">
+            <label for="dk-u-direct-perms">{{ _("Direct Permissions") }} <span class="dk-subtle dk-mono">(one per line, e.g. orders:view, orders:edit)</span></label>
+            <textarea id="dk-u-direct-perms" name="direct_permissions" rows="3" class="dk-textarea dk-mono" placeholder="orders:view&#10;audit:view"{% if demo_safe_mode %} disabled{% endif %}>{{ editing_direct_perms_text }}</textarea>
+          </div>
           <div class="dk-chip-group">
             <label class="dk-checkbox">
               <input type="checkbox" name="is_active" value="1"{% if editing_user.is_active %} checked{% endif %}{% if demo_safe_mode %} disabled{% endif %}>
@@ -91,6 +95,11 @@
             <label for="dk-u-reset-pwd">New Temporary Password</label>
             <input id="dk-u-reset-pwd" type="password" name="new_password" class="dk-input" required minlength="8" autocomplete="new-password"{% if demo_safe_mode %} disabled{% endif %}>
             <div class="dk-help-text">Revokes all active sessions for this user immediately.</div>
+            {% if password_rules %}
+            <ul class="dk-pwd-rules dk-help-text">
+              {% for rule in password_rules %}<li>{{ rule }}</li>{% endfor %}
+            </ul>
+            {% endif %}
           </div>
           <button type="submit" class="dk-btn dk-btn-danger"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>
             {{ deck_icon("lock" if demo_safe_mode else "key", 13) }} {{ _("Disabled in Demo") if demo_safe_mode else "Reset Password & Sign Out" }}
@@ -142,6 +151,13 @@
             </div>
           </div>
         </div>
+        <div class="dk-field">
+          <label for="dk-nu-direct-perms">{{ _("Direct Permissions") }} <span class="dk-subtle dk-mono">(optional, one per line)</span></label>
+          <textarea id="dk-nu-direct-perms" name="direct_permissions" rows="2" class="dk-textarea dk-mono" placeholder="orders:view"{% if demo_safe_mode %} disabled{% endif %}></textarea>
+          {% if password_rules %}
+          <div class="dk-help-text">{{ password_rules | join(" · ") }}</div>
+          {% endif %}
+        </div>
         <div class="dk-chip-group">
           <label class="dk-checkbox">
             <input type="checkbox" name="is_active" value="1" checked{% if demo_safe_mode %} disabled{% endif %}>
@@ -164,10 +180,38 @@
   </section>
   {% endif %}
 
+  <div class="dk-toolbar">
+    <form method="get" action="{{ url_for(bp_name ~ '.security_iam_users') }}" class="dk-toolbar-left">
+      <input type="search" name="q" value="{{ filter_q }}" class="dk-input" placeholder="{{ _('Search') }} users…" aria-label="Search users">
+      <select name="status" class="dk-select" aria-label="Filter by status">
+        <option value="">All statuses</option>
+        <option value="active"{% if filter_status == 'active' %} selected{% endif %}>Active</option>
+        <option value="inactive"{% if filter_status == 'inactive' %} selected{% endif %}>Inactive</option>
+        <option value="superuser"{% if filter_status == 'superuser' %} selected{% endif %}>Superuser</option>
+      </select>
+      <select name="group_id" class="dk-select" aria-label="Filter by group">
+        <option value="">All groups</option>
+        {% for grp in groups %}
+        <option value="{{ grp.id }}"{% if filter_group_id == grp.id %} selected{% endif %}>{{ grp.label }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit" class="dk-btn">{{ _("Search") }}</button>
+      {% if filter_q or filter_status or filter_group_id %}
+      <a href="{{ url_for(bp_name ~ '.security_iam_users') }}" class="dk-btn dk-btn-ghost">{{ _("Reset") }}</a>
+      {% endif %}
+    </form>
+    <form id="dk-iam-bulk-form" method="post" action="{{ url_for(bp_name ~ '.security_iam_users_bulk') }}" class="dk-toolbar-right">
+      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+      <button type="submit" name="action" value="activate" class="dk-btn dk-btn-sm"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>{{ _("Activate Selected") }}</button>
+      <button type="submit" name="action" value="deactivate" class="dk-btn dk-btn-sm dk-btn-danger"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>{{ _("Deactivate Selected") }}</button>
+    </form>
+  </div>
+
   <div class="dk-table-wrap">
     <table class="dk-table">
       <thead>
         <tr>
+          <th class="dk-th-check"><span class="dk-subtle">✓</span></th>
           <th>Username</th>
           <th>Name</th>
           <th>Groups / Roles</th>
@@ -179,9 +223,13 @@
       <tbody>
         {% for u in users %}
         <tr>
+          <td class="dk-td-check">
+            <input type="checkbox" name="user_ids" value="{{ u.id }}" form="dk-iam-bulk-form" aria-label="Select user {{ u.username }}"{% if demo_safe_mode %} disabled{% endif %}>
+          </td>
           <td class="dk-mono">
             <strong>{{ u.username }}</strong>
             {% if u.is_superuser %}<span class="dk-badge dk-badge-warn dk-mono">SUPER</span>{% endif %}
+            {% if u.direct_permissions %}<span class="dk-badge dk-badge-info dk-mono" title="{{ u.direct_permissions | join(', ') }}">+{{ u.direct_permissions | length }} perm</span>{% endif %}
           </td>
           <td>{{ u.display_name }}</td>
           <td class="dk-mono">{{ u.role_names | join(", ") if u.role_names else "—" }}</td>
@@ -211,9 +259,34 @@
             </div>
           </td>
         </tr>
+        {% else %}
+        <tr>
+          <td colspan="7" class="dk-chart-empty">{{ _("No matches") }}</td>
+        </tr>
         {% endfor %}
       </tbody>
     </table>
+  </div>
+
+  <div class="dk-pagination dk-mono dk-tabular">
+    <span>Page {{ page }} {{ _("of") }} {{ pages }} · {{ "{:,}".format(total_users) }} {{ _("total") }}</span>
+    <div class="dk-pag-btns">
+      {% if page > 1 %}
+      <a href="{{ url_for(bp_name ~ '.security_iam_users', q=(filter_q or None), status=(filter_status or None), group_id=(filter_group_id or None), page=page - 1) }}" class="dk-btn dk-btn-sm">{{ deck_icon("chevron-left", 13) }} {{ _("Prev") }}</a>
+      {% endif %}
+      {% for pnum in page_window %}
+        {% if pnum is none %}
+        <span class="dk-pag-ellipsis">…</span>
+        {% elif pnum == page %}
+        <span class="dk-btn dk-btn-sm dk-pag-num is-active">{{ pnum }}</span>
+        {% else %}
+        <a href="{{ url_for(bp_name ~ '.security_iam_users', q=(filter_q or None), status=(filter_status or None), group_id=(filter_group_id or None), page=pnum) }}" class="dk-btn dk-btn-sm dk-pag-num">{{ pnum }}</a>
+        {% endif %}
+      {% endfor %}
+      {% if page < pages %}
+      <a href="{{ url_for(bp_name ~ '.security_iam_users', q=(filter_q or None), status=(filter_status or None), group_id=(filter_group_id or None), page=page + 1) }}" class="dk-btn dk-btn-sm">{{ _("Next") }} {{ deck_icon("chevron-right", 13) }}</a>
+      {% endif %}
+    </div>
   </div>
 </div>
 {% endblock %}

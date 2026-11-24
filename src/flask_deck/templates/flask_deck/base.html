@@ -6,6 +6,8 @@
   <meta name="deck-csrf" content="{{ csrf_token }}">
   <meta name="deck-search-url" content="{{ url_for(bp_name ~ '.api_search') }}">
   <meta name="deck-notif-url" content="{{ url_for(bp_name ~ '.api_notifications') }}">
+  <meta name="deck-i18n" content="{{ js_i18n_json }}">
+  <meta name="deck-tz" content="{{ active_timezone }}">
   {% if brand.favicon_url %}
   <link rel="icon" href="{{ brand.favicon_url }}">
   {% else %}
@@ -22,9 +24,15 @@
   {% for css_href in brand.extra_css %}
   <link rel="stylesheet" href="{{ css_href }}">
   {% endfor %}
+  {% for css_href in extra_media_css %}
+  <link rel="stylesheet" href="{{ css_href }}">
+  {% endfor %}
   <script defer src="{{ asset_url('js/deck.js') }}"></script>
   {% block extra_scripts %}{% endblock %}
   {% for js_src in brand.extra_js %}
+  <script defer src="{{ js_src }}" nonce="{{ csp_nonce }}"></script>
+  {% endfor %}
+  {% for js_src in extra_media_js %}
   <script defer src="{{ js_src }}" nonce="{{ csp_nonce }}"></script>
   {% endfor %}
   {{ render_slot('head_extra') }}
@@ -65,6 +73,11 @@
 
     <div class="dk-top-right">
       {{ render_slot('topbar_right') }}
+      {% if site_url %}
+      <a href="{{ site_url }}" target="_blank" rel="noopener noreferrer" class="dk-btn dk-btn-ghost dk-btn-sm dk-status-hide-sm" title="{{ _('View Site') }}">
+        {{ deck_icon("external-link", 12) }} {{ _("View Site") }}
+      </a>
+      {% endif %}
       {% if config.read_only %}
       <span class="dk-badge dk-badge-warn dk-mono">READ-ONLY</span>
       {% endif %}
@@ -165,7 +178,7 @@
 
       {% for group in sidebar_groups %}
       <div data-rail-group>
-        <div class="dk-rail-group-title">{{ group.name }}</div>
+        <div class="dk-rail-group-title"><a href="{{ group.url }}" class="dk-rail-group-link{% if active_nav == '_category:' ~ group.slug %} is-active{% endif %}">{{ group.name }}</a></div>
         <nav class="dk-nav-list">
           {% for item in group.links %}
           <a href="{{ item.url }}"

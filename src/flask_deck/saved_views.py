@@ -29,21 +29,23 @@ def _ensure_utc(dt: datetime | None) -> datetime | None:
 
 
 def _is_safe_note_href(raw_url: str) -> bool:
-    u = raw_url.strip().lower()
-    if u.startswith("/") and not u.startswith("//"):
+    u = raw_url.strip()
+    if not u or "\\" in u or any(ord(ch) < 32 or ord(ch) == 127 for ch in u):
+        return False
+    low = u.lower()
+    if low.startswith("/") and not low.startswith("//"):
         return True
-    return u.startswith(("https://", "http://"))
+    return low.startswith(("https://", "http://"))
 
 
 def render_safe_markdown(raw_text: str) -> Markup:
     """Zero-dependency strict-CSP safe subset markdown renderer for record notes."""
     escaped = str(escape(raw_text or ""))
 
-    def _replace_link(match: re.Match[str]) -> str:
-        label, url = match.group(1), match.group(2)
-        if not _is_safe_note_href(url):
-            return f"{label} ({url})"
-        return f'<a href="{url}" rel="noopener noreferrer" target="_blank">{label}</a>'
+    def _format_inline(text: str) -> str:
+        t = _CODE_RE.sub(r'<code class="dk-code">\1</code>', text)
+        t = _BOLD_RE.sub(r"<strong>\1</strong>", t)
+        return _ITALIC_RE.sub(r"<em>\1</em>", t)
 
     rendered_lines: list[str] = []
     for line in escaped.splitlines():
@@ -52,10 +54,24 @@ def render_safe_markdown(raw_text: str) -> Markup:
         if item.startswith("- ") or item.startswith("* "):
             bullet = True
             item = item[2:]
+        # Protect generated <a> links with placeholders so inline formatting never mutates href=""
+        anchors: list[str] = []
+
+        def _replace_link(match: re.Match[str], _anchors: list[str] = anchors) -> str:
+            label, url = match.group(1), match.group(2)
+            if not _is_safe_note_href(url):
+                return f"{label} ({url})"
+            idx = len(_anchors)
+            safe_label = _format_inline(label)
+            _anchors.append(
+                f'<a href="{url}" rel="noopener noreferrer" target="_blank">{safe_label}</a>'
+            )
+            return f"\x00DECKLINK{idx}\x00"
+
         item = _LINK_RE.sub(_replace_link, item)
-        item = _CODE_RE.sub(r'<code class="dk-code">\1</code>', item)
-        item = _BOLD_RE.sub(r"<strong>\1</strong>", item)
-        item = _ITALIC_RE.sub(r"<em>\1</em>", item)
+        item = _format_inline(item)
+        for idx, anchor_html in enumerate(anchors):
+            item = item.replace(f"\x00DECKLINK{idx}\x00", anchor_html)
         if bullet:
             rendered_lines.append(f"• {item}")
         else:
@@ -128,7 +144,13 @@ class InMemorySavedViewStore:
                 or (r.scope == "personal" and r.owner_id == user_id)
             )
         ]
-        out.sort(key=lambda r: (0 if r.scope == "role" else (1 if r.scope == "team" else 2), r.created_at))
+        epoch = datetime.fromtimestamp(0, tz=timezone.utc)
+        out.sort(
+            key=lambda r: (
+                0 if r.scope == "role" else (1 if r.scope == "team" else 2),
+                _ensure_utc(r.created_at) or epoch,
+            )
+        )
         return out
 
     def get(self, view_id: str) -> SavedViewRecord | None:
@@ -224,7 +246,8 @@ class SQLAlchemySavedViewStore:
             cached_rows = loaded
 
         role_set = set(roles)
-        return [
+        epoch = datetime.fromtimestamp(0, tz=timezone.utc)
+        out = [
             replace(r)
             for r in cached_rows
             if (
@@ -233,6 +256,13 @@ class SQLAlchemySavedViewStore:
                 or (r.scope == "personal" and r.owner_id == user_id)
             )
         ]
+        out.sort(
+            key=lambda r: (
+                0 if r.scope == "role" else (1 if r.scope == "team" else 2),
+                _ensure_utc(r.created_at) or epoch,
+            )
+        )
+        return out
 
     def get(self, view_id: str) -> SavedViewRecord | None:
         with Session(self._engine) as sess:

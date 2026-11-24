@@ -257,7 +257,7 @@ class DeckMCPServer:
                             or view.requires_approval(user, "edit")
                             or view.requires_approval(user, "delete")
                         ),
-                        "actions": list(view.actions.keys()),
+                        "actions": list(view.get_actions(user).keys()),
                     }
                 )
             return {"models": models}
@@ -288,7 +288,7 @@ class DeckMCPServer:
                 "sortable": sorted(deck._allowed_query_fields(view, user)[2]),
                 "actions": [
                     {"name": s.name, "label": s.label, "require_approval": s.require_approval}
-                    for s in view.actions.values()
+                    for s in view.get_actions(user).values()
                 ],
             }
 
@@ -328,6 +328,7 @@ class DeckMCPServer:
                 count_mode=view.count_mode,
                 cursor_secret=deck._cursor_secret(),
                 soft_delete_column=view.soft_delete_column,
+                show_full_result_count=False,
                 trashed=False,
             )
             return {
@@ -467,9 +468,19 @@ class DeckMCPServer:
             if not isinstance(values, Mapping):
                 raise ValueError("'values' must be a JSON object.")
             obj = view.model()
+            need_create_app = _need_approval("create", payload=values)
             try:
                 form_md = build_multidict_from_json(deck, view, values, user=user, mode="create")
-                apply_json_mutation(deck, sess, view, obj, form_md, user=user, mode="create")
+                apply_json_mutation(
+                    deck,
+                    sess,
+                    view,
+                    obj,
+                    form_md,
+                    user=user,
+                    mode="create",
+                    run_hooks=not need_create_app,
+                )
                 sess.add(obj)
                 sess.flush()
                 diff = compute_diff(
@@ -483,7 +494,7 @@ class DeckMCPServer:
                 sess.rollback()
                 raise ValueError(f"Savepoint validation failed: {exc}") from exc
 
-            if _need_approval("create", payload=values):
+            if need_create_app:
                 sess.rollback()
                 assert deck.approval_store is not None
                 saved = deck.approval_store.create(
@@ -495,6 +506,7 @@ class DeckMCPServer:
                         record_repr=safe_repr,
                         payload={
                             "form_items": [[k, v] for k, v in form_md.items(multi=True)],
+                            "utc_passthrough": True,
                             "_actor_roles": list(user.roles) if user else [],
                             "_actor_superuser": bool(user.is_superuser) if user else False,
                         },
@@ -541,6 +553,8 @@ class DeckMCPServer:
             obj, pk_vals = self._fetch_record(view, pk_raw, user)
             pk_str = encode_pk(pk_vals)
             self._require(user, api_key, f"{slug}:edit", model_slug=slug, obj=obj)
+            if not view.can_edit_record(obj, user):
+                raise PermissionDeniedError(f"Not authorized to edit this {view.label}.")
             if deck._is_soft_deleted(view, obj):
                 raise ValueError("Cannot update a soft-deleted record.")
             expected_ver = str(args.get("expected_version", "")).strip()
@@ -556,7 +570,16 @@ class DeckMCPServer:
                 form_md = build_multidict_from_json(
                     deck, view, values, user=user, mode="edit", obj=obj
                 )
-                apply_json_mutation(deck, sess, view, obj, form_md, user=user, mode="edit")
+                apply_json_mutation(
+                    deck,
+                    sess,
+                    view,
+                    obj,
+                    form_md,
+                    user=user,
+                    mode="edit",
+                    run_hooks=not need_app,
+                )
                 if not need_app and view.version_column:
                     vf = view.meta.fields_by_name.get(view.version_column)
                     if vf is not None and vf.field_type == "integer":
@@ -589,6 +612,9 @@ class DeckMCPServer:
                         record_repr=safe_repr,
                         payload={
                             "form_items": [[k, v] for k, v in form_md.items(multi=True)],
+                            "partial": True,
+                            "utc_passthrough": True,
+                            "expected_version": current_ver,
                             "_actor_roles": list(user.roles) if user else [],
                             "_actor_superuser": bool(user.is_superuser) if user else False,
                         },
@@ -635,6 +661,8 @@ class DeckMCPServer:
             obj, pk_vals = self._fetch_record(view, pk_raw, user)
             pk_str = encode_pk(pk_vals)
             self._require(user, api_key, f"{slug}:delete", model_slug=slug, obj=obj)
+            if not view.can_delete_record(obj, user):
+                raise PermissionDeniedError(f"Not authorized to delete this {view.label}.")
             force = bool(args.get("force", False))
             if view.soft_delete_column and force:
                 self._require(user, api_key, f"{slug}:force_delete", model_slug=slug, obj=obj)
@@ -709,9 +737,10 @@ class DeckMCPServer:
 
         # propose_action
         action_name = str(args.get("action_name", "")).strip()
-        spec = view.actions.get(action_name)
-        if spec is None:
+        resolved_act = deck._resolve_action_spec_and_handler(view, action_name, user)
+        if resolved_act is None:
             raise LookupError(f"Unknown action '{action_name}' on model '{slug}'.")
+        spec, handler = resolved_act
         perm = spec.permission or f"{slug}:action:{action_name}"
         self._require(user, api_key, perm, model_slug=slug)
         raw_pks = [str(p) for p in (args.get("pks") or [])]
@@ -780,10 +809,10 @@ class DeckMCPServer:
                 "diff": saved.diff,
             }
 
-        handler = getattr(view, spec.handler_name)
         msg = handler(records, form_md, user)
         sess.commit()
-        return {"status": "executed", "message": str(msg or "Done"), "count": len(records)}
+        msg_str = "Done" if isinstance(msg, Response) else str(msg or "Done")
+        return {"status": "executed", "message": msg_str, "count": len(records)}
 
     def handle_message(
         self,

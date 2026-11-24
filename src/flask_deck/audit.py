@@ -106,6 +106,9 @@ class AuditEntry:
     def is_revertible(self) -> bool:
         if self.action not in {"update", "inline_edit"} or not self.changes:
             return False
+        # Inline child row edits store child column diffs under the parent slug/PK; never revert onto parent!
+        if self.metadata.get("inline_model") or self.metadata.get("inline_slug"):
+            return False
         # Do not attempt to revert redacted sensitive fields alone if all fields are redacted.
         return any(
             v.get("old") != "[REDACTED]" and v.get("new") != "[REDACTED]"
@@ -171,11 +174,12 @@ class AuditStore(ABC):
 class InMemoryAuditStore(AuditStore):
     """Thread-safe bounded ring-buffer audit store for tests and ephemeral demos."""
 
-    __slots__ = ("_entries", "_lock", "_max_entries", "hash_chain")
+    __slots__ = ("_base_prev_hash", "_entries", "_lock", "_max_entries", "hash_chain")
 
     def __init__(self, max_entries: int = 2000, *, hash_chain: bool = False) -> None:
         self._max_entries = max(10, max_entries)
         self._entries: deque[AuditEntry] = deque(maxlen=self._max_entries)
+        self._base_prev_hash: str = "GENESIS"
         self._lock = threading.Lock()
         self.hash_chain = bool(hash_chain)
 
@@ -183,7 +187,7 @@ class InMemoryAuditStore(AuditStore):
         with self._lock:
             stored = entry
             if self.hash_chain:
-                prev_hash = self._entries[0].entry_hash if self._entries else "GENESIS"
+                prev_hash = self._entries[0].entry_hash if self._entries else self._base_prev_hash
                 digest = compute_audit_entry_hash(entry, prev_hash)
                 stored = AuditEntry(
                     id=entry.id,
@@ -201,6 +205,10 @@ class InMemoryAuditStore(AuditStore):
                     prev_hash=prev_hash,
                     entry_hash=digest,
                 )
+            if len(self._entries) == self._max_entries:
+                evicted = self._entries[-1]
+                if self.hash_chain and evicted.entry_hash:
+                    self._base_prev_hash = evicted.entry_hash
             self._entries.appendleft(stored)
         return stored
 
@@ -210,7 +218,7 @@ class InMemoryAuditStore(AuditStore):
             return True, None
         with self._lock:
             chronological = list(reversed(self._entries))
-        expected_prev = "GENESIS"
+            expected_prev = self._base_prev_hash
         for item in chronological:
             if item.prev_hash != expected_prev:
                 return False, f"Audit hash-chain break at entry {item.id}: prev_hash mismatch"
@@ -379,6 +387,8 @@ class SQLAlchemyAuditStore(AuditStore):
 
     def verify_chain(self) -> tuple[bool, str | None]:
         """Verify cryptographic integrity of all hash-chained audit rows."""
+        if not self.hash_chain:
+            return True, None
         stmt = sa.select(self._table).order_by(self._table.c.seq.asc(), self._table.c.id.asc())
         with self._engine.connect() as conn:
             rows = conn.execute(stmt).mappings().all()

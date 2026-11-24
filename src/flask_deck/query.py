@@ -21,7 +21,7 @@ from typing import Any, Literal
 import sqlalchemy as sa
 from flask import g, has_request_context
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, defer, joinedload, selectinload
+from sqlalchemy.orm import Session, aliased, defer, joinedload, selectinload
 
 from flask_deck.formatters import normalize_tone
 from flask_deck.introspection import FieldMeta, ModelMeta, introspect_model
@@ -155,6 +155,50 @@ class PageResult:
     total_known: bool = True
     trashed_count: int = 0
     precomputed_facets: dict[str, dict[str, int]] = field(default_factory=dict)
+    full_total: int | None = None
+    page_window: tuple[int | None, ...] = ()
+
+
+def compute_page_window(current: int, total_pages: int) -> tuple[int | None, ...]:
+    """Build elided page numbers like ``(1, 2, None, 8, 9, 10, None, 19, 20)``."""
+    if total_pages <= 1:
+        return ()
+    current = max(1, min(total_pages, current))
+    if total_pages <= 9:
+        return tuple(range(1, total_pages + 1))
+    pages_set: set[int] = {1, 2, total_pages - 1, total_pages}
+    for p in range(max(1, current - 2), min(total_pages, current + 2) + 1):
+        pages_set.add(p)
+    sorted_pages = sorted(pages_set)
+    out: list[int | None] = []
+    prev = 0
+    for p in sorted_pages:
+        if prev and p - prev > 1:
+            out.append(None)
+        out.append(p)
+        prev = p
+    return tuple(out)
+
+
+def apply_base_stmt_extras(
+    stmt: sa.Select[Any],
+    base_stmt: sa.Select[Any],
+    *,
+    include_options: bool = False,
+) -> sa.Select[Any]:
+    """Preserve explicit ``.join()`` / ``.outerjoin()`` and ``.options()`` added in ``scope_query``."""
+    setup_joins = getattr(base_stmt, "_setup_joins", ())
+    for entry in setup_joins:
+        if isinstance(entry, tuple) and len(entry) >= 4:
+            target, onclause, _left, kw = entry[0], entry[1], entry[2], entry[3]
+            isouter = bool(kw.get("isouter", False)) if isinstance(kw, Mapping) else False
+            full = bool(kw.get("full", False)) if isinstance(kw, Mapping) else False
+            stmt = stmt.join(target, onclause, isouter=isouter, full=full)
+    if include_options:
+        opts = getattr(base_stmt, "_with_options", ())
+        if opts:
+            stmt = stmt.options(*opts)
+    return stmt
 
 
 def iter_filter_items(
@@ -453,12 +497,13 @@ def build_filter_condition(
     *,
     op: str = "eq",
     dialect_name: str = "",
+    model_override: Any = None,
 ) -> sa.ColumnElement[bool] | None:
     """Build a safe parameterized SQLAlchemy filter expression for a single field."""
     fmeta = meta.fields_by_name.get(field_name)
     if fmeta is None:
         return None
-    col: Any = getattr(meta.model, field_name)
+    col: Any = getattr(model_override or meta.model, field_name)
 
     if op == "null":
         if str(raw_value).lower() in {"1", "true", "null"}:
@@ -527,6 +572,10 @@ def build_filter_condition(
     if op == "preset" and fmeta.field_type in {"datetime", "date"}:
         now = datetime.now(timezone.utc)
         preset = str(raw_value).lower()
+        if preset == "no_date":
+            return col.is_(None)  # type: ignore[no-any-return]
+        if preset == "has_date":
+            return col.is_not(None)  # type: ignore[no-any-return]
         start_dt: datetime | None = None
         if preset == "today":
             start_dt = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
@@ -536,6 +585,8 @@ def build_filter_condition(
             start_dt = now - timedelta(days=30)
         elif preset == "month":
             start_dt = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+        elif preset == "year":
+            start_dt = datetime(now.year, 1, 1, tzinfo=timezone.utc)
         if start_dt is None:
             return None
         bound: datetime | date = start_dt.date() if fmeta.field_type == "date" else start_dt
@@ -612,6 +663,9 @@ def build_filter_condition(
         neq_expr: sa.ColumnElement[bool] = col != coerced
         return neq_expr
 
+    if op == "eq" and str(raw_value) == "__null__":
+        return col.is_(None)  # type: ignore[no-any-return]
+
     # Comma-separated multi-select support for enum/string/integer equality
     if isinstance(raw_value, str) and "," in raw_value and fmeta.field_type in {"enum", "string", "integer"}:
         parts = [_coerce_filter_value(p.strip(), fmeta) for p in raw_value.split(",")]
@@ -638,6 +692,7 @@ def build_dotted_filter_condition(
     views_by_model: Mapping[type[Any], Any] | None = None,
     user: Any = None,
     auth: Any = None,
+    alias_cache: dict[str, Any] | None = None,
 ) -> tuple[sa.ColumnElement[bool] | None, Any | None]:
     """Build a safe filter condition across a MANYTOONE dotted relation path like ``org.tier``."""
     if "." not in dotted_field:
@@ -648,13 +703,11 @@ def build_dotted_filter_condition(
         return None, None
 
     if auth is not None and views_by_model is not None:
-        p_view = views_by_model.get(meta.model)
-        if p_view is not None:
-            p_restricted = auth.hidden_fields_for(user, p_view.meta.slug) | auth.masked_fields_for(
-                user, p_view.meta.slug
-            )
-            if rel_name in p_restricted:
-                return None, None
+        p_restricted = auth.hidden_fields_for(user, meta.slug) | auth.masked_fields_for(
+            user, meta.slug
+        )
+        if rel_name in p_restricted:
+            return None, None
         t_view = views_by_model.get(rel_meta.target_model)
         if t_view is not None:
             t_restricted = auth.hidden_fields_for(user, t_view.meta.slug) | auth.masked_fields_for(
@@ -676,64 +729,276 @@ def build_dotted_filter_condition(
     ):
         return None, None
 
+    if alias_cache is not None:
+        rel_alias = alias_cache.get(rel_name)
+        if rel_alias is None:
+            rel_alias = aliased(rel_meta.target_model, name=f"_dk_{rel_name}")
+            alias_cache[rel_name] = rel_alias
+    else:
+        rel_alias = aliased(rel_meta.target_model, name=f"_dk_{rel_name}")
+
     cond = build_filter_condition(
-        target_meta, target_col_name, raw_value, op=op, dialect_name=dialect_name
+        target_meta,
+        target_col_name,
+        raw_value,
+        op=op,
+        dialect_name=dialect_name,
+        model_override=rel_alias,
     )
     if cond is None:
         return None, None
-    return cond, getattr(meta.model, rel_name)
+    return cond, getattr(meta.model, rel_name).of_type(rel_alias)
+
+
+def parse_search_column_spec(col_spec: str) -> tuple[str, str]:
+    """Parse optional Django-style search prefix (``^`` startswith, ``=`` exact, ``@`` fts)."""
+    clean = col_spec.strip()
+    if clean.startswith("^"):
+        return clean[1:].strip(), "startswith"
+    if clean.startswith("="):
+        return clean[1:].strip(), "exact"
+    if clean.startswith("@"):
+        return clean[1:].strip(), "fts"
+    return clean, "contains"
+
+
+def tokenize_search_query(
+    term: str,
+    *,
+    max_tokens: int = 8,
+    max_len: int = 200,
+) -> list[str]:
+    """O(N) ReDoS-safe search tokenizer supporting whitespace words and ``"quoted phrases"``."""
+    raw = (term or "").strip()[: max(1, max_len)]
+    if not raw:
+        return []
+    tokens: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    for ch in raw:
+        if ch == '"':
+            if in_quotes:
+                tok = "".join(buf).strip()
+                if tok:
+                    tokens.append(tok)
+                    if len(tokens) >= max_tokens:
+                        return tokens
+                buf.clear()
+                in_quotes = False
+            else:
+                if buf:
+                    tok = "".join(buf).strip()
+                    if tok:
+                        tokens.append(tok)
+                        if len(tokens) >= max_tokens:
+                            return tokens
+                    buf.clear()
+                in_quotes = True
+        elif ch.isspace() and not in_quotes:
+            if buf:
+                tok = "".join(buf).strip()
+                if tok:
+                    tokens.append(tok)
+                    if len(tokens) >= max_tokens:
+                        return tokens
+                buf.clear()
+        else:
+            buf.append(ch)
+    if buf and len(tokens) < max_tokens:
+        tok = "".join(buf).strip()
+        if tok:
+            tokens.append(tok)
+    return tokens
+
+
+def _build_scalar_search_pred(
+    model: type[Any],
+    fmeta: FieldMeta,
+    col_name: str,
+    token: str,
+    *,
+    mode: str,
+    dialect_name: str = "",
+) -> sa.ColumnElement[bool] | None:
+    if fmeta.is_sensitive:
+        return None
+    col: Any = getattr(model, col_name, None)
+    if col is None:
+        return None
+    escaped = escape_like(token)
+
+    if fmeta.field_type == "integer":
+        try:
+            int_val = int(token)
+        except ValueError:
+            return None
+        eq_int: sa.ColumnElement[bool] = col == int_val
+        return eq_int
+
+    if fmeta.field_type == "boolean":
+        low = token.strip().lower()
+        if low in {"true", "1", "yes"}:
+            return col.is_(True)  # type: ignore[no-any-return]
+        if low in {"false", "0", "no"}:
+            return col.is_(False)  # type: ignore[no-any-return]
+        return None
+
+    if fmeta.field_type == "uuid":
+        try:
+            eq_uuid: sa.ColumnElement[bool] = col == uuid.UUID(token)
+            return eq_uuid
+        except ValueError:
+            if mode == "exact":
+                return None
+            pat = f"{escaped}%" if mode == "startswith" else f"%{escaped}%"
+            uuid_like: sa.ColumnElement[bool] = sa.cast(col, sa.String).ilike(pat, escape="\\")
+            if dialect_name == "sqlite" and "-" in token:
+                esc_no_dash = escape_like(token.replace("-", ""))
+                pat_nd = f"{esc_no_dash}%" if mode == "startswith" else f"%{esc_no_dash}%"
+                return sa.or_(uuid_like, sa.cast(col, sa.String).ilike(pat_nd, escape="\\"))
+            return uuid_like
+
+    if fmeta.field_type == "enum":
+        if fmeta.enum_class is not None:
+            t_low = token.lower()
+            matched_members: list[Any] = []
+            for m in fmeta.enum_class:
+                n_low, v_low = m.name.lower(), str(m.value).lower()
+                if (
+                    (mode == "exact" and t_low in (n_low, v_low))
+                    or (mode == "startswith" and (n_low.startswith(t_low) or v_low.startswith(t_low)))
+                    or (mode not in {"exact", "startswith"} and (t_low in n_low or t_low in v_low))
+                ):
+                    matched_members.append(m)
+            if matched_members:
+                enum_in: sa.ColumnElement[bool] = col.in_(matched_members)
+                return enum_in
+        if mode == "exact":
+            enum_eq: sa.ColumnElement[bool] = sa.func.lower(sa.cast(col, sa.String)) == token.lower()
+            return enum_eq
+        pat = f"{escaped}%" if mode == "startswith" else f"%{escaped}%"
+        enum_like: sa.ColumnElement[bool] = sa.cast(col, sa.String).ilike(pat, escape="\\")
+        return enum_like
+
+    if fmeta.field_type in {"string", "text", "email", "url"}:
+        if mode == "exact":
+            str_eq: sa.ColumnElement[bool] = sa.func.lower(col) == token.lower()
+            return str_eq
+        if mode == "startswith":
+            sw_expr: sa.ColumnElement[bool] = col.ilike(f"{escaped}%", escape="\\")
+            return sw_expr
+        if mode == "fts" and dialect_name == "postgresql":
+            fts_expr: sa.ColumnElement[bool] = sa.func.to_tsvector(
+                "english", sa.cast(col, sa.Text)
+            ).op("@@")(sa.func.plainto_tsquery("english", token))
+            return fts_expr
+        like_expr: sa.ColumnElement[bool] = col.ilike(f"%{escaped}%", escape="\\")
+        return like_expr
+
+    if mode == "exact":
+        gen_eq: sa.ColumnElement[bool] = sa.func.lower(sa.cast(col, sa.String)) == token.lower()
+        return gen_eq
+    pat = f"{escaped}%" if mode == "startswith" else f"%{escaped}%"
+    gen_like: sa.ColumnElement[bool] = sa.cast(col, sa.String).ilike(pat, escape="\\")
+    return gen_like
+
+
+def _build_rel_search_pred(
+    meta: ModelMeta,
+    parts: list[str],
+    token: str,
+    *,
+    mode: str,
+    dialect_name: str = "",
+    max_hops: int = 2,
+) -> sa.ColumnElement[bool] | None:
+    """Build correlated SQL EXISTS search predicate across 1..max_hops MANYTOONE/TO-MANY relations."""
+    if len(parts) < 2 or (len(parts) - 1) > max_hops:
+        return None
+    rel_name = parts[0]
+    rel_meta = meta.relationships_by_name.get(rel_name)
+    if rel_meta is None or rel_name in meta.sensitive_fields:
+        return None
+    rel_attr: Any = getattr(meta.model, rel_name, None)
+    if rel_attr is None:
+        return None
+    target_meta = introspect_model(rel_meta.target_model)
+    if len(parts) == 2:
+        col_name = parts[1]
+        target_fmeta = target_meta.fields_by_name.get(col_name)
+        if target_fmeta is None or target_fmeta.is_sensitive or is_sensitive_field(col_name):
+            return None
+        inner = _build_scalar_search_pred(
+            target_meta.model, target_fmeta, col_name, token, mode=mode, dialect_name=dialect_name
+        )
+    else:
+        inner = _build_rel_search_pred(
+            target_meta, parts[1:], token, mode=mode, dialect_name=dialect_name, max_hops=max_hops - 1
+        )
+    if inner is None:
+        return None
+    exists_expr: sa.ColumnElement[bool] = rel_attr.any(inner) if rel_meta.uselist else rel_attr.has(inner)
+    return exists_expr
 
 
 def build_search_clause(
     meta: ModelMeta,
     searchable_columns: Sequence[str],
     term: str,
+    *,
+    dialect_name: str = "",
+    max_tokens: int = 8,
+    max_len: int = 200,
 ) -> tuple[sa.ColumnElement[bool] | None, list[Any]]:
-    """Build safe escaped LIKE search clause across scalar and dotted FK columns."""
-    clean = term.strip()
-    if not clean or not searchable_columns:
+    """Build safe tokenized/quoted AND-across-tokens search clause with ``^``/``=``/``@`` prefixes and EXISTS joins."""
+    tokens = tokenize_search_query(term, max_tokens=max_tokens, max_len=max_len)
+    if not tokens or not searchable_columns:
         return None, []
 
-    escaped = f"%{escape_like(clean)}%"
-    predicates: list[sa.ColumnElement[bool]] = []
-    joins: list[Any] = []
-    seen_joins: set[str] = set()
-
-    for col_spec in searchable_columns:
-        if "." in col_spec:
-            rel_name, target_col_name = col_spec.split(".", 1)
-            rel_meta = meta.relationships_by_name.get(rel_name)
-            if rel_meta is None or rel_meta.direction != "MANYTOONE":
+    parsed_cols = [parse_search_column_spec(c) for c in searchable_columns]
+    token_clauses: list[sa.ColumnElement[bool]] = []
+    for token in tokens:
+        preds: list[sa.ColumnElement[bool]] = []
+        for col_path, mode in parsed_cols:
+            if not col_path:
                 continue
-            target_col = getattr(rel_meta.target_model, target_col_name, None)
-            if target_col is None:
+            if "." in col_path:
+                parts = [p.strip() for p in col_path.split(".") if p.strip()]
+                rel_pred = _build_rel_search_pred(
+                    meta, parts, token, mode=mode, dialect_name=dialect_name, max_hops=2
+                )
+                if rel_pred is not None:
+                    preds.append(rel_pred)
                 continue
-            if rel_name not in seen_joins:
-                joins.append(getattr(meta.model, rel_name))
-                seen_joins.add(rel_name)
-            predicates.append(sa.cast(target_col, sa.String).ilike(escaped, escape="\\"))
-            continue
+            fmeta = meta.fields_by_name.get(col_path)
+            if fmeta is None or fmeta.is_sensitive:
+                continue
+            sc_pred = _build_scalar_search_pred(
+                meta.model, fmeta, col_path, token, mode=mode, dialect_name=dialect_name
+            )
+            if sc_pred is not None:
+                preds.append(sc_pred)
+        if preds:
+            token_clauses.append(sa.or_(*preds) if len(preds) > 1 else preds[0])
+        else:
+            # Token matched no eligible typed column (e.g. non-numeric token on integer-only search) -> empty result
+            token_clauses.append(sa.false())
 
-        fmeta = meta.fields_by_name.get(col_spec)
-        if fmeta is None or fmeta.is_sensitive:
-            continue
-        col = getattr(meta.model, col_spec)
-        if fmeta.field_type in {"string", "text", "email", "url"}:
-            predicates.append(col.ilike(escaped, escape="\\"))
-        elif fmeta.field_type == "integer":
-            with contextlib.suppress(ValueError):
-                predicates.append(col == int(clean))
-        elif fmeta.field_type == "uuid":
-            try:
-                predicates.append(col == uuid.UUID(clean))
-            except ValueError:
-                predicates.append(sa.cast(col, sa.String).ilike(escaped, escape="\\"))
-        elif fmeta.field_type == "enum":
-            predicates.append(sa.cast(col, sa.String).ilike(escaped, escape="\\"))
-
-    if not predicates:
+    if not token_clauses:
         return None, []
-    return sa.or_(*predicates), joins
+    combined: sa.ColumnElement[bool] = (
+        sa.and_(*token_clauses) if len(token_clauses) > 1 else token_clauses[0]
+    )
+    return combined, []
+
+
+def _is_eager_loadable_rel(model: type[Any], rel_name: str) -> bool:
+    """Return False for lazy='dynamic' / WriteOnlyMapped relationships where eager loading raises."""
+    mapper = sa.inspect(model)
+    prop = mapper.relationships.get(rel_name)
+    if prop is None:
+        return False
+    return str(getattr(prop, "lazy", "")) not in {"dynamic", "write_only"}
 
 
 def apply_list_load_options(
@@ -742,8 +1007,9 @@ def apply_list_load_options(
     displayed_columns: Sequence[str],
     *,
     defer_unshown_heavy: bool = True,
+    extra_select_related: Sequence[str] = (),
 ) -> sa.Select[Any]:
-    """Attach automatic joinedload/selectinload for displayed relations and defer heavy unshown blobs."""
+    """Attach automatic joinedload/selectinload for displayed relations, extra chains, and defer heavy blobs."""
     shown_set = set(displayed_columns)
     options: list[Any] = []
     loaded_rels: set[str] = set()
@@ -754,12 +1020,39 @@ def apply_list_load_options(
             rel_meta = meta.fk_column_to_rel.get(col_name)
         if rel_meta is None or rel_meta.name in loaded_rels:
             continue
+        if not _is_eager_loadable_rel(meta.model, rel_meta.name):
+            continue
         rel_attr = getattr(meta.model, rel_meta.name)
         if rel_meta.direction == "MANYTOONE":
             options.append(joinedload(rel_attr))
         else:
             options.append(selectinload(rel_attr))
         loaded_rels.add(rel_meta.name)
+
+    for rel_path in extra_select_related:
+        parts = [p.strip() for p in rel_path.split(".") if p.strip()]
+        if not parts or len(parts) > 3:
+            continue
+        cur_meta = meta
+        chain_opt: Any = None
+        valid = True
+        for part in parts:
+            rm = cur_meta.relationships_by_name.get(part)
+            if rm is None or not _is_eager_loadable_rel(cur_meta.model, rm.name):
+                valid = False
+                break
+            attr = getattr(cur_meta.model, rm.name)
+            if chain_opt is None:
+                chain_opt = joinedload(attr) if rm.direction == "MANYTOONE" else selectinload(attr)
+            else:
+                chain_opt = (
+                    chain_opt.joinedload(attr)
+                    if rm.direction == "MANYTOONE"
+                    else chain_opt.selectinload(attr)
+                )
+            cur_meta = introspect_model(rm.target_model)
+        if valid and chain_opt is not None:
+            options.append(chain_opt)
 
     if defer_unshown_heavy:
         pk_names = {pk.name for pk in meta.primary_keys}
@@ -833,6 +1126,8 @@ def _compute_quick_tab_and_facet_counts(
     dialect_name: str = "",
     soft_delete_column: str | None = None,
     extra_facet_exprs: Sequence[tuple[str, str, sa.ColumnElement[bool]]] = (),
+    base_stmt: sa.Select[Any] | None = None,
+    search_applier: Callable[[sa.Select[Any]], sa.Select[Any]] | None = None,
 ) -> tuple[dict[str, int], int, dict[str, dict[str, int]]]:
     """Compute QuickTab + Trash counts plus optional foldable shared facet counts in ONE SQL query."""
     if not quick_tabs and not soft_delete_column:
@@ -867,10 +1162,14 @@ def _compute_quick_tab_and_facet_counts(
         agg_exprs.append(sa.func.count(sa.case((eff_pred, 1))).label(f"_xf_{idx_f}"))
 
     stmt = sa.select(*agg_exprs).select_from(meta.model)
+    if base_stmt is not None:
+        stmt = apply_base_stmt_extras(stmt, base_stmt, include_options=False)
     for rel_attr in joins:
         stmt = stmt.outerjoin(rel_attr)
     if base_where:
         stmt = stmt.where(*base_where)
+    if search_applier is not None:
+        stmt = search_applier(stmt)
 
     row = session.execute(stmt).first()
     if row is None:
@@ -980,6 +1279,7 @@ def _resolve_sort_column(
     display_fields: Mapping[str, Any] | None = None,
     joins: list[Any],
     seen_joins: set[Any],
+    alias_cache: dict[str, Any] | None = None,
 ) -> Any | None:
     """Resolve scalar, dotted FK, or @display.ordering SQLAlchemy order expression safely."""
     d_spec = display_fields.get(col_name) if display_fields is not None else None
@@ -995,13 +1295,21 @@ def _resolve_sort_column(
             rel_meta = meta.relationships_by_name.get(rel_name)
             if rel_meta is None or rel_meta.direction != "MANYTOONE":
                 return None
-            col_expr = getattr(rel_meta.target_model, target_col, None)
+            if not hasattr(rel_meta.target_model, target_col):
+                return None
+            if alias_cache is not None:
+                rel_alias = alias_cache.get(rel_name)
+                if rel_alias is None:
+                    rel_alias = aliased(rel_meta.target_model, name=f"_dk_{rel_name}")
+                    alias_cache[rel_name] = rel_alias
+            else:
+                rel_alias = aliased(rel_meta.target_model, name=f"_dk_{rel_name}")
+            col_expr = getattr(rel_alias, target_col, None)
             if col_expr is None:
                 return None
-            join_attr = getattr(meta.model, rel_name)
-            jkey = getattr(join_attr, "key", id(join_attr))
+            jkey = f"rel:{rel_name}"
             if jkey not in seen_joins:
-                joins.append(join_attr)
+                joins.append(getattr(meta.model, rel_name).of_type(rel_alias))
                 seen_joins.add(jkey)
             return col_expr
         if target_spec in meta.fields_by_name:
@@ -1022,10 +1330,12 @@ def _apply_filter_params(
     user: Any = None,
     auth: Any = None,
     where_by_field: dict[str, list[sa.ColumnElement[bool]]] | None = None,
+    alias_cache: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], list[tuple[str, str]]]:
     known_fields = frozenset(meta.fields_by_name.keys()) | set(filterable_columns)
     active_filters: dict[str, str] = {}
     applied_filter_pairs: list[tuple[str, str]] = []
+    local_aliases = alias_cache if alias_cache is not None else {}
     for raw_key, raw_val in iter_filter_items(filter_params):
         if not raw_val:
             continue
@@ -1033,6 +1343,7 @@ def _apply_filter_params(
         if fname not in filterable_columns:
             continue
         if "." in fname:
+            rel_name = fname.split(".", 1)[0]
             cond, join_attr = build_dotted_filter_condition(
                 meta,
                 fname,
@@ -1042,12 +1353,13 @@ def _apply_filter_params(
                 views_by_model=views_by_model,
                 user=user,
                 auth=auth,
+                alias_cache=local_aliases,
             )
             if cond is not None and join_attr is not None:
                 where_clauses.append(cond)
                 if where_by_field is not None:
                     where_by_field.setdefault(fname, []).append(cond)
-                jkey = getattr(join_attr, "key", id(join_attr))
+                jkey = f"rel:{rel_name}"
                 if jkey not in seen_joins:
                     joins.append(join_attr)
                     seen_joins.add(jkey)
@@ -1081,6 +1393,10 @@ def prepare_scoped_clauses(
     user: Any = None,
     auth: Any = None,
     extra_where: Sequence[sa.ColumnElement[bool]] = (),
+    max_search_tokens: int = 8,
+    max_search_length: int = 200,
+    use_default_search: bool = True,
+    search_applier: Callable[[sa.Select[Any]], sa.Select[Any]] | None = None,
 ) -> tuple[
     list[sa.ColumnElement[bool]],
     list[sa.ColumnElement[bool]],
@@ -1092,14 +1408,22 @@ def prepare_scoped_clauses(
     joins: list[Any] = []
     seen_joins: set[Any] = set()
 
-    search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
-    if search_clause is not None:
-        non_filter_where.append(search_clause)
-        for j in search_joins:
-            jkey = getattr(j, "key", id(j))
-            if jkey not in seen_joins:
-                joins.append(j)
-                seen_joins.add(jkey)
+    if use_default_search and search_applier is None:
+        search_clause, search_joins = build_search_clause(
+            meta,
+            searchable_columns,
+            search_term,
+            dialect_name=dialect_name,
+            max_tokens=max_search_tokens,
+            max_len=max_search_length,
+        )
+        if search_clause is not None:
+            non_filter_where.append(search_clause)
+            for j in search_joins:
+                jkey = getattr(j, "key", id(j))
+                if jkey not in seen_joins:
+                    joins.append(j)
+                    seen_joins.add(jkey)
 
     sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=trashed)
     if sd_pred is not None:
@@ -1170,6 +1494,11 @@ def execute_list_query(
     extra_where: Sequence[sa.ColumnElement[bool]] = (),
     custom_filter_appliers: Sequence[Callable[[sa.Select[Any]], sa.Select[Any]]] = (),
     extra_facet_exprs: Sequence[tuple[str, str, sa.ColumnElement[bool]]] = (),
+    extra_select_related: Sequence[str] = (),
+    search_applier: Callable[[sa.Select[Any]], sa.Select[Any]] | None = None,
+    show_full_result_count: bool = True,
+    max_search_tokens: int = 8,
+    max_search_length: int = 200,
 ) -> PageResult:
     """Execute an optimized, N+1-free, SQLi-safe paginated list query (Offset or Keyset Cursor)."""
     safe_page = max(1, page)
@@ -1178,18 +1507,28 @@ def execute_list_query(
     bind = session.get_bind()
     dialect_name = bind.dialect.name if bind is not None else ""
 
-    base_conditions: list[sa.ColumnElement[bool]] = list(base_stmt._where_criteria)
+    scope_where: list[sa.ColumnElement[bool]] = list(base_stmt._where_criteria)
+    base_conditions: list[sa.ColumnElement[bool]] = list(scope_where)
     joins: list[Any] = []
     seen_joins: set[Any] = set()
 
-    search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
-    if search_clause is not None:
-        base_conditions.append(search_clause)
-        for j in search_joins:
-            jkey = getattr(j, "key", id(j))
-            if jkey not in seen_joins:
-                joins.append(j)
-                seen_joins.add(jkey)
+    has_search = bool((search_term or "").strip())
+    if search_applier is None:
+        search_clause, search_joins = build_search_clause(
+            meta,
+            searchable_columns,
+            search_term,
+            dialect_name=dialect_name,
+            max_tokens=max_search_tokens,
+            max_len=max_search_length,
+        )
+        if search_clause is not None:
+            base_conditions.append(search_clause)
+            for j in search_joins:
+                jkey = getattr(j, "key", id(j))
+                if jkey not in seen_joins:
+                    joins.append(j)
+                    seen_joins.add(jkey)
 
     # Skip expensive quick-tab full-table scan when count_mode == "none".
     if count_mode == "none":
@@ -1207,6 +1546,8 @@ def execute_list_query(
             dialect_name=dialect_name,
             soft_delete_column=soft_delete_column,
             extra_facet_exprs=extra_facet_exprs,
+            base_stmt=base_stmt,
+            search_applier=search_applier,
         )
 
     where_clauses: list[sa.ColumnElement[bool]] = list(base_conditions)
@@ -1227,6 +1568,7 @@ def execute_list_query(
                         where_clauses.append(cond)
                 break
 
+    alias_cache: dict[str, Any] = {}
     active_filters, applied_filter_pairs = _apply_filter_params(
         meta,
         filter_params,
@@ -1238,6 +1580,7 @@ def execute_list_query(
         views_by_model=views_by_model,
         user=user,
         auth=auth,
+        alias_cache=alias_cache,
     )
 
     # Strictly allowlisted sorting supporting up to 3 multi-sort levels, dotted FKs & @display.ordering.
@@ -1263,6 +1606,7 @@ def execute_list_query(
             display_fields=display_fields,
             joins=joins,
             seen_joins=seen_joins,
+            alias_cache=alias_cache,
         )
         if s_expr is not None:
             resolved_sorts.append((s_col_name, s_dir, s_expr))
@@ -1280,6 +1624,7 @@ def execute_list_query(
         and len(resolved_sorts) == 1
         and chosen_sort in meta.fields_by_name
         and not custom_filter_appliers
+        and search_applier is None
     )
 
     # Resolve row count strategy (only skip COUNT when cursor mode is actually active)
@@ -1294,10 +1639,13 @@ def execute_list_query(
     )
     has_unscoped_only = (
         not base_conditions
+        and not getattr(base_stmt, "_setup_joins", ())
+        and not soft_delete_column
         and not active_filters
         and not has_active_tab_filter
         and not extra_where
         and not custom_filter_appliers
+        and search_applier is None
         and not trashed
     )
 
@@ -1324,9 +1672,13 @@ def execute_list_query(
         ):
             total = tab_counts[quick_tabs[0].key]
         else:
-            count_stmt = sa.select(sa.func.count()).select_from(meta.model)
+            count_stmt = apply_base_stmt_extras(
+                sa.select(sa.func.count()).select_from(meta.model), base_stmt
+            )
             if where_clauses:
                 count_stmt = count_stmt.where(*where_clauses)
+            if search_applier is not None:
+                count_stmt = search_applier(count_stmt)
             for applier in custom_filter_appliers:
                 count_stmt = applier(count_stmt)
             total = int(session.execute(count_stmt).scalar_one() or 0)
@@ -1346,14 +1698,50 @@ def execute_list_query(
     ):
         total = tab_counts[quick_tabs[0].key]
     else:
-        count_stmt = sa.select(sa.func.count()).select_from(meta.model)
+        count_stmt = apply_base_stmt_extras(
+            sa.select(sa.func.count()).select_from(meta.model), base_stmt
+        )
         for rel_attr in joins:
             count_stmt = count_stmt.outerjoin(rel_attr)
         if where_clauses:
             count_stmt = count_stmt.where(*where_clauses)
+        if search_applier is not None:
+            count_stmt = search_applier(count_stmt)
         for applier in custom_filter_appliers:
             count_stmt = applier(count_stmt)
         total = int(session.execute(count_stmt).scalar_one() or 0)
+
+    # Optional unfiltered total ("X matching of Y total") — zero extra SQL when QuickTab("all") already computed it!
+    is_narrowed = bool(
+        has_search or active_filters or has_active_tab_filter or extra_where or custom_filter_appliers
+    )
+    full_total: int | None = None
+    if show_full_result_count and is_narrowed and total_known and count_mode != "none":
+        if not has_search and not trashed:
+            for tab in quick_tabs:
+                if not tab.filters and tab.key in tab_counts:
+                    full_total = tab_counts[tab.key]
+                    break
+        if (
+            full_total is None
+            and count_mode == "estimated"
+            and not scope_where
+            and sd_pred is None
+            and not getattr(base_stmt, "_setup_joins", ())
+        ):
+            est_full = estimate_table_rows(session, meta)
+            if est_full is not None:
+                full_total = est_full
+        if full_total is None:
+            ft_stmt = apply_base_stmt_extras(
+                sa.select(sa.func.count()).select_from(meta.model), base_stmt
+            )
+            ft_where = list(scope_where)
+            if sd_pred is not None:
+                ft_where.append(sd_pred)
+            if ft_where:
+                ft_stmt = ft_stmt.where(*ft_where)
+            full_total = int(session.execute(ft_stmt).scalar_one() or 0)
 
     # Keyset Cursor Mode (zero OFFSET, signed opaque cursors, deterministic PG/SQLite NULL order)
     if use_cursor_mode:
@@ -1366,6 +1754,7 @@ def execute_list_query(
                     search_term.strip(),
                     sorted(applied_filter_pairs),
                     bool(trashed),
+                    [str(ew) for ew in extra_where],
                 ],
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -1411,7 +1800,7 @@ def execute_list_query(
             clauses: Sequence[sa.ColumnElement[bool]],
             direction: str,
         ) -> list[Any]:
-            stmt = sa.select(meta.model)
+            stmt = apply_base_stmt_extras(sa.select(meta.model), base_stmt, include_options=True)
             for rel_attr in joins:
                 stmt = stmt.outerjoin(rel_attr)
             if clauses:
@@ -1425,7 +1814,9 @@ def execute_list_query(
             if chosen_sort != pk_field.name:
                 order_clauses.append(pk_col.desc() if direction == "desc" else pk_col.asc())
             stmt = stmt.order_by(*order_clauses)
-            stmt = apply_list_load_options(stmt, meta, displayed_columns)
+            stmt = apply_list_load_options(
+                stmt, meta, displayed_columns, extra_select_related=extra_select_related
+            )
             stmt = stmt.limit(safe_size + 1)
             return list(session.scalars(stmt).unique().all())
 
@@ -1483,6 +1874,7 @@ def execute_list_query(
             total_known=total_known,
             trashed_count=trashed_count,
             precomputed_facets=precomputed_facets,
+            full_total=full_total,
         )
 
     # Classic Offset Pagination
@@ -1490,11 +1882,13 @@ def execute_list_query(
     if safe_page > pages:
         safe_page = pages
 
-    data_stmt = sa.select(meta.model)
+    data_stmt = apply_base_stmt_extras(sa.select(meta.model), base_stmt, include_options=True)
     for rel_attr in joins:
         data_stmt = data_stmt.outerjoin(rel_attr)
     if where_clauses:
         data_stmt = data_stmt.where(*where_clauses)
+    if search_applier is not None:
+        data_stmt = search_applier(data_stmt)
     for applier in custom_filter_appliers:
         data_stmt = applier(data_stmt)
 
@@ -1508,7 +1902,9 @@ def execute_list_query(
             pcol = getattr(meta.model, pk_f.name)
             offset_orders.append(pcol.desc() if chosen_dir == "desc" else pcol.asc())
     data_stmt = data_stmt.order_by(*offset_orders)
-    data_stmt = apply_list_load_options(data_stmt, meta, displayed_columns)
+    data_stmt = apply_list_load_options(
+        data_stmt, meta, displayed_columns, extra_select_related=extra_select_related
+    )
     data_stmt = data_stmt.limit(safe_size).offset((safe_page - 1) * safe_size)
 
     items = list(session.scalars(data_stmt).unique().all())
@@ -1527,6 +1923,8 @@ def execute_list_query(
         total_known=total_known,
         trashed_count=trashed_count,
         precomputed_facets=precomputed_facets,
+        full_total=full_total,
+        page_window=compute_page_window(safe_page, pages),
     )
 
 
@@ -1582,6 +1980,9 @@ def compute_all_aggregates(
     auth: Any = None,
     extra_where: Sequence[sa.ColumnElement[bool]] = (),
     custom_filter_appliers: Sequence[Callable[[sa.Select[Any]], sa.Select[Any]]] = (),
+    search_applier: Callable[[sa.Select[Any]], sa.Select[Any]] | None = None,
+    max_search_tokens: int = 8,
+    max_search_length: int = 200,
 ) -> dict[str, tuple[str, float]]:
     """Compute SQL aggregates (sum, avg, min, max) over the entire filtered dataset in 1 query."""
     if not column_aggregates:
@@ -1613,14 +2014,22 @@ def compute_all_aggregates(
     joins: list[Any] = []
     seen_joins: set[Any] = set()
 
-    search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
-    if search_clause is not None:
-        where_clauses.append(search_clause)
-        for j in search_joins:
-            jkey = getattr(j, "key", id(j))
-            if jkey not in seen_joins:
-                joins.append(j)
-                seen_joins.add(jkey)
+    if search_applier is None:
+        search_clause, search_joins = build_search_clause(
+            meta,
+            searchable_columns,
+            search_term,
+            dialect_name=dialect_name,
+            max_tokens=max_search_tokens,
+            max_len=max_search_length,
+        )
+        if search_clause is not None:
+            where_clauses.append(search_clause)
+            for j in search_joins:
+                jkey = getattr(j, "key", id(j))
+                if jkey not in seen_joins:
+                    joins.append(j)
+                    seen_joins.add(jkey)
 
     sd_pred = soft_delete_predicate(meta, soft_delete_column, trashed=trashed)
     if sd_pred is not None:
@@ -1652,11 +2061,13 @@ def compute_all_aggregates(
         auth=auth,
     )
 
-    stmt = sa.select(*agg_exprs).select_from(meta.model)
+    stmt = apply_base_stmt_extras(sa.select(*agg_exprs).select_from(meta.model), base_stmt)
     for rel_attr in joins:
         stmt = stmt.outerjoin(rel_attr)
     if where_clauses:
         stmt = stmt.where(*where_clauses)
+    if search_applier is not None:
+        stmt = search_applier(stmt)
     for applier in custom_filter_appliers:
         stmt = applier(stmt)
     row = session.execute(stmt).first()
@@ -1688,6 +2099,9 @@ def execute_kanban_query(
     views_by_model: Mapping[type[Any], Any] | None = None,
     user: Any = None,
     auth: Any = None,
+    search_applier: Callable[[sa.Select[Any]], sa.Select[Any]] | None = None,
+    max_search_tokens: int = 8,
+    max_search_length: int = 200,
 ) -> list[dict[str, Any]]:
     """Fetch bounded, eager-loaded records grouped by enum choices for Kanban Board view."""
     fmeta = meta.fields_by_name.get(kanban_column)
@@ -1704,14 +2118,22 @@ def execute_kanban_query(
 
     joins: list[Any] = []
     seen_joins: set[Any] = set()
-    search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
-    if search_clause is not None:
-        where_clauses.append(search_clause)
-        for j in search_joins:
-            jkey = getattr(j, "key", id(j))
-            if jkey not in seen_joins:
-                joins.append(j)
-                seen_joins.add(jkey)
+    if search_applier is None:
+        search_clause, search_joins = build_search_clause(
+            meta,
+            searchable_columns,
+            search_term,
+            dialect_name=dialect_name,
+            max_tokens=max_search_tokens,
+            max_len=max_search_length,
+        )
+        if search_clause is not None:
+            where_clauses.append(search_clause)
+            for j in search_joins:
+                jkey = getattr(j, "key", id(j))
+                if jkey not in seen_joins:
+                    joins.append(j)
+                    seen_joins.add(jkey)
 
     _apply_filter_params(
         meta,
@@ -1726,11 +2148,13 @@ def execute_kanban_query(
         auth=auth,
     )
 
-    stmt = sa.select(meta.model)
+    stmt = apply_base_stmt_extras(sa.select(meta.model), base_stmt, include_options=True)
     for rel_attr in joins:
         stmt = stmt.outerjoin(rel_attr)
     if where_clauses:
         stmt = stmt.where(*where_clauses)
+    if search_applier is not None:
+        stmt = search_applier(stmt)
     stmt = stmt.order_by(getattr(meta.model, meta.primary_keys[0].name).desc())
     stmt = apply_list_load_options(stmt, meta, card_fields)
     stmt = stmt.limit(max(1, min(limit, 250)))
@@ -1765,6 +2189,9 @@ def execute_calendar_query(
     views_by_model: Mapping[type[Any], Any] | None = None,
     user: Any = None,
     auth: Any = None,
+    search_applier: Callable[[sa.Select[Any]], sa.Select[Any]] | None = None,
+    max_search_tokens: int = 8,
+    max_search_length: int = 200,
 ) -> dict[str, Any]:
     """Fetch bounded records for a YYYY-MM month and bucket them into 7-day calendar weeks."""
     today = datetime.now(timezone.utc).date()
@@ -1801,14 +2228,22 @@ def execute_calendar_query(
 
     joins: list[Any] = []
     seen_joins: set[Any] = set()
-    search_clause, search_joins = build_search_clause(meta, searchable_columns, search_term)
-    if search_clause is not None:
-        where_clauses.append(search_clause)
-        for j in search_joins:
-            jkey = getattr(j, "key", id(j))
-            if jkey not in seen_joins:
-                joins.append(j)
-                seen_joins.add(jkey)
+    if search_applier is None:
+        search_clause, search_joins = build_search_clause(
+            meta,
+            searchable_columns,
+            search_term,
+            dialect_name=dialect_name,
+            max_tokens=max_search_tokens,
+            max_len=max_search_length,
+        )
+        if search_clause is not None:
+            where_clauses.append(search_clause)
+            for j in search_joins:
+                jkey = getattr(j, "key", id(j))
+                if jkey not in seen_joins:
+                    joins.append(j)
+                    seen_joins.add(jkey)
 
     _apply_filter_params(
         meta,
@@ -1831,11 +2266,14 @@ def execute_calendar_query(
         start_bound = month_start
         end_bound = month_end
 
-    stmt = sa.select(meta.model)
+    stmt = apply_base_stmt_extras(sa.select(meta.model), base_stmt, include_options=True)
     for rel_attr in joins:
         stmt = stmt.outerjoin(rel_attr)
     where_clauses.extend([date_col >= start_bound, date_col < end_bound])
-    stmt = stmt.where(*where_clauses).order_by(date_col.asc()).limit(max(1, min(limit, 500)))
+    stmt = stmt.where(*where_clauses)
+    if search_applier is not None:
+        stmt = search_applier(stmt)
+    stmt = stmt.order_by(date_col.asc()).limit(max(1, min(limit, 500)))
     records = list(session.scalars(stmt).unique().all())
 
     by_iso: dict[str, list[Any]] = {}
@@ -1895,7 +2333,7 @@ def execute_tree_query(
     if sd_pred is not None:
         where_clauses.append(sd_pred)
 
-    stmt = sa.select(meta.model)
+    stmt = apply_base_stmt_extras(sa.select(meta.model), base_stmt, include_options=True)
     if where_clauses:
         stmt = stmt.where(*where_clauses)
     stmt = stmt.order_by(pk_col.asc())

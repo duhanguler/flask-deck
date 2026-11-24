@@ -92,6 +92,22 @@
     <span class="dk-muted" data-switch-label>{{ "Enabled" if spec.value else "Disabled" }}</span>
   </label>
 
+  {% elif spec.kind == 'enum' and spec.radio_layout in ['horizontal', 'vertical'] %}
+  <div class="dk-radio-group dk-radio-{{ spec.radio_layout }}" role="radiogroup" aria-label="{{ spec.label }}">
+    {% if not spec.required %}
+    <label class="dk-radio-opt">
+      <input type="radio" name="{{ spec.name }}" value=""{% if spec.value|string == '' %} checked{% endif %}{% if spec.readonly %} disabled{% endif %}>
+      <span class="dk-subtle">— None —</span>
+    </label>
+    {% endif %}
+    {% for val, lbl in spec.choices %}
+    <label class="dk-radio-opt">
+      <input type="radio" name="{{ spec.name }}" value="{{ val }}"{% if spec.value|string == val %} checked{% endif %}{% if spec.readonly %} disabled{% endif %}{% if spec.required %} required{% endif %}>
+      <span>{{ lbl }}</span>
+    </label>
+    {% endfor %}
+  </div>
+
   {% elif spec.kind == 'enum' and wtype == 'segmented' %}
   <div class="dk-seg-radios" role="radiogroup" aria-label="{{ spec.label }}">
     {% for val, lbl in spec.choices %}
@@ -110,17 +126,34 @@
     {% endfor %}
   </select>
 
+  {% elif spec.kind == 'fk' and spec.radio_layout in ['horizontal', 'vertical'] %}
+  <div class="dk-radio-group dk-radio-{{ spec.radio_layout }}" role="radiogroup" aria-label="{{ spec.label }}">
+    {% if not spec.required %}
+    <label class="dk-radio-opt">
+      <input type="radio" name="{{ spec.name }}" value=""{% if spec.value|string == '' %} checked{% endif %}{% if spec.readonly %} disabled{% endif %}>
+      <span class="dk-subtle">— None —</span>
+    </label>
+    {% endif %}
+    {% for opt in spec.fk_options %}
+    <label class="dk-radio-opt">
+      <input type="radio" name="{{ spec.name }}" value="{{ opt.id }}"{% if spec.value|string == opt.id %} checked{% endif %}{% if spec.readonly %} disabled{% endif %}{% if spec.required %} required{% endif %}>
+      <span>{{ opt.label }}</span>
+    </label>
+    {% endfor %}
+  </div>
+
   {% elif spec.kind == 'fk' %}
   <div class="dk-fk-control-row">
-    <div class="dk-fk-wrap" data-deck-fk data-fk-url="{{ spec.fk_search_url or '' }}"{% if spec.dependent_json %} data-dependent="{{ spec.dependent_json }}"{% endif %}>
+    <div class="dk-fk-wrap" data-deck-fk data-fk-url="{{ '' if spec.is_raw_id else (spec.fk_search_url or '') }}"{% if spec.dependent_json %} data-dependent="{{ spec.dependent_json }}"{% endif %}>
       <input type="hidden" name="{{ spec.name }}" value="{{ spec.value }}" data-fk-value>
       <input type="text"
              id="fld_{{ spec.name }}"
-             class="dk-input"
+             class="dk-input{% if spec.is_raw_id %} dk-mono{% endif %}"
              value="{{ spec.fk_current_label or spec.value }}"
-             placeholder="Search {{ spec.label | lower }}…"
+             placeholder="{{ 'Select via lookup…' if spec.is_raw_id else ('Search ' ~ (spec.label | lower) ~ '…') }}"
              autocomplete="off"
              data-fk-search
+             {% if spec.is_raw_id %}data-fk-raw-id="1"{% endif %}
              {% if spec.readonly %}readonly{% endif %}>
       <div class="dk-fk-dropdown" data-fk-dropdown hidden="hidden">
         {% for opt in spec.fk_options %}
@@ -131,8 +164,19 @@
         {% endfor %}
       </div>
     </div>
-    {% if spec.fk_target_slug and (spec.fk_can_create or spec.fk_can_edit or spec.fk_can_view) %}
+    {% if spec.fk_target_slug and (spec.fk_can_create or spec.fk_can_edit or spec.fk_can_view or spec.fk_can_delete) %}
     <div class="dk-rel-actions">
+      {% if spec.fk_lookup_url and spec.fk_can_view and not spec.readonly %}
+      <button type="button"
+              class="dk-btn dk-btn-sm dk-btn-icon"
+              title="{{ _('Lookup') }} {{ spec.label }}"
+              aria-label="Lookup {{ spec.label }}"
+              data-deck-rel-lookup="{{ spec.fk_lookup_url }}"
+              data-rel-title="{{ _('Lookup') }} {{ spec.label }}"
+              data-rel-target="fld_{{ spec.name }}">
+        {{ deck_icon("search", 13) }}
+      </button>
+      {% endif %}
       {% if spec.fk_can_create %}
       <button type="button"
               class="dk-btn dk-btn-sm dk-btn-icon"
@@ -164,6 +208,18 @@
               data-rel-title="{{ spec.label }}"
               data-rel-target="fld_{{ spec.name }}">
         {{ deck_icon("eye", 13) }}
+      </button>
+      {% endif %}
+      {% if spec.fk_can_delete %}
+      <button type="button"
+              class="dk-btn dk-btn-sm dk-btn-icon dk-btn-danger"
+              title="{{ _('Delete Related') }} {{ spec.label }}"
+              aria-label="Delete selected {{ spec.label }}"
+              data-deck-rel-del="{{ url_for(bp_name ~ '.api_quick_delete', slug=spec.fk_target_slug, raw_pk='__PK__') }}"
+              data-impact-url="{{ url_for(bp_name ~ '.api_delete_impact', slug=spec.fk_target_slug) if config.enable_cascade_impact else '' }}"
+              data-rel-title="{{ _('Delete Related') }} {{ spec.label }}"
+              data-rel-target="fld_{{ spec.name }}">
+        {{ deck_icon("x", 13) }}
       </button>
       {% endif %}
     </div>
@@ -329,13 +385,22 @@
          {% if spec.required %}required{% endif %}>
 
   {% elif spec.kind == 'date' %}
-  <input type="date" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+  <div class="dk-date-wrap">
+    <input type="date" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+    {% if not spec.readonly %}<button type="button" class="dk-btn dk-btn-sm" data-deck-set-today="fld_{{ spec.name }}">{{ _("Today") }}</button>{% endif %}
+  </div>
 
   {% elif spec.kind == 'time' %}
-  <input type="time" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+  <div class="dk-date-wrap">
+    <input type="time" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+    {% if not spec.readonly %}<button type="button" class="dk-btn dk-btn-sm" data-deck-set-now="fld_{{ spec.name }}" data-now-kind="time">{{ _("Now") }}</button>{% endif %}
+  </div>
 
   {% elif spec.kind == 'datetime' %}
-  <input type="datetime-local" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+  <div class="dk-date-wrap">
+    <input type="datetime-local" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input dk-mono"{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
+    {% if not spec.readonly %}<button type="button" class="dk-btn dk-btn-sm" data-deck-set-now="fld_{{ spec.name }}" data-now-kind="datetime">{{ _("Now") }}</button>{% endif %}
+  </div>
 
   {% elif spec.kind == 'email' %}
   <input type="email" id="fld_{{ spec.name }}" name="{{ spec.name }}" value="{{ spec.value }}" class="dk-input"{% if spec.max_length %} maxlength="{{ spec.max_length }}"{% endif %}{% if spec.readonly %} readonly{% endif %}{% if spec.required %} required{% endif %}>
@@ -358,24 +423,60 @@
 
 {% macro render_inline_control(inline, col, idx_expr, row) %}
 {% set fname = 'inline__' ~ inline.slug ~ '__' ~ idx_expr ~ '__' ~ col.name %}
-{% set cur_v = row.values[col.name] if row else '' %}
-{% if col.kind == 'fk' and col.fk_search_url %}
-<div class="dk-fk-wrap" data-deck-fk data-fk-url="{{ col.fk_search_url }}">
-  <input type="hidden" name="{{ fname }}" value="{{ cur_v }}" data-fk-value>
-  <input type="text"
-         class="dk-input"
-         value="{{ (row.fk_labels.get(col.name, cur_v) if row else '') }}"
-         placeholder="Search {{ col.label | lower }}…"
-         autocomplete="off"
-         data-fk-search>
-  <div class="dk-fk-dropdown" data-fk-dropdown hidden="hidden">
-    {% for opt in col.fk_options %}
-    <div class="dk-fk-opt" data-id="{{ opt.id }}" data-label="{{ opt.label }}">
-      <span>{{ opt.label }}</span>
-      <span class="dk-mono dk-subtle">#{{ opt.id }}</span>
+{% set cur_v = row['values'][col.name] if row else '' %}
+{% if col.kind == 'display_ro' %}
+<div class="dk-ro-val">{{ row.ro_html[col.name] if (row and row.ro_html and col.name in row.ro_html) else '—' }}</div>
+{% elif row and row.widget_html and col.name in row.widget_html %}
+{{ row.widget_html[col.name] }}
+{% elif col.kind == 'file' %}
+<div class="dk-inline-file-wrap">
+  {% set im_url = row.media_urls.get(col.name) if (row and row.media_urls) else None %}
+  {% if im_url and col.file_kind == 'image' %}
+  <button type="button" class="dk-thumb-btn" data-deck-lightbox="{{ im_url }}" data-lightbox-title="{{ col.label }}">
+    <img src="{{ im_url }}" alt="{{ col.label }}" class="dk-thumb">
+  </button>
+  {% elif im_url %}
+  <a href="{{ im_url }}" class="dk-file-chip dk-mono">{{ deck_icon("paperclip", 11) }} {{ (cur_v|string).rsplit('/', 1)[-1] }}</a>
+  {% endif %}
+  <input type="file" name="{{ fname }}" accept="{{ col.file_accept }}" class="dk-input dk-inline-file"{% if col.readonly %} disabled{% endif %}>
+  {% if cur_v and not col.required and not col.readonly %}
+  <label class="dk-checkbox">
+    <input type="checkbox" name="inline__{{ inline.slug }}__{{ idx_expr }}___clear_{{ col.name }}" value="1">
+    <span class="dk-subtle">{{ _("Clear") }}</span>
+  </label>
+  {% endif %}
+</div>
+{% elif col.kind == 'fk' and col.fk_search_url %}
+<div class="dk-fk-control-row">
+  <div class="dk-fk-wrap" data-deck-fk data-fk-url="{{ col.fk_search_url }}">
+    <input type="hidden" name="{{ fname }}" value="{{ cur_v }}" data-fk-value>
+    <input type="text"
+           id="fld_{{ fname }}"
+           class="dk-input"
+           value="{{ (row.fk_labels.get(col.name, cur_v) if row else '') }}"
+           placeholder="Search {{ col.label | lower }}…"
+           autocomplete="off"
+           data-fk-search>
+    <div class="dk-fk-dropdown" data-fk-dropdown hidden="hidden">
+      {% for opt in col.fk_options %}
+      <div class="dk-fk-opt" data-id="{{ opt.id }}" data-label="{{ opt.label }}">
+        <span>{{ opt.label }}</span>
+        <span class="dk-mono dk-subtle">#{{ opt.id }}</span>
+      </div>
+      {% endfor %}
     </div>
-    {% endfor %}
   </div>
+  {% if col.fk_lookup_url and col.fk_can_view %}
+  <button type="button"
+          class="dk-btn dk-btn-sm dk-btn-icon"
+          title="{{ _('Lookup') }} {{ col.label }}"
+          aria-label="Lookup {{ col.label }}"
+          data-deck-rel-lookup="{{ col.fk_lookup_url }}"
+          data-rel-title="{{ _('Lookup') }} {{ col.label }}"
+          data-rel-target="fld_{{ fname }}">
+    {{ deck_icon("search", 12) }}
+  </button>
+  {% endif %}
 </div>
 {% elif col.kind == 'fk' %}
 <select name="{{ fname }}" class="dk-select">
@@ -386,8 +487,9 @@
 </select>
 {% elif col.kind == 'enum' %}
 <select name="{{ fname }}" class="dk-select">
+  <option value="">—</option>
   {% for val, lbl in col.choices %}
-  <option value="{{ val }}"{% if cur_v|string == val %} selected{% endif %}>{{ lbl }}</option>
+  <option value="{{ val }}"{% if cur_v is not none and cur_v != '' and cur_v|string == val %} selected{% endif %}>{{ lbl }}</option>
   {% endfor %}
 </select>
 {% elif col.kind == 'boolean' %}
@@ -416,6 +518,27 @@
   <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
   <input type="hidden" name="_deck_version" value="{{ occ_version or '' }}">
   <input type="hidden" name="_return_qs" value="{{ return_qs or '' }}">
+
+  {{ render_slot('form_above') }}
+
+  {% if save_on_top and not use_wizard %}
+  <div class="dk-form-top-bar">
+    <span class="dk-subtle dk-mono">{{ "Create " ~ view.label if mode == 'create' else "Edit " ~ view.label }}</span>
+    <div class="dk-page-actions">
+      <button type="submit" name="_save_action" value="save" class="dk-btn dk-btn-sm dk-btn-primary">
+        {{ deck_icon("check", 12) }} {{ "Create " ~ view.label if mode == 'create' else _("Save Changes") }}
+      </button>
+      <button type="submit" name="_save_action" value="continue" class="dk-btn dk-btn-sm">{{ _("Save & Continue Editing") }}</button>
+      {% if can_add_another %}
+      <button type="submit" name="_save_action" value="add_another" class="dk-btn dk-btn-sm">{{ _("Save & Add Another") }}</button>
+      {% endif %}
+      {% if can_save_as %}
+      <button type="submit" name="_save_action" value="save_as" class="dk-btn dk-btn-sm">{{ _("Save as New") }}</button>
+      {% endif %}
+      <a href="{{ list_return_url or url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-btn dk-btn-sm">{{ _("Cancel") }}</a>
+    </div>
+  </div>
+  {% endif %}
 
   {% if errors.get('__all__') %}
   <div class="dk-alert dk-alert-danger" role="alert">
@@ -555,8 +678,24 @@
   {% endif %}
   {% endfor %}
 
-  <!-- One-to-Many Inline Child Editors (Tabular or Stacked) -->
+  <!-- One-to-Many Inline Child Editors (Tabular or Stacked, Collapsible) -->
   {% for inline in inlines %}
+  {% if inline.collapsible %}
+  <details class="dk-panel dk-fieldset-details"{% if not inline.collapsed %} open{% endif %}>
+    <summary class="dk-panel-head">
+      <div>
+        <h2 class="dk-panel-title">{{ inline.label }} <span class="dk-tab-count dk-mono">{{ inline.rows | length }}</span></h2>
+        <p class="dk-panel-sub">Inline child records saved atomically with parent{% if inline.min_num %} · min {{ inline.min_num }}{% endif %}</p>
+      </div>
+      <span class="dk-subtle dk-mono">Click to toggle</span>
+    </summary>
+    {% if inline.can_create %}
+    <div class="dk-panel-head">
+      <span></span>
+      <button type="button" class="dk-btn dk-btn-sm" data-deck-add-inline="{{ inline.slug }}">{{ deck_icon("plus", 12) }} {{ _("Add Row") }}</button>
+    </div>
+    {% endif %}
+  {% else %}
   <section class="dk-panel">
     <div class="dk-panel-head">
       <div>
@@ -564,9 +703,10 @@
         <p class="dk-panel-sub">Inline child records saved atomically with parent{% if inline.min_num %} · min {{ inline.min_num }}{% endif %}</p>
       </div>
       {% if inline.can_create %}
-      <button type="button" class="dk-btn dk-btn-sm" data-deck-add-inline="{{ inline.slug }}">{{ deck_icon("plus", 12) }} Add Row</button>
+      <button type="button" class="dk-btn dk-btn-sm" data-deck-add-inline="{{ inline.slug }}">{{ deck_icon("plus", 12) }} {{ _("Add Row") }}</button>
       {% endif %}
     </div>
+  {% endif %}
     {% set inl_ns = namespace(errs=[]) %}
     {% for ek, emsgs in errors.items() %}
       {% if ek == inline.slug or ek.startswith(inline.slug ~ '[') %}
@@ -582,10 +722,10 @@
     {% endif %}
 
     {% if inline.layout == 'stacked' %}
-    <div class="dk-panel-body dk-inline-stack" data-inline-body="{{ inline.slug }}" data-next-index="{{ inline.rows | length }}">
+    <div class="dk-panel-body dk-inline-stack" data-inline-body="{{ inline.slug }}" data-next-index="{{ inline.rows | length }}" data-max-rows="{{ inline.max_rows }}">
       {% for row in inline.rows %}
       {% set idx = loop.index0 %}
-      <div class="dk-inline-card" data-inline-row>
+      <div class="dk-inline-card{% if row.deleted %} is-deleted{% endif %}" data-inline-row>
         <div class="dk-inline-card-head">
           <span class="dk-mono dk-subtle">{{ inline.label }} #{{ loop.index }}{% if row.pk %} · PK {{ row.pk }}{% endif %}</span>
           <div class="dk-row-actions">
@@ -594,7 +734,7 @@
           </div>
         </div>
         <input type="hidden" name="inline__{{ inline.slug }}__{{ idx }}___pk" value="{{ row.pk }}">
-        <input type="hidden" name="inline__{{ inline.slug }}__{{ idx }}___delete" value="0" data-inline-del-flag>
+        <input type="hidden" name="inline__{{ inline.slug }}__{{ idx }}___delete" value="{{ '1' if row.deleted else '0' }}" data-inline-del-flag>
         <div class="dk-form-grid">
           {% for col in inline.columns %}
           <div class="dk-field{% if col.kind == 'text' %} dk-field-full{% endif %}">
@@ -633,15 +773,15 @@
             {% if inline.can_delete or inline.show_change_link %}<th class="dk-td-actions">Actions</th>{% endif %}
           </tr>
         </thead>
-        <tbody data-inline-body="{{ inline.slug }}" data-next-index="{{ inline.rows | length }}">
+        <tbody data-inline-body="{{ inline.slug }}" data-next-index="{{ inline.rows | length }}" data-max-rows="{{ inline.max_rows }}">
           {% for row in inline.rows %}
           {% set idx = loop.index0 %}
-          <tr data-inline-row>
+          <tr data-inline-row{% if row.deleted %} class="is-deleted"{% endif %}>
             {% for col in inline.columns %}
             <td>
               {% if loop.first %}
               <input type="hidden" name="inline__{{ inline.slug }}__{{ idx }}___pk" value="{{ row.pk }}">
-              <input type="hidden" name="inline__{{ inline.slug }}__{{ idx }}___delete" value="0" data-inline-del-flag>
+              <input type="hidden" name="inline__{{ inline.slug }}__{{ idx }}___delete" value="{{ '1' if row.deleted else '0' }}" data-inline-del-flag>
               {% endif %}
               {{ render_inline_control(inline, col, idx, row) }}
             </td>
@@ -672,13 +812,15 @@
       </tr>
     </template>
     {% endif %}
-  </section>
+  {% if inline.collapsible %}</details>{% else %}</section>{% endif %}
   {% endfor %}
+
+  {{ render_slot('form_below') }}
 
   <!-- Sticky Multi-Action Save Bar -->
   <div class="dk-form-sticky-bar">
     <div class="dk-top-left">
-      <span class="dk-badge dk-badge-warn dk-mono" data-deck-dirty-badge hidden="hidden">Unsaved changes</span>
+      <span class="dk-badge dk-badge-warn dk-mono" data-deck-dirty-badge hidden="hidden">{{ _("Unsaved changes") }}</span>
       <span class="dk-subtle dk-mono dk-status-hide-sm">⌘S Save · ⌘⇧S Save &amp; continue</span>
     </div>
     <div class="dk-page-actions">
@@ -687,19 +829,19 @@
       <button type="button" class="dk-btn dk-btn-primary" data-wiz-next>{{ _("Next") }} {{ deck_icon("arrow-right", 13) }}</button>
       {% endif %}
       <button type="submit" name="_save_action" value="save" class="dk-btn dk-btn-primary" data-save-btn="save"{% if use_wizard %} data-wiz-submit hidden="hidden"{% endif %}>
-        {{ deck_icon("check", 13) }} {{ "Create " ~ view.label if mode == 'create' else "Save Changes" }}
+        {{ deck_icon("check", 13) }} {{ "Create " ~ view.label if mode == 'create' else _("Save Changes") }}
       </button>
-      <button type="submit" name="_save_action" value="continue" class="dk-btn" data-save-btn="continue"{{ ' hidden="hidden"' if use_wizard else '' }}>
-        Save &amp; Continue Editing
+      <button type="submit" name="_save_action" value="continue" class="dk-btn" data-save-btn="continue"{% if use_wizard %} data-wiz-submit hidden="hidden"{% endif %}>
+        {{ _("Save & Continue Editing") }}
       </button>
       {% if can_add_another %}
-      <button type="submit" name="_save_action" value="add_another" class="dk-btn" data-save-btn="add_another">
-        Save &amp; Add Another
+      <button type="submit" name="_save_action" value="add_another" class="dk-btn" data-save-btn="add_another"{% if use_wizard %} data-wiz-submit hidden="hidden"{% endif %}>
+        {{ _("Save & Add Another") }}
       </button>
       {% endif %}
       {% if can_save_as %}
-      <button type="submit" name="_save_action" value="save_as" class="dk-btn" data-save-btn="save_as">
-        Save as New
+      <button type="submit" name="_save_action" value="save_as" class="dk-btn" data-save-btn="save_as"{% if use_wizard %} data-wiz-submit hidden="hidden"{% endif %}>
+        {{ _("Save as New") }}
       </button>
       {% endif %}
       <a href="{{ list_return_url or url_for(bp_name ~ '.model_list', slug=view.meta.slug) }}" class="dk-btn">{{ _("Cancel") }}</a>

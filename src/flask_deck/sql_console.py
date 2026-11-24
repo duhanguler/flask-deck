@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from flask_deck.charts import render_area_chart, render_bar_chart
+from flask_deck.charts import render_area_chart, render_bar_chart, render_grouped_bar_chart
 from flask_deck.security import is_sensitive_field, sanitize_csv_cell
 
 _ALLOWED_LEADING = frozenset({"SELECT", "WITH", "EXPLAIN"})
@@ -38,7 +38,10 @@ _FORBIDDEN_KEYWORDS_RE = re.compile(
 
 # Internal security & database credential tables that must never be queried via the console.
 _FORBIDDEN_TABLES_RE = re.compile(
-    r"\b(?:_flask_deck_mfa|_flask_deck_passkeys|_flask_deck_sessions|deck_api_keys|"
+    r"\b(?:_flask_deck_mfa|_flask_deck_passkeys|_flask_deck_sessions|"
+    r"_flask_deck_users|_flask_deck_password_resets|_flask_deck_user_groups|"
+    r"_flask_deck_user_permissions|_flask_deck_groups|"
+    r"_flask_deck_import_previews|_flask_deck_webhook_deliveries|deck_api_keys|"
     r"pg_authid|pg_shadow|pg_roles|mysql\.user|sqlite_temp_master)\b",
     re.IGNORECASE,
 )
@@ -60,17 +63,22 @@ class SQLQueryResult:
     error: str | None = None
 
 
-def _strip_sql_comments_and_literals(sql: str) -> tuple[str, list[str]]:
-    """Single-pass SQL lexer removing comments & replacing string literals without regex order bugs.
+def _strip_sql_comments_and_literals(
+    sql: str,
+    *,
+    dialect_name: str = "",
+) -> tuple[str, list[str]]:
+    """Single-pass dialect-aware SQL lexer preventing comment/quote desync across SQLite/PG/MySQL.
 
     Returns ``(normalized_sql, quoted_identifiers)`` where comments become spaces,
     string literals become ``''``, and double-quoted identifiers remain inspectable.
-    Raises ``ValueError`` on unterminated strings or comments.
+    Raises ``ValueError`` on unterminated strings/comments or ambiguous dialect-specific escapes.
     """
     out: list[str] = []
     quoted_idents: list[str] = []
     n = len(sql)
     i = 0
+    is_mysql = dialect_name.lower().startswith(("mysql", "mariadb"))
 
     while i < n:
         ch = sql[i]
@@ -84,40 +92,46 @@ def _strip_sql_comments_and_literals(sql: str) -> tuple[str, list[str]]:
             out.append(" ")
             continue
 
-        # MySQL line comment: # ...
-        if ch == "#":
+        # MySQL-only line comment: # ... (in PostgreSQL '#' is an operator, never a comment!)
+        if ch == "#" and is_mysql:
             i += 1
             while i < n and sql[i] != "\n":
                 i += 1
             out.append(" ")
             continue
 
-        # Block comment: /* ... */ (supports PostgreSQL nested block comments)
+        # Block comment: /* ... */ (reject nested /* and MySQL conditional /*! to avoid dialect desync)
         if ch == "/" and nxt == "*":
-            depth = 1
+            if i + 2 < n and sql[i + 2] == "!":
+                raise ValueError("Conditional SQL comments (/*! ... */) are not permitted.")
             i += 2
-            while i < n and depth > 0:
+            closed = False
+            while i < n:
                 if i + 1 < n and sql[i] == "/" and sql[i + 1] == "*":
-                    depth += 1
+                    raise ValueError("Nested block comments are not permitted in the read-only console.")
+                if i + 1 < n and sql[i] == "*" and sql[i + 1] == "/":
                     i += 2
-                elif i + 1 < n and sql[i] == "*" and sql[i + 1] == "/":
-                    depth -= 1
-                    i += 2
-                else:
-                    i += 1
-            if depth != 0:
+                    closed = True
+                    break
+                i += 1
+            if not closed:
                 raise ValueError("Unterminated block comment in SQL query.")
             out.append(" ")
             continue
 
-        # Single-quoted string literal ('...' with '' or \' escapes)
+        # Reject PostgreSQL escape-string literals (E'...') to prevent backslash-quote desync
+        if ch in {"e", "E"} and nxt == "'" and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_")):
+            raise ValueError("Escape-string literals (E'...') are not permitted in the read-only console.")
+
+        # Single-quoted string literal ('...' with standard SQL '' escape only)
         if ch == "'":
             i += 1
             closed = False
             while i < n:
-                if sql[i] == "\\" and i + 1 < n:
-                    i += 2
-                    continue
+                if is_mysql and sql[i] == "\\":
+                    raise ValueError(
+                        "Backslash escapes in string literals are not permitted; use '' instead."
+                    )
                 if sql[i] == "'":
                     if i + 1 < n and sql[i + 1] == "'":
                         i += 2
@@ -178,6 +192,24 @@ def _strip_sql_comments_and_literals(sql: str) -> tuple[str, list[str]]:
 
 def _split_top_level_select_items(normalized_sql: str) -> list[str]:
     """Extract top-level SELECT projection expressions from a normalized SQL string."""
+    trimmed = normalized_sql.strip()
+    while trimmed.startswith("(") and trimmed.endswith(")"):
+        # Only unwrap if the outer parentheses actually enclose the whole query
+        depth = 0
+        wraps_all = True
+        for idx, ch in enumerate(trimmed):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and idx < len(trimmed) - 1:
+                    wraps_all = False
+                    break
+        if wraps_all and depth == 0:
+            trimmed = trimmed[1:-1].strip()
+        else:
+            break
+    normalized_sql = trimmed
     upper = normalized_sql.upper()
     m = re.match(r"^\s*SELECT\s+(?:DISTINCT\s+|ALL\s+)?", upper)
     if not m:
@@ -321,6 +353,7 @@ def validate_readonly_sql(
     raw_sql: str,
     *,
     extra_sensitive_patterns: Iterable[re.Pattern[str]] = (),
+    dialect_name: str = "",
 ) -> str:
     """Strictly validate that raw_sql is a single read-only SELECT/WITH/EXPLAIN statement."""
     sql = raw_sql.strip()
@@ -333,8 +366,8 @@ def validate_readonly_sql(
     if sql.endswith(";"):
         sql = sql[:-1].rstrip()
 
-    # Single-pass lexer strips comments & string literals cleanly (blocks '/*' / '--' smuggling)
-    normalized, _quoted = _strip_sql_comments_and_literals(sql)
+    # Single-pass dialect-aware lexer strips comments & string literals cleanly
+    normalized, _quoted = _strip_sql_comments_and_literals(sql, dialect_name=dialect_name)
 
     # Disallow statement stacking (semicolons anywhere outside string literals)
     if ";" in normalized:
@@ -386,9 +419,12 @@ def execute_readonly_sql(
 ) -> SQLQueryResult:
     """Execute a validated read-only SQL query inside a read-only rolled-back transaction."""
     patterns = tuple(extra_sensitive_patterns)
+    dialect_name = engine.dialect.name
     try:
-        clean_sql = validate_readonly_sql(raw_sql, extra_sensitive_patterns=patterns)
-        normalized_sql, _ = _strip_sql_comments_and_literals(clean_sql)
+        clean_sql = validate_readonly_sql(
+            raw_sql, extra_sensitive_patterns=patterns, dialect_name=dialect_name
+        )
+        normalized_sql, _ = _strip_sql_comments_and_literals(clean_sql, dialect_name=dialect_name)
     except ValueError as exc:
         return SQLQueryResult(
             sql=raw_sql,
@@ -403,7 +439,6 @@ def execute_readonly_sql(
 
     safe_limit = max(1, min(int(max_rows), 1000))
     t0 = time.perf_counter()
-    dialect_name = engine.dialect.name
     exec_sql = clean_sql
     if explain and not normalized_sql.lstrip().upper().startswith("EXPLAIN"):
         exec_sql = (
@@ -567,6 +602,8 @@ def build_sql_chart_svg(
     labels, series = extracted
     if chart_type == "line":
         return render_area_chart(labels, series, height=220)
+    if len(series) > 1:
+        return render_grouped_bar_chart(labels, series, height=220)
     return render_bar_chart(labels, series, height=220)
 
 

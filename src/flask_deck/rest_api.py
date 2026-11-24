@@ -124,7 +124,8 @@ def build_multidict_from_json(
     """Validate incoming JSON field keys against RBAC write rules and return form MultiDict."""
     slug = view.meta.slug
     masked = deck.auth.masked_fields_for(user, slug)
-    writable = set(view.allowed_form_fields(deck.auth, user, mode=mode))
+    target_obj_ctx = obj if mode == "edit" else None
+    writable = set(view.allowed_form_fields(deck.auth, user, mode=mode, obj=target_obj_ctx))
     if mode == "edit":
         writable -= masked
     rejected: dict[str, list[str]] = {}
@@ -137,21 +138,12 @@ def build_multidict_from_json(
         raise ValidationError(rejected)
 
     md: MultiDict[str, str] = MultiDict()
-    if mode == "edit" and obj is not None:
-        for col in writable:
-            if col in data:
-                for s_val in _value_to_form_strings(data[col]):
-                    md.add(col, s_val)
-            else:
-                for s_val in _current_obj_to_form_strings(obj, col, view):
-                    md.add(col, s_val)
-    else:
-        for col, raw_v in data.items():
-            key = str(col)
-            if key not in writable:
-                continue
-            for s_val in _value_to_form_strings(raw_v):
-                md.add(key, s_val)
+    for col, raw_v in data.items():
+        key = str(col)
+        if key not in writable:
+            continue
+        for s_val in _value_to_form_strings(raw_v):
+            md.add(key, s_val)
     return md
 
 
@@ -164,6 +156,7 @@ def apply_json_mutation(
     *,
     user: DeckUser | None,
     mode: str,
+    run_hooks: bool = True,
 ) -> None:
     """Apply validated MultiDict mutation to ORM object cleanly."""
 
@@ -171,7 +164,7 @@ def apply_json_mutation(
         tv = deck._views_by_model.get(target_cls)
         return tv.scope_query(s, user) if tv is not None else s
 
-    view.apply_form_data(
+    vdata = view.apply_form_data(
         sess,
         obj,
         form_md,
@@ -181,8 +174,11 @@ def apply_json_mutation(
         max_json_depth=deck.config.max_json_depth,
         m2m_getter=form_md.getlist,
         m2m_scope=_scope_m2m,
+        partial=(mode == "edit"),
+        utc_passthrough=True,
     )
-    view.on_model_change(obj, is_created=(mode == "create"), user=user)
+    if run_hooks:
+        view.invoke_on_model_change(obj, is_created=(mode == "create"), user=user, virtual_data=vdata)
 
 
 def build_openapi_spec(deck: Deck, user: DeckUser | None) -> dict[str, Any]:
@@ -228,7 +224,7 @@ def build_openapi_spec(deck: Deck, user: DeckUser | None) -> dict[str, Any]:
             elif f.field_type == "json":
                 js_type = "object"
             props[f.name] = {"type": js_type}
-        schema_name = view.meta.name
+        schema_name = view.meta.name if view.meta.name not in schemas else f"{view.meta.name}_{slug}"
         schemas[schema_name] = {"type": "object", "properties": props}
 
         collection_item: dict[str, Any] = {
@@ -368,7 +364,7 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
                     ],
                     "actions": [
                         {"name": spec.name, "label": spec.label, "require_approval": spec.require_approval}
-                        for spec in view.actions.values()
+                        for spec in view.get_actions(user).values()
                     ],
                 }
             )
@@ -427,6 +423,7 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
                 cursor_secret=deck._cursor_secret(),
                 soft_delete_column=view.soft_delete_column,
                 trashed=trashed,
+                show_full_result_count=False,
             )
             return jsonify(
                 {
@@ -551,6 +548,8 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
 
         if request.method == "GET":
             deck._require_perm(f"{slug}:view", model_slug=slug, obj=obj)
+            if not view.can_view_record(obj, user):
+                return jsonify({"error": f"Not authorized to view this {view.label}."}), 403
             rec_json = serialize_record_for_api(deck, view, obj, user)
             resp = jsonify(rec_json)
             resp.headers["ETag"] = f'"{rec_json["_version"]}"'
@@ -560,6 +559,8 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
             if not view.can_edit:
                 return jsonify({"error": "Editing is disabled for this model."}), 403
             deck._require_perm(f"{slug}:edit", model_slug=slug, obj=obj)
+            if not view.can_edit_record(obj, user):
+                return jsonify({"error": f"Not authorized to edit this {view.label}."}), 403
             if deck._is_soft_deleted(view, obj):
                 return jsonify({"error": "Record is soft-deleted."}), 409
             payload = request.get_json(silent=True)
@@ -591,7 +592,16 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
                 needs_approval = deck.approval_store is not None and view.requires_approval(
                     user, "edit", obj=obj, payload=dict(payload)
                 )
-                apply_json_mutation(deck, sess, view, obj, form_md, user=user, mode="edit")
+                apply_json_mutation(
+                    deck,
+                    sess,
+                    view,
+                    obj,
+                    form_md,
+                    user=user,
+                    mode="edit",
+                    run_hooks=not needs_approval,
+                )
                 if not needs_approval and view.version_column:
                     vf = view.meta.fields_by_name.get(view.version_column)
                     if vf is not None and vf.field_type == "integer":
@@ -618,6 +628,9 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
                         record_repr=safe_repr,
                         payload={
                             "form_items": [[k, v] for k, v in form_md.items(multi=True)],
+                            "partial": True,
+                            "utc_passthrough": True,
+                            "expected_version": current_ver,
                             "_actor_roles": list(user.roles) if user else [],
                             "_actor_superuser": bool(user.is_superuser) if user else False,
                         },
@@ -680,6 +693,8 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
         if not view.can_delete:
             return jsonify({"error": "Deletion is disabled for this model."}), 403
         deck._require_perm(f"{slug}:delete", model_slug=slug, obj=obj)
+        if not view.can_delete_record(obj, user):
+            return jsonify({"error": f"Not authorized to delete this {view.label}."}), 403
         payload_del = request.get_json(silent=True) or {}
         force = (
             request.args.get("force") == "1"
@@ -796,10 +811,11 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
     @bp.route("/_api/v1/<slug>/actions/<action_name>", methods=["POST"])
     def rest_v1_action(slug: str, action_name: str) -> tuple[Response, int]:
         view = deck.get_view(slug)
-        spec = view.actions.get(action_name)
-        if spec is None:
-            return jsonify({"error": f"Unknown action '{action_name}'."}), 404
         user = deck._current_user()
+        resolved_act = deck._resolve_action_spec_and_handler(view, action_name, user)
+        if resolved_act is None:
+            return jsonify({"error": f"Unknown action '{action_name}'."}), 404
+        spec, handler = resolved_act
         perm = spec.permission or f"{slug}:action:{action_name}"
         deck._require_perm(perm, model_slug=slug)
 
@@ -871,20 +887,20 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
             )
             return jsonify({"status": "pending_approval", "approval_id": saved.id}), 202
 
-        handler = getattr(view, spec.handler_name)
         try:
             msg = handler(records, form_md, user)
             sess.commit()
         except (ValueError, ValidationError, SQLAlchemyError) as exc:
             sess.rollback()
             return jsonify({"error": str(exc)}), 422
+        msg_str = spec.label if isinstance(msg, Response) else str(msg or "Done")
         meta = _actor_meta(deck, "rest_api")
         meta.update({"action": action_name, "count": len(records)})
         deck._record_audit(
             action_name="bulk_action",
             view=view,
             record_pk=",".join(raw_pks[:10]),
-            record_repr=str(msg or spec.label),
+            record_repr=msg_str,
             metadata=meta,
         )
         deck._emit_event(
@@ -893,7 +909,7 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
             record_pk=",".join(raw_pks[:10]),
             payload={"action": action_name, "count": len(records), "source": "rest_api"},
         )
-        return jsonify({"ok": True, "message": str(msg or "Done"), "count": len(records)}), 200
+        return jsonify({"ok": True, "message": msg_str, "count": len(records)}), 200
 
     @bp.route("/_api/v1/approvals")
     def rest_v1_approvals() -> tuple[Response, int]:

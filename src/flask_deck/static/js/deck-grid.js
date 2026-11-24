@@ -289,6 +289,58 @@
     sel.addEventListener("focus", () => sel.setAttribute("data-prev-val", sel.value));
   });
 
+  const batchBar = document.getElementById("dk-batch-save-bar");
+  const batchCountEl = document.getElementById("dk-batch-dirty-count");
+  const batchForm = document.getElementById("dk-batch-edit-form");
+  function getDirtyBatchRows() {
+    const dirtyRows = new Set();
+    document.querySelectorAll("[data-deck-batch-input]").forEach((el) => {
+      const orig = el.getAttribute("data-orig-val") || "";
+      const cur = el.type === "checkbox" ? (el.checked ? "true" : "false") : String(el.value || "");
+      const changed = cur !== orig;
+      const td = el.closest("td");
+      if (td) td.classList.toggle("is-dirty", changed);
+      if (changed) dirtyRows.add(el.getAttribute("data-batch-row") || "");
+    });
+    return dirtyRows;
+  }
+  function syncBatchDirty() {
+    if (!batchBar) return;
+    const dirtyRows = getDirtyBatchRows();
+    batchBar.hidden = dirtyRows.size === 0;
+    if (batchCountEl) batchCountEl.textContent = dirtyRows.size + " row(s) changed";
+  }
+  if (batchBar) {
+    document.addEventListener("input", (e) => { if (e.target instanceof Element && e.target.matches("[data-deck-batch-input]")) syncBatchDirty(); });
+    document.addEventListener("change", (e) => { if (e.target instanceof Element && e.target.matches("[data-deck-batch-input]")) syncBatchDirty(); });
+    if (batchForm) {
+      batchForm.addEventListener("submit", () => {
+        const dirtyRows = getDirtyBatchRows();
+        document.querySelectorAll("[data-deck-batch-input]").forEach((el) => {
+          const r = el.getAttribute("data-batch-row") || "";
+          if (!dirtyRows.has(r)) el.disabled = true;
+        });
+        document.querySelectorAll("[data-batch-row-meta]").forEach((el) => {
+          const r = el.getAttribute("data-batch-row-meta") || "";
+          if (!dirtyRows.has(r)) el.disabled = true;
+        });
+      });
+    }
+    const discBtn = batchBar.querySelector("[data-deck-batch-discard]");
+    if (discBtn) {
+      discBtn.addEventListener("click", () => {
+        document.querySelectorAll("[data-deck-batch-input]").forEach((el) => {
+          el.disabled = false;
+          const orig = el.getAttribute("data-orig-val") || "";
+          if (el.type === "checkbox") el.checked = orig === "true";
+          else el.value = orig;
+        });
+        document.querySelectorAll("[data-batch-row-meta]").forEach((el) => { el.disabled = false; });
+        syncBatchDirty();
+      });
+    }
+  }
+
   const filterPanel = document.getElementById("dk-filter-panel");
   function hydrateFilterFacets() {
     if (!filterPanel || filterPanel.hidden) return;

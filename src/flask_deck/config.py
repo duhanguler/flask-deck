@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from flask_deck.branding import BrandConfig
-from flask_deck.security import is_valid_csp_img_source
+from flask_deck.security import is_safe_display_url, is_valid_csp_img_source
 
 EnvironmentName = Literal["development", "staging", "production"]
 ThemeName = Literal["dark", "light", "system"]
@@ -80,6 +80,13 @@ class DeckConfig:
     bulk_sync_limit: int = 500
     max_select_across: int = 10000
     enable_cascade_impact: bool = True
+    # v0.6.0 Django Parity+ & Enterprise Hardening
+    site_url: str | None = None
+    empty_value_display: str = "—"
+    sidebar_order: tuple[str, ...] = ()
+    strict_view_checks: bool | None = None
+    max_search_tokens: int = 8
+    max_search_length: int = 200
 
     def __post_init__(self) -> None:
         if self.page_size < 1 or self.page_size > self.max_page_size:
@@ -92,6 +99,8 @@ class DeckConfig:
             raise ValueError("max_import_rows must be positive")
         if not self.url_prefix.startswith("/"):
             raise ValueError("url_prefix must start with '/'")
+        if self.site_url is not None and not is_safe_display_url(self.site_url):
+            raise ValueError(f"Unsafe DeckConfig.site_url: {self.site_url!r}")
         for src in self.csp_img_sources:
             if not is_valid_csp_img_source(src):
                 raise ValueError(f"Unsafe csp_img_sources token: {src!r}")

@@ -16,6 +16,7 @@ from flask import (
     url_for,
 )
 
+from flask_deck.adapters.sqlalchemy import decode_pk
 from flask_deck.audit import make_audit_entry
 from flask_deck.auth import OpenAuthProvider
 from flask_deck.dashboard import ActivityWidget, DashboardContext, Widget, build_default_dashboard
@@ -98,6 +99,8 @@ def register_ops_routes(bp: Blueprint, deck: Deck) -> None:
             abort(403)
         obj, _ = deck._fetch_scoped_record(view, raw_pk)
         deck._require_perm(f"{slug}:view", model_slug=slug, obj=obj)
+        if not view.can_view_record(obj, user):
+            abort(403)
         if deck._is_soft_deleted(view, obj):
             abort(404)
         key = getattr(obj, field_name, None)
@@ -128,6 +131,173 @@ def register_ops_routes(bp: Blueprint, deck: Deck) -> None:
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Cache-Control"] = "private, max-age=300"
         return resp
+
+    @bp.route("/_media/<slug>/_inline/<inline_slug>/<field_name>/<raw_pk>")
+    def serve_inline_media(slug: str, inline_slug: str, field_name: str, raw_pk: str) -> Any:
+        """Serve an inline child file_field object with full parent+child RBAC and scope isolation."""
+        view = deck.get_view(slug)
+        if not view.can_view:
+            abort(404)
+        deck._require_perm(f"{slug}:view", model_slug=slug)
+        user = deck._current_user()
+        candidate_inlines = list(view.get_inlines(user, None))
+        inline = next((inl for inl in candidate_inlines if inl.meta.slug == inline_slug), None)
+        if inline is None:
+            # Also check static inline_views in case get_inlines depends on parent_obj; re-verify once parent is loaded
+            inline = next((inl for inl in view.inline_views if inl.meta.slug == inline_slug), None)
+        if inline is None:
+            abort(404)
+        cfg = inline.file_fields.get(field_name)
+        if cfg is None:
+            abort(404)
+        child_view = deck._views_by_model.get(inline.model)
+        eff_child_slug = child_view.meta.slug if child_view is not None else inline_slug
+        deck._require_perm(f"{eff_child_slug}:view", model_slug=eff_child_slug)
+        if (
+            field_name in deck.auth.hidden_fields_for(user, eff_child_slug)
+            or field_name in deck.auth.masked_fields_for(user, eff_child_slug)
+        ):
+            abort(403)
+
+        pk_vals = decode_pk(raw_pk, inline.meta)
+        sess = deck.get_session(view.bind_key)
+        c_stmt = sa.select(inline.model)
+        for pk_f, val in zip(inline.meta.primary_keys, pk_vals, strict=True):
+            c_stmt = c_stmt.where(getattr(inline.model, pk_f.name) == val)
+        if child_view is not None:
+            c_stmt = child_view.scope_query(c_stmt, user)
+            c_sd = soft_delete_predicate(child_view.meta, child_view.soft_delete_column, trashed=False)
+            if c_sd is not None:
+                c_stmt = c_stmt.where(c_sd)
+        c_stmt = inline.scope_query(c_stmt, user, None)
+        child_obj = sess.scalars(c_stmt).unique().first()
+        if child_obj is None:
+            abort(404)
+        if child_view is not None and not child_view.can_view_record(child_obj, user):
+            abort(403)
+
+        # Verify parent record is ALSO inside parent view's scope_query (cross-tenant barrier!)
+        fk_col = inline.resolve_fk_column(view.meta)
+        parent_fk_val = getattr(child_obj, fk_col, None)
+        if parent_fk_val is None:
+            abort(404)
+        fk_fmeta = inline.meta.fields_by_name.get(fk_col)
+        parent_match_col = (
+            getattr(fk_fmeta, "fk_target_column", None) or view.meta.primary_keys[0].name
+        )
+        p_stmt = view.scope_query(sa.select(view.model), user).where(
+            getattr(view.model, parent_match_col) == parent_fk_val
+        )
+        parent_obj = sess.scalars(p_stmt).first()
+        if parent_obj is None or deck._is_soft_deleted(view, parent_obj):
+            abort(404)
+        deck._require_perm(f"{slug}:view", model_slug=slug, obj=parent_obj)
+        if not view.can_view_record(parent_obj, user):
+            abort(403)
+        allowed_inlines_for_parent = view.get_inlines(user, parent_obj)
+        if not any(inl.meta.slug == inline_slug for inl in allowed_inlines_for_parent):
+            abort(404)
+
+        key = getattr(child_obj, field_name, None)
+        if not key or not isinstance(key, str):
+            abort(404)
+
+        if cfg.use_presigned_redirect:
+            signed_url = cfg.storage.presigned_url(key, expires_in=cfg.presign_ttl)
+            if signed_url and (
+                signed_url.startswith("https://") or signed_url.startswith("http://")
+            ):
+                redir = redirect(signed_url, code=302)
+                redir.headers["Cache-Control"] = "private, no-store"
+                return redir
+
+        try:
+            chunk_iter, detected_mime = stream_storage_object(cfg.storage, key)
+        except (FileNotFoundError, ValueError):
+            abort(404)
+
+        mime = detected_mime or "application/octet-stream"
+        is_inline_raster = mime in RASTER_INLINE_MIMES
+        safe_name = sanitize_filename(key.rsplit("/", 1)[-1])
+        disposition = "inline" if is_inline_raster else "attachment"
+        resp = Response(chunk_iter, mimetype=mime)
+        resp.headers["Content-Disposition"] = f'{disposition}; filename="{safe_name}"'
+        resp.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["Cache-Control"] = "private, max-age=300"
+        return resp
+
+    @bp.route("/_category/<cat_slug>")
+    def category_index(cat_slug: str) -> str:
+        """Category / App Index landing page listing all authorized models & pages in one category."""
+        user = deck._current_user()
+        groups = deck._sidebar_groups()
+        matched_group = next((grp for grp in groups if grp["slug"] == cat_slug), None)
+        if matched_group is None:
+            abort(404)
+        bp_name = deck.config.name
+        model_cards: list[dict[str, Any]] = []
+        cat_slugs: list[str] = []
+        for link in matched_group["links"]:
+            if link.get("is_page"):
+                model_cards.append(
+                    {
+                        "label": link["label"],
+                        "slug": link["slug"],
+                        "icon": link["icon"],
+                        "count": None,
+                        "list_url": link["url"],
+                        "create_url": None,
+                        "is_page": True,
+                    }
+                )
+            else:
+                v = deck.views.get(link["slug"])
+                if v is None:
+                    continue
+                cat_slugs.append(v.meta.slug)
+                can_add = bool(
+                    v.can_create
+                    and not deck.config.read_only
+                    and deck.auth.has_permission(user, f"{v.meta.slug}:create", model_slug=v.meta.slug)
+                )
+                model_cards.append(
+                    {
+                        "label": v.plural_label,
+                        "singular": v.label,
+                        "slug": v.meta.slug,
+                        "icon": v.icon,
+                        "count": link.get("count"),
+                        "list_url": link["url"],
+                        "create_url": (
+                            url_for(f"{bp_name}.model_create", slug=v.meta.slug)
+                            if can_add
+                            else None
+                        ),
+                        "is_page": False,
+                    }
+                )
+        recent_audit: list[Any] = []
+        if deck.audit_store is not None and deck.auth.has_permission(user, "audit:view") and cat_slugs:
+            raw_entries, _ = deck.audit_store.list_entries(limit=30)
+            cat_set = set(cat_slugs)
+            recent_audit = [
+                deck._sanitize_audit_entry(e, user)
+                for e in raw_entries
+                if e.model_slug in cat_set
+            ][:10]
+
+        return render_template(
+            "flask_deck/category_index.html",
+            **deck._base_context(
+                page_title=matched_group["name"],
+                active_nav=f"_category:{cat_slug}",
+                category_name=matched_group["name"],
+                category_slug=cat_slug,
+                model_cards=model_cards,
+                recent_audit=recent_audit,
+            ),
+        )
 
     @bp.route("/_schema")
     def schema_inspector() -> str:

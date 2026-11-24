@@ -27,8 +27,8 @@ def cli_info() -> None:
     """List registered Flask-Deck instances, models, columns, and security settings."""
     decks = _get_registered_decks()
     if not decks:
-        click.echo("No Flask-Deck instances registered on this Flask app.")
-        return
+        click.echo("No Flask-Deck instances registered on this Flask app.", err=True)
+        sys.exit(1)
     for name, deck in decks.items():
         click.echo(
             f"Deck '{name}' | prefix={deck.config.url_prefix} | env={deck.config.environment} "
@@ -137,8 +137,8 @@ def cli_scaffold(slugs: tuple[str, ...], output: str | None) -> None:
     """Generate typed ModelView subclass boilerplate from registered SQLAlchemy models."""
     decks = _get_registered_decks()
     if not decks:
-        click.echo("No Flask-Deck instances registered on this Flask app.")
-        return
+        click.echo("No Flask-Deck instances registered on this Flask app.", err=True)
+        sys.exit(1)
     slug_filter = set(slugs)
     lines: list[str] = [
         "from __future__ import annotations",
@@ -146,11 +146,17 @@ def cli_scaffold(slugs: tuple[str, ...], output: str | None) -> None:
         "from flask_deck import CurrencyFormatter, ModelView",
         "",
     ]
+    seen_cls_names: set[str] = set()
     for _name, deck in decks.items():
         for slug, view in deck.views.items():
             if slug_filter and slug not in slug_filter:
                 continue
             m = view.meta
+            cls_name = f"{m.name}View"
+            if cls_name in seen_cls_names:
+                slug_camel = "".join(p.title() for p in slug.replace("-", "_").split("_") if p)
+                cls_name = f"{slug_camel}View"
+            seen_cls_names.add(cls_name)
             cols = [f.name for f in m.fields if not f.is_sensitive and not f.is_heavy][:7]
             searches = [
                 f.name
@@ -165,7 +171,7 @@ def cli_scaffold(slugs: tuple[str, ...], output: str | None) -> None:
             ][:5]
             lines.extend(
                 [
-                    f"class {m.name}View(ModelView):",
+                    f"class {cls_name}(ModelView):",
                     f"    model = {m.name}",
                     f"    columns = {tuple(cols)!r}",
                     f"    searchable_columns = {tuple(searches)!r}",
@@ -193,7 +199,11 @@ def _run_demo(host: str = "127.0.0.1", port: int = 5055, open_browser: bool = Fa
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="flask_deck_demo_"))
     db_file = tmp_dir / "demo.sqlite3"
-    app = create_demo_app(db_uri=f"sqlite:///{db_file.as_posix()}", seed_profile="showcase")
+    try:
+        app = create_demo_app(db_uri=f"sqlite:///{db_file.as_posix()}", seed_profile="showcase")
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
     def _cleanup_demo() -> None:
         decks = app.extensions.get("flask_deck", {})
@@ -203,16 +213,18 @@ def _run_demo(host: str = "127.0.0.1", port: int = 5055, open_browser: bool = Fa
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     atexit.register(_cleanup_demo)
-    url = f"http://{host}:{port}/admin/"
+    url_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    url = f"http://{url_host}:{port}/admin/"
     click.echo(f"Flask-Deck Demo Workbench running at {url}")
     click.echo("Demo accounts (password: 'deck-demo-2026'):")
     click.echo("  - admin@acme.dev   (Superadmin — full access + revert)")
     click.echo("  - support@acme.dev (Support — masked PII, read-only billing, no delete)")
     click.echo("  - viewer@acme.dev  (Auditor — strict read-only inspection)")
     if open_browser:
+        import threading
         import webbrowser
 
-        webbrowser.open(url)
+        threading.Timer(0.6, webbrowser.open, args=(url,)).start()
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
@@ -227,8 +239,8 @@ def cli_jobs_list() -> None:
     """List scheduled jobs registered on Flask-Deck instances."""
     decks = _get_registered_decks()
     if not decks:
-        click.echo("No Flask-Deck instances registered on this Flask app.")
-        return
+        click.echo("No Flask-Deck instances registered on this Flask app.", err=True)
+        sys.exit(1)
     for name, deck in decks.items():
         click.echo(f"Scheduled jobs for '{name}':")
         if not deck.scheduled_jobs:
@@ -245,8 +257,8 @@ def cli_jobs_run(job_name: str) -> None:
     """Execute a registered scheduled job by name synchronously and print status."""
     decks = _get_registered_decks()
     if not decks:
-        click.echo("No Flask-Deck instances registered on this Flask app.")
-        return
+        click.echo("No Flask-Deck instances registered on this Flask app.", err=True)
+        sys.exit(1)
     for _name, deck in decks.items():
         if job_name in deck.scheduled_jobs:
             rec = deck.run_scheduled_job_sync(job_name)
@@ -258,10 +270,118 @@ def cli_jobs_run(job_name: str) -> None:
     sys.exit(1)
 
 
+@deck_cli.command("createsuperuser")
+@click.option("--username", default=None, help="Superuser login username")
+@click.option("--email", default="", help="Superuser email address")
+@click.option("--display-name", default="", help="Display name")
+@click.option("--password", default=None, help="Superuser password (omit for interactive prompt)")
+@click.option("--no-input", is_flag=True, default=False, help="Fail instead of prompting interactively")
+@click.option("--deck-name", default=None, help="Target Deck blueprint name (defaults to first)")
+@with_appcontext
+def cli_createsuperuser(
+    username: str | None,
+    email: str,
+    display_name: str,
+    password: str | None,
+    no_input: bool,
+    deck_name: str | None,
+) -> None:
+    """Create a DB-backed superuser account on a SQLAlchemyAuthProvider Deck instance."""
+    from flask_deck.iam import SQLAlchemyAuthProvider
+
+    decks = _get_registered_decks()
+    if not decks:
+        click.echo("No Flask-Deck instances registered on this Flask app.", err=True)
+        sys.exit(1)
+    target = decks.get(deck_name) if deck_name else next(iter(decks.values()))
+    if target is None:
+        click.echo(f"Flask-Deck instance {deck_name!r} not found.", err=True)
+        sys.exit(1)
+    if not isinstance(target.auth, SQLAlchemyAuthProvider):
+        click.echo(
+            f"createsuperuser requires SQLAlchemyAuthProvider (current: {target.auth.__class__.__name__}).",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not username:
+        if no_input:
+            click.echo("--username is required with --no-input.", err=True)
+            sys.exit(1)
+        username = str(click.prompt("Username")).strip()
+    if not email and not no_input:
+        email = str(click.prompt("Email address", default="", show_default=False)).strip()
+    if password is None:
+        if no_input:
+            click.echo("--password is required with --no-input.", err=True)
+            sys.exit(1)
+        password = str(click.prompt("Password", hide_input=True, confirmation_prompt=True))
+
+    try:
+        created = target.auth.create_user(
+            username=username,
+            password=password,
+            email=email,
+            display_name=display_name or username,
+            is_active=True,
+            is_superuser=True,
+        )
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    click.echo(f"Superuser '{created.username}' (id={created.id}) created successfully.")
+
+
+@deck_cli.command("changepassword")
+@click.argument("username")
+@click.option("--password", default=None, help="New password (omit for interactive prompt)")
+@click.option("--deck-name", default=None, help="Target Deck blueprint name (defaults to first)")
+@with_appcontext
+def cli_changepassword(
+    username: str,
+    password: str | None,
+    deck_name: str | None,
+) -> None:
+    """Change password for an existing SQLAlchemyAuthProvider user and revoke active sessions."""
+    from flask_deck.iam import SQLAlchemyAuthProvider
+
+    decks = _get_registered_decks()
+    if not decks:
+        click.echo("No Flask-Deck instances registered on this Flask app.", err=True)
+        sys.exit(1)
+    target = decks.get(deck_name) if deck_name else next(iter(decks.values()))
+    if target is None:
+        click.echo(f"Flask-Deck instance {deck_name!r} not found.", err=True)
+        sys.exit(1)
+    if not isinstance(target.auth, SQLAlchemyAuthProvider):
+        click.echo(
+            f"changepassword requires SQLAlchemyAuthProvider (current: {target.auth.__class__.__name__}).",
+            err=True,
+        )
+        sys.exit(1)
+
+    user_rec = target.auth.get_user_by_username(username)
+    if user_rec is None:
+        click.echo(f"User '{username}' does not exist.", err=True)
+        sys.exit(1)
+
+    if password is None:
+        password = str(click.prompt("New password", hide_input=True, confirmation_prompt=True))
+
+    try:
+        target.auth.admin_reset_password(user_rec.id, password)
+    except (ValueError, KeyError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+    if target.session_store is not None:
+        target.session_store.revoke_others(user_rec.id, keep_session_id=None)
+    click.echo(f"Password changed successfully for user '{user_rec.username}'.")
+
+
 @deck_cli.command("demo")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=5055, type=int, show_default=True)
-@click.option("--open-browser", is_flag=True, default=False)
+@click.option("--open-browser", "--open", "open_browser", is_flag=True, default=False)
 def cli_demo(host: str, port: int, open_browser: bool) -> None:
     """Launch the built-in Acme Cloud Ops SaaS demo workbench."""
     _run_demo(host=host, port=port, open_browser=open_browser)

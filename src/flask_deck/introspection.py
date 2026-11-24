@@ -64,6 +64,12 @@ class FieldMeta:
     help_text: str = ""
     ondelete: str | None = None
 
+    @property
+    def fk_target_column(self) -> str | None:
+        if self.fk_column and "." in self.fk_column:
+            return self.fk_column.rsplit(".", 1)[1]
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class RelationshipMeta:
@@ -394,10 +400,15 @@ def introspect_model(
             raw_help = str(col.info.get("help_text") or "").strip()
         if not raw_help and getattr(col, "comment", None):
             raw_help = str(col.comment).strip()
+        pk_col_count = len(mapper.primary_key)
         autoincrement = bool(
             col.primary_key
             and field_type == "integer"
-            and (col.autoincrement in (True, "auto") or is_joined_pk_fk)
+            and (
+                col.autoincrement is True
+                or (col.autoincrement == "auto" and pk_col_count == 1)
+                or is_joined_pk_fk
+            )
             and (not col.foreign_keys or is_joined_pk_fk)
         )
 

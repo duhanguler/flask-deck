@@ -72,6 +72,8 @@ class _IncomingEdge:
     child_cls: type[Any]
     child_table_name: str
     child_fk_col_name: str
+    child_fk_attr_name: str
+    target_col_name: str
     child_fk_nullable: bool
     action: Literal["blocked", "cascade", "set_null"]
 
@@ -128,11 +130,18 @@ def _build_reverse_fk_index(root_model: type[Any]) -> dict[str, list[_IncomingEd
             else:
                 edge_action = "blocked"
 
+            try:
+                child_attr_name = c_mapper.get_property_by_column(fk.parent).key
+            except Exception:
+                child_attr_name = fk.parent.name
+
             edges_by_target_table.setdefault(target_tbl.name, []).append(
                 _IncomingEdge(
                     child_cls=c_cls,
                     child_table_name=c_tbl.name,
                     child_fk_col_name=fk.parent.name,
+                    child_fk_attr_name=child_attr_name,
+                    target_col_name=target_col.name,
                     child_fk_nullable=bool(fk.parent.nullable),
                     action=edge_action,
                 )
@@ -174,6 +183,12 @@ def analyze_delete_impact(
     truncated = False
     max_items = 25
     edge_visits: dict[tuple[type[Any], str], int] = {}
+    seen_pks_by_model: dict[type[Any], set[Any]] = {}
+
+    # Seed root PKs to prevent self-referential double-counting and cycle inflation
+    root_pk_vals = set(session.scalars(sa.select(root_sub_col)).all())
+    if root_pk_vals:
+        seen_pks_by_model[view.model] = set(root_pk_vals)
 
     while queue:
         parent_cls, parent_pk_col_expr, depth, path_classes = queue.popleft()
@@ -183,6 +198,11 @@ def analyze_delete_impact(
         p_table_name = p_mapper.local_table.name
         edges = reverse_index.get(p_table_name, [])
         pk_in_select = sa.select(parent_pk_col_expr)
+        p_pk_cols = list(p_mapper.primary_key)
+        p_pk_col_name = p_pk_cols[0].name if len(p_pk_cols) == 1 else None
+        p_pk_attr = (
+            p_mapper.get_property_by_column(p_pk_cols[0]).key if len(p_pk_cols) == 1 else None
+        )
 
         for edge in edges:
             edge_key = (edge.child_cls, edge.child_fk_col_name)
@@ -193,26 +213,50 @@ def analyze_delete_impact(
                 continue
             edge_visits[edge_key] = visits + 1
 
-            fk_col = getattr(edge.child_cls, edge.child_fk_col_name, None)
+            fk_col = getattr(edge.child_cls, edge.child_fk_attr_name, None)
             if fk_col is None:
                 continue
+
+            # Resolve non-PK unique FK targets cleanly (e.g. User.country_code -> Country.code)
+            match_in_select: Any = pk_in_select
+            if p_pk_col_name and edge.target_col_name != p_pk_col_name and p_pk_attr:
+                target_sql_col = p_mapper.local_table.c.get(edge.target_col_name)
+                if target_sql_col is None:
+                    continue
+                try:
+                    target_attr = p_mapper.get_property_by_column(target_sql_col).key
+                except Exception:
+                    target_attr = edge.target_col_name
+                p_ref_attr = getattr(parent_cls, target_attr, None)
+                p_pk_orm = getattr(parent_cls, p_pk_attr, None)
+                if p_ref_attr is None or p_pk_orm is None:
+                    continue
+                match_in_select = sa.select(p_ref_attr).where(
+                    p_pk_orm.in_(pk_in_select), p_ref_attr.is_not(None)
+                )
+
+            base_conds: list[Any] = [fk_col.in_(match_in_select)]
+            child_view = deck._views_by_model.get(edge.child_cls)
+            child_meta = child_view.meta if child_view is not None else introspect_model(edge.child_cls)
+            if edge.child_cls is parent_cls and len(child_meta.primary_keys) == 1:
+                already_seen = seen_pks_by_model.get(edge.child_cls)
+                if already_seen:
+                    c_pk_orm = getattr(edge.child_cls, child_meta.primary_keys[0].name)
+                    base_conds.append(c_pk_orm.notin_(list(already_seen)))
 
             cnt_stmt = (
                 sa.select(sa.func.count())
                 .select_from(edge.child_cls)
-                .where(fk_col.in_(pk_in_select))
+                .where(*base_conds)
             )
             cnt = int(session.execute(cnt_stmt).scalar() or 0)
             if cnt <= 0:
                 continue
 
-            child_view = deck._views_by_model.get(edge.child_cls)
             if child_view is not None:
-                child_meta = child_view.meta
                 model_slug: str | None = child_meta.slug
                 model_label = child_view.plural_label
             else:
-                child_meta = introspect_model(edge.child_cls)
                 model_slug = None
                 model_label = edge.child_cls.__name__
 
@@ -223,7 +267,7 @@ def analyze_delete_impact(
             )
             if child_view is not None and can_view_child:
                 sample_stmt = child_view.scope_query(sa.select(edge.child_cls), user).where(
-                    fk_col.in_(pk_in_select)
+                    *base_conds
                 )
                 sample_stmt = sample_stmt.limit(5)
                 sample_rows = list(session.scalars(sample_stmt).all())
@@ -264,11 +308,22 @@ def analyze_delete_impact(
                 and len(child_meta.primary_keys) == 1
             ):
                 child_pk_col = getattr(edge.child_cls, child_meta.primary_keys[0].name)
-                next_sub = (
-                    sa.select(child_pk_col.label("_pk"))
-                    .where(fk_col.in_(pk_in_select))
-                    .subquery()
-                )
+                if edge.child_cls is parent_cls:
+                    new_pks = list(session.scalars(sa.select(child_pk_col).where(*base_conds)).all())
+                    if not new_pks:
+                        continue
+                    seen_pks_by_model.setdefault(edge.child_cls, set()).update(new_pks)
+                    next_sub = (
+                        sa.select(child_pk_col.label("_pk"))
+                        .where(child_pk_col.in_(new_pks))
+                        .subquery()
+                    )
+                else:
+                    next_sub = (
+                        sa.select(child_pk_col.label("_pk"))
+                        .where(*base_conds)
+                        .subquery()
+                    )
                 queue.append(
                     (
                         edge.child_cls,

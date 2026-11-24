@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import secrets
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
@@ -67,6 +67,7 @@ class InMemorySessionStore:
         self._lock = threading.Lock()
 
     def register(self, record: SessionRecord) -> SessionRecord:
+        epoch = datetime.fromtimestamp(0, tz=timezone.utc)
         with self._lock:
             self._records[record.session_id] = record
             if len(self._records) > 2000:
@@ -75,7 +76,16 @@ class InMemorySessionStore:
                 ]
                 for sid in revoked_ids[:500]:
                     self._records.pop(sid, None)
-        return record
+                if len(self._records) > 2000:
+                    oldest = sorted(
+                        self._records.items(),
+                        key=lambda kv: _ensure_utc(kv[1].last_seen_at) or epoch,
+                    )
+                    drop_n = len(self._records) - 1500
+                    for sid, _ in oldest[:drop_n]:
+                        if sid != record.session_id:
+                            self._records.pop(sid, None)
+        return replace(record)
 
     def is_active(self, session_id: str) -> bool:
         if not session_id:
@@ -96,11 +106,12 @@ class InMemorySessionStore:
     def list_sessions(
         self, *, user_id: str | None = None, limit: int = 100
     ) -> list[SessionRecord]:
+        epoch = datetime.fromtimestamp(0, tz=timezone.utc)
         with self._lock:
-            items = list(self._records.values())
+            items = [replace(r) for r in self._records.values()]
         if user_id is not None:
             items = [r for r in items if r.user_id == user_id]
-        items.sort(key=lambda r: r.last_seen_at, reverse=True)
+        items.sort(key=lambda r: _ensure_utc(r.last_seen_at) or epoch, reverse=True)
         return items[: max(1, limit)]
 
     def revoke(self, session_id: str, *, actor_id: str | None = None) -> bool:

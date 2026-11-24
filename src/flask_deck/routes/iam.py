@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -8,6 +9,7 @@ from flask import (
     Blueprint,
     abort,
     flash,
+    g,
     redirect,
     render_template,
     request,
@@ -20,6 +22,7 @@ from flask_deck.auth import DeckUser
 from flask_deck.exceptions import PermissionDeniedError
 from flask_deck.iam import IAMGroupRecord, SQLAlchemyAuthProvider
 from flask_deck.mfa import MFA_VERIFIED_KEY
+from flask_deck.query import compute_page_window
 from flask_deck.sessions import DECK_SID_SESSION_KEY, issue_tracked_session
 
 if TYPE_CHECKING:
@@ -39,6 +42,35 @@ _SYSTEM_PERMISSIONS: tuple[tuple[str, str], ...] = (
     ("iam:manage", "Manage Users & Permission Groups"),
     ("*", "Full Superadmin Wildcard (*)"),
 )
+
+
+_PRIVILEGED_SENTINEL = "__deck_superuser_sentinel__:__all__"
+
+
+def _is_privileged_permission(pattern: str) -> bool:
+    """Return True if ``pattern`` grants wildcard/superuser or IAM management privileges."""
+    p = pattern.strip()
+    if not p:
+        return False
+    return (
+        p in {"*", "**", "*:*", "iam:manage", "iam:*"}
+        or fnmatch.fnmatchcase("iam:manage", p)
+        or fnmatch.fnmatchcase(_PRIVILEGED_SENTINEL, p)
+    )
+
+
+def _has_privileged_permission(perms: Sequence[str] | frozenset[str]) -> bool:
+    return any(_is_privileged_permission(p) for p in perms)
+
+
+def _parse_direct_permissions(form: Any) -> list[str]:
+    perms: list[str] = [p.strip() for p in form.getlist("direct_perm") if p.strip()]
+    raw = str(form.get("direct_permissions", ""))
+    for line in raw.replace(",", "\n").splitlines():
+        tok = line.strip()
+        if tok and tok not in perms:
+            perms.append(tok)
+    return list(dict.fromkeys(perms))
 
 
 def _parse_group_permissions(form: Any) -> list[str]:
@@ -124,6 +156,10 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
 
     @bp.route("/_security/password", methods=["GET", "POST"])
     def security_change_password() -> Any:
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "Password cannot be changed while impersonating another user."
+            )
         user = deck._current_user()
         if user is None or not deck.auth.supports_password_change:
             abort(404)
@@ -177,16 +213,46 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
     @bp.route("/_security/users")
     def security_iam_users() -> str:
         auth, _ = _require_iam_admin()
+        q = request.args.get("q", "").strip()
+        status = request.args.get("status", "").strip().lower()
+        group_id = request.args.get("group_id", "").strip()
+        try:
+            page = max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            page = 1
+        page_size = 25
+        users_page, total_users = auth.list_users_paginated(
+            q=q,
+            status=status,
+            group_id=group_id,
+            page=page,
+            page_size=page_size,
+        )
+        pages = max(1, (total_users + page_size - 1) // page_size)
+        if page > pages:
+            page = pages
         edit_id = request.args.get("edit", "").strip()
         editing_user = auth.get_user_record(edit_id) if edit_id else None
+        editing_direct_perms_text = (
+            "\n".join(sorted(editing_user.direct_permissions)) if editing_user is not None else ""
+        )
         return render_template(
             "flask_deck/iam_users.html",
             **deck._base_context(
                 page_title="Users",
                 active_nav="_iam_users",
-                users=auth.list_users(),
+                users=users_page,
+                total_users=total_users,
+                page=page,
+                pages=pages,
+                page_window=compute_page_window(page, pages),
+                filter_q=q,
+                filter_status=status,
+                filter_group_id=group_id,
                 groups=auth.list_groups(),
                 editing_user=editing_user,
+                editing_direct_perms_text=editing_direct_perms_text,
+                password_rules=auth.password_help_texts(),
             ),
         )
 
@@ -202,7 +268,19 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         want_super = request.form.get("is_superuser") in {"1", "true", "on"}
         if want_super and not actor.is_superuser:
             raise PermissionDeniedError("Only a superuser may grant superuser privileges.")
-        group_ids = [g.strip() for g in request.form.getlist("group_ids") if g.strip()]
+        group_ids = [g_id.strip() for g_id in request.form.getlist("group_ids") if g_id.strip()]
+        direct_perms = _parse_direct_permissions(request.form)
+        if not actor.is_superuser:
+            if _has_privileged_permission(direct_perms):
+                raise PermissionDeniedError(
+                    "Only a superuser may grant wildcard or 'iam:manage' permissions."
+                )
+            for gid in group_ids:
+                grec = auth.get_group_record(gid)
+                if grec is not None and _has_privileged_permission(grec.permissions):
+                    raise PermissionDeniedError(
+                        "Only a superuser may assign groups containing wildcard or 'iam:manage' permissions."
+                    )
         try:
             created = auth.create_user(
                 username=username,
@@ -212,6 +290,7 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
                 is_active=is_active,
                 is_superuser=want_super,
                 group_ids=group_ids,
+                direct_permissions=direct_perms,
                 tenant_id=tenant_id,
             )
         except ValueError as exc:
@@ -223,7 +302,11 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
             action="iam.user_created",
             record_pk=created.id,
             record_repr=created.username,
-            metadata={"roles": list(created.role_names), "is_superuser": created.is_superuser},
+            metadata={
+                "roles": list(created.role_names),
+                "direct_permissions": sorted(created.direct_permissions),
+                "is_superuser": created.is_superuser,
+            },
         )
         flash(f"Created user '{created.username}'.", "ok")
         return redirect(url_for(f"{bp_name}.security_iam_users"))
@@ -243,7 +326,25 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         want_super = request.form.get("is_superuser") in {"1", "true", "on"}
         if want_super and not actor.is_superuser:
             raise PermissionDeniedError("Only a superuser may grant superuser privileges.")
-        group_ids = [g.strip() for g in request.form.getlist("group_ids") if g.strip()]
+        group_ids = [g_id.strip() for g_id in request.form.getlist("group_ids") if g_id.strip()]
+        has_direct_field = (
+            "direct_permissions" in request.form or "direct_perm" in request.form
+        )
+        direct_perms: list[str] | None = (
+            _parse_direct_permissions(request.form) if has_direct_field else None
+        )
+        if not actor.is_superuser:
+            if direct_perms is not None and _has_privileged_permission(direct_perms):
+                raise PermissionDeniedError(
+                    "Only a superuser may grant wildcard or 'iam:manage' permissions."
+                )
+            existing_gids = set(existing.group_ids)
+            for gid in group_ids:
+                grec = auth.get_group_record(gid)
+                if grec is not None and _has_privileged_permission(grec.permissions) and gid not in existing_gids:
+                    raise PermissionDeniedError(
+                        "Only a superuser may assign groups containing wildcard or 'iam:manage' permissions."
+                    )
         try:
             updated = auth.update_user(
                 user_id,
@@ -252,6 +353,7 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
                 is_active=is_active,
                 is_superuser=want_super,
                 group_ids=group_ids,
+                direct_permissions=direct_perms,
                 tenant_id=tenant_id,
             )
         except (ValueError, KeyError) as exc:
@@ -270,9 +372,46 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
                 "is_active": updated.is_active,
                 "is_superuser": updated.is_superuser,
                 "roles": list(updated.role_names),
+                "direct_permissions": sorted(updated.direct_permissions),
             },
         )
         flash(f"Updated user '{updated.username}'.", "ok")
+        return redirect(url_for(f"{bp_name}.security_iam_users"))
+
+    @bp.route("/_security/users/bulk", methods=["POST"])
+    def security_iam_users_bulk() -> Any:
+        auth, actor = _require_iam_admin()
+        act = request.form.get("action", "").strip().lower()
+        if act not in {"activate", "deactivate"}:
+            flash("Select a valid bulk action (activate or deactivate).", "danger")
+            return redirect(url_for(f"{bp_name}.security_iam_users"))
+        selected_ids = [uid.strip() for uid in request.form.getlist("user_ids") if uid.strip()]
+        if not selected_ids:
+            flash("Select at least one user.", "warn")
+            return redirect(url_for(f"{bp_name}.security_iam_users"))
+        if not actor.is_superuser:
+            for uid in selected_ids:
+                target = auth.get_user_record(uid)
+                if target is not None and target.is_superuser:
+                    raise PermissionDeniedError("Only a superuser may modify superuser accounts.")
+        target_active = act == "activate"
+        try:
+            updated_ids = auth.bulk_set_active(selected_ids, is_active=target_active)
+        except ValueError as exc:
+            flash(str(exc), "danger")
+            return redirect(url_for(f"{bp_name}.security_iam_users"))
+        if not target_active and deck.session_store is not None:
+            for uid in updated_ids:
+                deck.session_store.revoke_others(uid, keep_session_id=None)
+        _audit(
+            actor,
+            action=f"iam.users_bulk_{act}",
+            record_pk=",".join(updated_ids[:10]),
+            record_repr=f"Bulk {act} ({len(updated_ids)} user(s))",
+            metadata={"action": act, "count": len(updated_ids)},
+        )
+        verb = "Activated" if target_active else "Deactivated"
+        flash(f"{verb} {len(updated_ids)} user account(s).", "ok")
         return redirect(url_for(f"{bp_name}.security_iam_users"))
 
     @bp.route("/_security/users/<user_id>/reset-password", methods=["POST"])
@@ -388,8 +527,10 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         label = request.form.get("label", "").strip()
         description = request.form.get("description", "").strip()
         perms = _parse_group_permissions(request.form)
-        if not actor.is_superuser and ("*" in perms or "iam:manage" in perms):
-            raise PermissionDeniedError("Only a superuser may grant '*' or 'iam:manage' permissions.")
+        if not actor.is_superuser and _has_privileged_permission(perms):
+            raise PermissionDeniedError(
+                "Only a superuser may grant wildcard or 'iam:manage' permissions."
+            )
         model_slugs = list(deck.views.keys())
         try:
             hidden_r = _parse_field_rules_from_form(request.form, "hidden_fields", model_slugs)
@@ -424,11 +565,17 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         existing = auth.get_group_record(group_id)
         if existing is None:
             abort(404)
+        if not actor.is_superuser and _has_privileged_permission(existing.permissions):
+            raise PermissionDeniedError(
+                "Only a superuser may modify a group containing wildcard or 'iam:manage' permissions."
+            )
         label = request.form.get("label", "").strip()
         description = request.form.get("description", "").strip()
         perms = _parse_group_permissions(request.form)
-        if not actor.is_superuser and ("*" in perms or "iam:manage" in perms):
-            raise PermissionDeniedError("Only a superuser may grant '*' or 'iam:manage' permissions.")
+        if not actor.is_superuser and _has_privileged_permission(perms):
+            raise PermissionDeniedError(
+                "Only a superuser may grant wildcard or 'iam:manage' permissions."
+            )
         model_slugs = list(deck.views.keys())
         try:
             hidden_r = _parse_field_rules_from_form(request.form, "hidden_fields", model_slugs)
@@ -463,6 +610,10 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         existing = auth.get_group_record(group_id)
         if existing is None:
             abort(404)
+        if not actor.is_superuser and _has_privileged_permission(existing.permissions):
+            raise PermissionDeniedError(
+                "Only a superuser may delete a group containing wildcard or 'iam:manage' permissions."
+            )
         auth.delete_group(group_id)
         _audit(
             actor,

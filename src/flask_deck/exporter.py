@@ -4,6 +4,7 @@ import csv
 import enum
 import io
 import json
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -23,9 +24,12 @@ from flask_deck.query import (
     build_filter_condition,
     build_search_clause,
     parse_filter_key,
+    parse_search_column_spec,
     soft_delete_predicate,
 )
 from flask_deck.security import is_sensitive_field, sanitize_csv_cell
+
+_XLSX_INVALID_TITLE_RE = re.compile(r"[/\\?*\[\]:]")
 
 
 def _serialize_export_value(value: Any) -> Any:
@@ -70,8 +74,9 @@ def _build_export_statement(
     else:
         allowed_items: list[str] = []
         for col_spec in view.resolved_searchable:
-            if "." in col_spec:
-                rel_name, target_col = col_spec.split(".", 1)
+            col_path, _ = parse_search_column_spec(col_spec)
+            if "." in col_path:
+                rel_name, target_col = col_path.split(".", 1)
                 if rel_name in restricted or is_sensitive_field(target_col):
                     continue
                 rel_meta = meta.relationships_by_name.get(rel_name)
@@ -91,17 +96,25 @@ def _build_export_statement(
                         if target_col in t_restricted or target_col in t_meta.sensitive_fields:
                             continue
                 allowed_items.append(col_spec)
-            elif col_spec not in restricted:
+            elif col_path not in restricted and not is_sensitive_field(col_path):
                 allowed_items.append(col_spec)
         allowed_searchable = tuple(allowed_items)
     allowed_filterable = view.resolved_filterable - restricted
     known_fields = frozenset(meta.fields_by_name.keys())
 
-    search_clause, search_joins = build_search_clause(meta, allowed_searchable, search_term)
-    for rel_attr in search_joins:
-        stmt = stmt.outerjoin(rel_attr)
-    if search_clause is not None:
-        stmt = stmt.where(search_clause)
+    search_joins: list[Any] = []
+    search_may_dup = False
+    if search_term:
+        if view.has_custom_search_results():
+            stmt, search_may_dup = view.get_search_results(stmt, search_term, user)
+        else:
+            search_clause, search_joins = build_search_clause(
+                meta, allowed_searchable, search_term, dialect_name=dialect_name
+            )
+            for rel_attr in search_joins:
+                stmt = stmt.outerjoin(rel_attr)
+            if search_clause is not None:
+                stmt = stmt.where(search_clause)
 
     if active_tab_key and not trashed:
         for tab in view.quick_tabs:
@@ -146,7 +159,7 @@ def _build_export_statement(
         stmt = applier(stmt)
 
     pk_orders = [getattr(view.model, pk.name).asc() for pk in meta.primary_keys]
-    return stmt.order_by(*pk_orders), bool(search_joins or extra_joins)
+    return stmt.order_by(*pk_orders), bool(search_joins or extra_joins or search_may_dup)
 
 
 def export_columns_for_user(
@@ -233,7 +246,8 @@ def iter_export_chunks(
         def _gen_xlsx() -> Iterator[bytes]:
             wb = openpyxl.Workbook(write_only=True)
             try:
-                ws = wb.create_sheet(title=view.plural_label[:31] or "Export")
+                safe_title = _XLSX_INVALID_TITLE_RE.sub("_", view.plural_label).strip()[:31] or "Export"
+                ws = wb.create_sheet(title=safe_title)
                 ws.append([sanitize_csv_cell(c, enabled=sanitize_csv) for c in cols])
                 for obj in _iter_objects():
                     row_data = _row_dict(obj)

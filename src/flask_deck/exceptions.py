@@ -9,6 +9,10 @@ class SecurityConfigurationError(DeckError):
     """Raised when flask-deck is started in an insecure production configuration."""
 
 
+class ConfigurationError(DeckError):
+    """Raised when a ModelView or Deck configuration fails startup validation checks."""
+
+
 class PermissionDeniedError(DeckError):
     """Raised when a user lacks permission to perform an operation."""
 

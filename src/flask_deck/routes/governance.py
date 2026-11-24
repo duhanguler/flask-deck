@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import sqlalchemy as sa
 from flask import (
     Blueprint,
     Response,
@@ -25,7 +26,9 @@ from flask_deck.adapters.sqlalchemy import encode_pk
 from flask_deck.audit import AuditEntry, compute_diff
 from flask_deck.exceptions import PermissionDeniedError, ValidationError
 from flask_deck.i18n import LOCALE_SESSION_KEY, TZ_SESSION_KEY, is_valid_timezone, normalize_locale
+from flask_deck.introspection import introspect_model
 from flask_deck.model_view import coerce_form_value
+from flask_deck.query import soft_delete_predicate
 from flask_deck.security import is_safe_redirect_url, mask_ip_address, sanitize_csv_cell
 
 if TYPE_CHECKING:
@@ -305,7 +308,19 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
             return redirect(url_for(f"{bp_name}.audit_list"))
 
         user = deck._current_user()
-        writable = set(view.allowed_form_fields(deck.auth, user, mode="edit"))
+        if not view.can_edit_record(obj, user):
+            raise PermissionDeniedError(f"Not authorized to edit this {view.label}.")
+        if deck._is_soft_deleted(view, obj):
+            flash("Restore record from Trash before reverting.", "danger")
+            return redirect(url_for(f"{bp_name}.audit_list"))
+        if deck.approval_store is not None and view.requires_approval(user, "edit", obj=obj):
+            flash(
+                "Edits to this model require four-eyes approval; direct audit revert is blocked.",
+                "danger",
+            )
+            return redirect(url_for(f"{bp_name}.audit_list"))
+
+        writable = set(view.allowed_form_fields(deck.auth, user, mode="edit", obj=obj))
         masked = deck.auth.masked_fields_for(user, view.meta.slug)
         before_snap = view.extract_snapshot(obj)
         sess = deck.get_session(view.bind_key)
@@ -336,6 +351,28 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
                         utc_passthrough=True,
                     )
                 )
+                if fmeta.fk_target_model is not None and coerced is not None:
+                    t_cls = fmeta.fk_target_model
+                    t_view = deck._views_by_model.get(t_cls)
+                    t_meta = t_view.meta if t_view is not None else introspect_model(t_cls)
+                    ref_col_name = fmeta.fk_target_column or (
+                        t_meta.primary_keys[0].name if len(t_meta.primary_keys) == 1 else None
+                    )
+                    if ref_col_name and hasattr(t_cls, ref_col_name):
+                        fk_stmt = sa.select(t_cls).where(getattr(t_cls, ref_col_name) == coerced)
+                        if t_view is not None:
+                            fk_stmt = t_view.scope_query(fk_stmt, user)
+                            t_sd = soft_delete_predicate(
+                                t_view.meta, t_view.soft_delete_column, trashed=False
+                            )
+                            if t_sd is not None:
+                                fk_stmt = fk_stmt.where(t_sd)
+                        fk_stmt = view.formfield_for_foreignkey(fname, fk_stmt, user, obj=obj)
+                        t_sess = deck.get_session(t_view.bind_key if t_view is not None else view.bind_key)
+                        if t_sess.scalars(fk_stmt).first() is None:
+                            raise ValidationError(
+                                {fname: ["Referenced record no longer exists or is outside your scope."]}
+                            )
                 reverted_values[fname] = coerced
             if not reverted_values:
                 flash("No revertible fields remain writable on this record.", "warn")
@@ -350,6 +387,14 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
                     raise ValidationError(dict(ext_errs))
             for fname, coerced in reverted_values.items():
                 setattr(obj, fname, coerced)
+            if view.version_column:
+                vf = view.meta.fields_by_name.get(view.version_column)
+                if vf is not None and vf.field_type == "integer":
+                    setattr(
+                        obj,
+                        view.version_column,
+                        int(before_snap.get(view.version_column) or 0) + 1,
+                    )
             view.on_model_change(obj, is_created=False, user=user)
             sess.commit()
         except (ValueError, ValidationError, SQLAlchemyError) as exc:

@@ -89,16 +89,18 @@ def register_job_routes(bp: Blueprint, deck: Deck) -> None:
             if callable(can_retry_fn)
             else set()
         )
-        can_run_scheduled = (
-            deck.auth.has_permission(user, "jobs:run_scheduled")
-            or (user is not None and user.is_superuser)
-        )
+        is_super = user is not None and user.is_superuser
+        can_run_default_scheduled = is_super or deck.auth.has_permission(user, "jobs:run_scheduled")
         scheduled_jobs = [
             spec
             for spec in deck.scheduled_jobs.values()
             if (
-                can_run_scheduled
-                or (spec.permission and deck.auth.has_permission(user, spec.permission))
+                is_super
+                or (
+                    deck.auth.has_permission(user, spec.permission)
+                    if spec.permission
+                    else can_run_default_scheduled
+                )
             )
         ]
         focus_id = request.args.get("focus", "").strip()
@@ -176,7 +178,15 @@ def register_job_routes(bp: Blueprint, deck: Deck) -> None:
         if not callable(retry_fn):
             flash("Configured job backend does not support retries.", "warn")
             return redirect(url_for(f"{bp_name}.jobs_list", focus=rec.id))
-        new_rec = retry_fn(rec.id)
+        user = deck._current_user()
+        try:
+            new_rec = retry_fn(
+                rec.id,
+                actor_id=user.id if user else rec.actor_id,
+                actor_name=user.label if user else rec.actor_name,
+            )
+        except TypeError:
+            new_rec = retry_fn(rec.id)
         if not isinstance(new_rec, JobRecord):
             flash(f"Job #{rec.id} cannot be retried.", "warn")
             return redirect(url_for(f"{bp_name}.jobs_list", focus=rec.id))

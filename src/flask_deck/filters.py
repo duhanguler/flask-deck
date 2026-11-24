@@ -165,6 +165,226 @@ class PredicateListFilter(ListFilter):
         return stmt.where(pred) if pred is not None else stmt
 
 
+class EmptyFieldListFilter(ListFilter):
+    """Built-in filter distinguishing empty (``NULL`` or blank string ``""``) vs populated values."""
+
+    column: ClassVar[str] = ""
+
+    def __init__(
+        self,
+        *,
+        parameter_name: str | None = None,
+        title: str | None = None,
+        column: str | None = None,
+        empty_label: str = "Empty / None",
+        non_empty_label: str = "Not Empty",
+    ) -> None:
+        self._column = column or self.column
+        self._param_name = parameter_name or self.parameter_name or f"{self._column}_empty"
+        self._title = title or self.title or f"{self._column.replace('_', ' ').title()}"
+        self._empty_label = empty_label
+        self._non_empty_label = non_empty_label
+
+    @property
+    def param_key(self) -> str:
+        return self._param_name
+
+    @property
+    def display_title(self) -> str:
+        return self._title
+
+    def _is_restricted(self, view: Any, user: DeckUser | None) -> bool:
+        if not self._column or self._column in view.meta.sensitive_fields:
+            return True
+        deck = getattr(view, "_deck", None)
+        if deck is not None and hasattr(deck, "auth"):
+            restricted = deck.auth.hidden_fields_for(user, view.meta.slug) | deck.auth.masked_fields_for(
+                user, view.meta.slug
+            )
+            if self._column in restricted:
+                return True
+        return False
+
+    def lookups(
+        self,
+        session: Session,
+        view: Any,
+        user: DeckUser | None,
+    ) -> Sequence[tuple[str, str]]:
+        _ = session
+        if self._is_restricted(view, user):
+            return ()
+        return (("empty", self._empty_label), ("non_empty", self._non_empty_label))
+
+    def facet_predicate(self, value: str, model: type[Any]) -> sa.ColumnElement[bool] | None:
+        if not self._column or not hasattr(model, self._column):
+            return None
+        col: Any = getattr(model, self._column)
+        col_type = getattr(col, "type", None)
+        while isinstance(col_type, sa.TypeDecorator):
+            col_type = getattr(col_type, "impl", None)
+        is_string_col = isinstance(col_type, (sa.String, sa.Text)) and not isinstance(
+            col_type, sa.Enum
+        )
+        if value == "empty":
+            if is_string_col:
+                return sa.or_(col.is_(None), col == "")
+            expr_null: sa.ColumnElement[bool] = col.is_(None)
+            return expr_null
+        if value == "non_empty":
+            if is_string_col:
+                return sa.and_(col.is_not(None), col != "")
+            expr_nn: sa.ColumnElement[bool] = col.is_not(None)
+            return expr_nn
+        return None
+
+    def apply(
+        self,
+        stmt: sa.Select[Any],
+        value: str,
+        session: Session,
+        view: Any,
+        user: DeckUser | None,
+    ) -> sa.Select[Any]:
+        _ = session
+        if self._is_restricted(view, user):
+            return stmt
+        pred = self.facet_predicate(value, view.model)
+        return stmt.where(pred) if pred is not None else stmt
+
+
+class RelatedOnlyFieldListFilter(ListFilter):
+    """FK filter listing ONLY related records actually referenced by scoped rows in the current table."""
+
+    column: ClassVar[str] = ""
+
+    def __init__(
+        self,
+        *,
+        parameter_name: str | None = None,
+        title: str | None = None,
+        column: str | None = None,
+        limit: int = 80,
+    ) -> None:
+        self._column = column or self.column
+        self._param_name = parameter_name or self.parameter_name or f"{self._column}_rel"
+        self._title = title or self.title or self._column.replace("_id", "").replace("_", " ").title()
+        self._limit = max(1, min(int(limit), 250))
+
+    @property
+    def param_key(self) -> str:
+        return self._param_name
+
+    @property
+    def display_title(self) -> str:
+        return self._title
+
+    def _is_restricted(self, view: Any, user: DeckUser | None) -> bool:
+        if not self._column or self._column in view.meta.sensitive_fields:
+            return True
+        deck = getattr(view, "_deck", None)
+        if deck is not None and hasattr(deck, "auth"):
+            restricted = deck.auth.hidden_fields_for(user, view.meta.slug) | deck.auth.masked_fields_for(
+                user, view.meta.slug
+            )
+            if self._column in restricted:
+                return True
+        return False
+
+    def lookups(
+        self,
+        session: Session,
+        view: Any,
+        user: DeckUser | None,
+    ) -> Sequence[tuple[str, str]]:
+        from flask_deck.introspection import introspect_model
+        from flask_deck.query import soft_delete_predicate
+
+        if self._is_restricted(view, user):
+            return ()
+        fmeta = view.meta.fields_by_name.get(self._column)
+        if fmeta is None or fmeta.fk_target_model is None or fmeta.is_sensitive:
+            return ()
+        fk_col: Any = getattr(view.model, self._column)
+        distinct_stmt = view.scope_query(
+            sa.select(fk_col).distinct().select_from(view.model), user
+        )
+        sd_pred = soft_delete_predicate(view.meta, view.soft_delete_column, trashed=False)
+        if sd_pred is not None:
+            distinct_stmt = distinct_stmt.where(sd_pred)
+        raw_ids = [r[0] for r in session.execute(distinct_stmt.limit(self._limit + 1)).all()]
+        has_null = any(v is None for v in raw_ids)
+        non_null_ids = [v for v in raw_ids if v is not None][: self._limit]
+
+        choices: list[tuple[str, str]] = []
+        if non_null_ids:
+            target_cls = fmeta.fk_target_model
+            deck = getattr(view, "_deck", None)
+            target_view = (
+                deck._views_by_model.get(target_cls)
+                if deck is not None and hasattr(deck, "_views_by_model")
+                else None
+            )
+            target_meta = target_view.meta if target_view is not None else introspect_model(target_cls)
+            ref_col_name = fmeta.fk_target_column or (
+                target_meta.primary_keys[0].name if len(target_meta.primary_keys) == 1 else None
+            )
+            if ref_col_name and hasattr(target_cls, ref_col_name):
+                t_ref_col: Any = getattr(target_cls, ref_col_name)
+                t_stmt = sa.select(target_cls).where(t_ref_col.in_(non_null_ids))
+                if target_view is not None:
+                    t_stmt = target_view.scope_query(t_stmt, user)
+                    t_sd = soft_delete_predicate(
+                        target_view.meta, target_view.soft_delete_column, trashed=False
+                    )
+                    if t_sd is not None:
+                        t_stmt = t_stmt.where(t_sd)
+                t_sess = (
+                    deck.get_session(target_view.bind_key)
+                    if (deck is not None and target_view is not None)
+                    else session
+                )
+                auth_obj = deck.auth if deck is not None and hasattr(deck, "auth") else None
+                for obj in t_sess.scalars(t_stmt).all():
+                    opt_val = str(getattr(obj, ref_col_name))
+                    lbl = (
+                        target_view.format_record_repr(obj, auth=auth_obj, user=user)
+                        if target_view is not None
+                        else str(obj)
+                    )
+                    choices.append((opt_val, lbl))
+                choices.sort(key=lambda p: p[1].lower())
+        if fmeta.nullable and has_null:
+            choices.append(("__null__", "(None)"))
+        return tuple(choices)
+
+    def facet_predicate(self, value: str, model: type[Any]) -> sa.ColumnElement[bool] | None:
+        from urllib.parse import unquote
+
+        from flask_deck.introspection import introspect_model
+        from flask_deck.query import build_filter_condition
+
+        if not self._column or not hasattr(model, self._column):
+            return None
+        meta = introspect_model(model)
+        clean_v = unquote(value[3:]) if value.startswith("pk:") else value
+        return build_filter_condition(meta, self._column, clean_v, op="eq")
+
+    def apply(
+        self,
+        stmt: sa.Select[Any],
+        value: str,
+        session: Session,
+        view: Any,
+        user: DeckUser | None,
+    ) -> sa.Select[Any]:
+        _ = session
+        if self._is_restricted(view, user):
+            return stmt
+        pred = self.facet_predicate(value, view.model)
+        return stmt.where(pred) if pred is not None else stmt
+
+
 def filter_param_name(flt: ListFilter) -> str:
     return str(getattr(flt, "param_key", "") or flt.parameter_name)
 
@@ -282,8 +502,11 @@ def compute_date_hierarchy(
     where_clauses: Sequence[sa.ColumnElement[bool]],
     joins: Sequence[Any] = (),
     custom_appliers: Sequence[Callable[[sa.Select[Any]], sa.Select[Any]]] = (),
+    base_stmt: sa.Select[Any] | None = None,
 ) -> tuple[DateHierarchyResult | None, sa.ColumnElement[bool] | None]:
     """Compute hierarchical Year/Month/Day drill-down choices and SARGable SQL predicate in ONE query."""
+    from flask_deck.query import apply_base_stmt_extras
+
     fmeta = meta.fields_by_name.get(column_name)
     if fmeta is None or fmeta.field_type not in {"date", "datetime"} or fmeta.is_sensitive:
         return None, None
@@ -320,6 +543,8 @@ def compute_date_hierarchy(
             sa.select(bucket_expr.label("_dh_b"), sa.func.count().label("_dh_cnt"))
             .select_from(meta.model)
         )
+        if base_stmt is not None:
+            stmt = apply_base_stmt_extras(stmt, base_stmt)
         for rel_attr in joins:
             stmt = stmt.outerjoin(rel_attr)
         if where_clauses:
@@ -387,6 +612,8 @@ def collect_shared_facet_exprs(
             continue
         if ftype == "boolean":
             pairs = ["true", "false"]
+            if spec.get("nullable"):
+                pairs.append("__null__")
         elif ftype == "enum":
             pairs = [str(v) for v, _ in spec.get("choices", ())]
         else:
@@ -426,8 +653,11 @@ def compute_filter_facets(
     user: DeckUser | None,
     dialect_name: str,
     precomputed_facets: Mapping[str, Mapping[str, int]] | None = None,
+    base_stmt: sa.Select[Any] | None = None,
 ) -> dict[str, dict[str, int]]:
     """Compute exact faceted option counts batching enum/boolean/predicate filters into minimal SQL queries."""
+    from flask_deck.query import apply_base_stmt_extras
+
     facets: dict[str, dict[str, int]] = (
         {k: dict(v) for k, v in precomputed_facets.items()}
         if precomputed_facets
@@ -448,6 +678,8 @@ def compute_filter_facets(
             for i, (_, _, pred) in enumerate(exprs)
         ]
         stmt: Any = sa.select(*agg_cols).select_from(meta.model)
+        if base_stmt is not None:
+            stmt = apply_base_stmt_extras(stmt, base_stmt)
         for rel_attr in joins:
             stmt = stmt.outerjoin(rel_attr)
         if base_where:
@@ -477,6 +709,8 @@ def compute_filter_facets(
             continue
         if ftype == "boolean":
             pairs = [("true", "true"), ("false", "false")]
+            if spec.get("nullable"):
+                pairs.append(("__null__", "__null__"))
         elif ftype == "enum":
             pairs = [(str(v), str(v)) for v, _ in spec.get("choices", ())]
         else:
@@ -519,13 +753,15 @@ def compute_filter_facets(
     for fname, batch in per_field_batches.items():
         _run_batch(batch, exclude_filter_field=fname)
 
-    # FK filters: 1 GROUP BY query per FK filter (only over displayed options)
+    # FK filters: 1 GROUP BY query per FK filter (including NULL bucket when nullable)
     for spec in filter_specs:
         fname = str(spec["name"])
         if spec.get("type") != "fk" or fname not in meta.fields_by_name or "." in fname:
             continue
         fk_col = getattr(meta.model, fname)
         stmt = sa.select(fk_col, sa.func.count()).select_from(meta.model)
+        if base_stmt is not None:
+            stmt = apply_base_stmt_extras(stmt, base_stmt)
         for rel_attr in joins:
             stmt = stmt.outerjoin(rel_attr)
         if base_where:
@@ -535,10 +771,15 @@ def compute_filter_facets(
                 stmt = stmt.where(*f_conds)
         for applier in custom_appliers_by_param.values():
             stmt = applier(stmt)
-        stmt = stmt.where(fk_col.is_not(None)).group_by(fk_col)
+        if not spec.get("nullable"):
+            stmt = stmt.where(fk_col.is_not(None))
+        stmt = stmt.group_by(fk_col)
         counts_map: dict[str, int] = {}
         for raw_fk, cnt in session.execute(stmt).all():
-            if raw_fk is not None:
+            if raw_fk is None:
+                if spec.get("nullable"):
+                    counts_map["__null__"] = int(cnt or 0)
+            else:
                 counts_map[str(raw_fk)] = int(cnt or 0)
         facets[fname] = counts_map
 
@@ -549,6 +790,8 @@ def compute_filter_facets(
         cf_map: dict[str, int] = {}
         for val, _ in cf.lookups(session, view, user):
             sub_base = sa.select(meta.model)
+            if base_stmt is not None:
+                sub_base = apply_base_stmt_extras(sub_base, base_stmt)
             for rel_attr in joins:
                 sub_base = sub_base.outerjoin(rel_attr)
             if base_where:

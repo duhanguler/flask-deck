@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from datetime import date
 from typing import Any
 
 from markupsafe import Markup, escape
@@ -395,18 +396,30 @@ def render_grouped_bar_chart(
     return Markup("".join(parts))
 
 
-def render_heatmap_chart(cells: Sequence[tuple[str, int]], *, unit: str = "events") -> Markup:
+def render_heatmap_chart(cells: Sequence[tuple[str, Any]], *, unit: str = "events") -> Markup:
     """Render a crisp 7x13 (91-day) GitHub-style activity heatmap in pure SVG."""
     if not cells:
         return Markup('<div class="dk-chart-empty">No activity data available</div>')
 
     data = list(cells)[-91:]
-    max_val = max((c for _, c in data), default=1) or 1
+    parsed: list[tuple[str, int, int | None]] = []
+    for date_str, count in data:
+        safe_count = max(0, int(_safe_float(count)))
+        dow_val: int | None = None
+        if isinstance(date_str, str) and len(date_str) >= 10:
+            try:
+                dow_val = date.fromisoformat(date_str[:10]).weekday()
+            except ValueError:
+                dow_val = None
+        parsed.append((str(date_str), safe_count, dow_val))
+
+    max_val = max((c for _, c, _ in parsed), default=1) or 1
+    first_dow = parsed[0][2] if parsed[0][2] is not None else 0
     cell_sz = 13.0
     gap = 4.0
     step = cell_sz + gap
     pad_l, pad_t = 28.0, 10.0
-    weeks = max(1, math.ceil(len(data) / 7))
+    weeks = max(1, math.ceil((len(parsed) + first_dow) / 7))
     w = pad_l + weeks * step + 6.0
     h = pad_t + 7 * step + 8.0
 
@@ -421,12 +434,12 @@ def render_heatmap_chart(cells: Sequence[tuple[str, int]], *, unit: str = "event
                 f'<text class="dk-chart-axis" x="0" y="{pad_t + d_idx * step + 10:.1f}">{dlbl}</text>'
             )
 
-    for idx, (date_str, count) in enumerate(data):
-        wk = idx // 7
-        dow = idx % 7
+    for idx, (date_str, safe_count, real_dow) in enumerate(parsed):
+        slot = idx + first_dow
+        wk = slot // 7
+        dow = real_dow if real_dow is not None else (slot % 7)
         x = pad_l + wk * step
         y = pad_t + dow * step
-        safe_count = int(_safe_float(count))
         if safe_count <= 0:
             lvl = 0
         else:

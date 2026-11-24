@@ -543,6 +543,7 @@ class SQLAlchemyJobBackend:
         ] = {}
         self._max_logs = max(10, int(max_logs_per_job))
         self._callable_resolver = callable_resolver
+        self._default_app: Flask | None = None
 
     @staticmethod
     def _row_to_record(row: Any) -> JobRecord:
@@ -573,6 +574,9 @@ class SQLAlchemyJobBackend:
 
     def set_callable_resolver(self, resolver: Callable[[str], JobCallable | None] | None) -> None:
         self._callable_resolver = resolver
+
+    def set_default_app(self, app: Flask | None) -> None:
+        self._default_app = app
 
     def _is_cancelled(self, job_id: str) -> bool:
         ev = self._cancel_events.get(job_id)
@@ -655,31 +659,38 @@ class SQLAlchemyJobBackend:
         if self._callable_resolver is not None:
             fn = self._callable_resolver(rec.name)
             if fn is not None:
-                return (fn, None, None)
+                return (fn, self._default_app, None)
         return None
 
     def can_retry(self, job_id: str) -> bool:
         rec = self.get(job_id)
-        if rec is None or rec.status not in {"failed", "cancelled"}:
+        if rec is None or rec.status not in {"failed", "cancelled"} or rec.finished_at is None:
             return False
         return self._resolve_retry_spec(rec) is not None
 
-    def retry(self, job_id: str) -> JobRecord | None:
+    def retry(
+        self,
+        job_id: str,
+        *,
+        actor_id: str | None = None,
+        actor_name: str | None = None,
+    ) -> JobRecord | None:
         rec = self.get(job_id)
-        if rec is None or rec.status not in {"failed", "cancelled"}:
+        if rec is None or rec.status not in {"failed", "cancelled"} or rec.finished_at is None:
             return None
         spec = self._resolve_retry_spec(rec)
         if spec is None:
             return None
         fn, app, on_complete = spec
+        retry_label = f"Retry: {rec.label}"[:255]
         return self.submit(
             name=rec.name,
-            label=f"Retry: {rec.label}",
-            actor_id=rec.actor_id,
-            actor_name=rec.actor_name,
+            label=retry_label,
+            actor_id=actor_id or rec.actor_id,
+            actor_name=actor_name or rec.actor_name,
             model_slug=rec.model_slug,
             fn=fn,
-            app=app,
+            app=app or self._default_app,
             on_complete=on_complete,
         )
 
@@ -697,10 +708,11 @@ class SQLAlchemyJobBackend:
     ) -> JobRecord:
         job_id = uuid.uuid4().hex[:16]
         now = datetime.now(timezone.utc)
+        safe_label = label[:255]
         rec = JobRecord(
             id=job_id,
             name=name,
-            label=label,
+            label=safe_label,
             actor_id=actor_id,
             actor_name=actor_name,
             model_slug=model_slug,
@@ -711,7 +723,7 @@ class SQLAlchemyJobBackend:
                 self._table.insert().values(
                     id=job_id,
                     name=name,
-                    label=label,
+                    label=safe_label,
                     actor_id=actor_id,
                     actor_name=actor_name,
                     model_slug=model_slug,
@@ -729,6 +741,11 @@ class SQLAlchemyJobBackend:
             if len(self._callables) > 200:
                 oldest = next(iter(self._callables))
                 self._callables.pop(oldest, None)
+                self._cancel_events.pop(oldest, None)
+            if len(self._cancel_events) > 200:
+                oldest_ev = next(iter(self._cancel_events))
+                if oldest_ev != job_id:
+                    self._cancel_events.pop(oldest_ev, None)
 
         def _runner() -> None:
             cur = self.get(job_id)
@@ -798,7 +815,7 @@ class SQLAlchemyJobBackend:
                 conn.execute(
                     self._table.update()
                     .where(self._table.c.id == job_id)
-                    .values(status="cancelled", message="Cancellation requested")
+                    .values(message="Cancellation requested")
                 )
             return True
 

@@ -535,7 +535,12 @@ def parse_import_payload(
             header_tuple = next(row_iter, None)
             if not header_tuple:
                 raise ImportLimitError("XLSX file is missing a header row.")
-            headers = tuple(str(h).strip() for h in header_tuple if h is not None and str(h).strip())
+            header_cols: list[tuple[int, str]] = [
+                (col_idx, str(h).strip())
+                for col_idx, h in enumerate(header_tuple)
+                if h is not None and str(h).strip()
+            ]
+            headers = tuple(hname for _, hname in header_cols)
             if not headers:
                 raise ImportLimitError("XLSX file header row is empty.")
             if len(headers) > max_columns:
@@ -548,7 +553,7 @@ def parse_import_payload(
                 if not any(v is not None and str(v).strip() != "" for v in vals):
                     continue
                 row_dict: dict[str, Any] = {}
-                for col_idx, hname in enumerate(headers):
+                for col_idx, hname in header_cols:
                     cell_v = vals[col_idx] if col_idx < len(vals) else None
                     row_dict[hname] = "" if cell_v is None else cell_v
                 xlsx_rows.append(row_dict)
@@ -1019,11 +1024,23 @@ def commit_dry_run_import(
             f"Import contains {report.errors} errored row(s). Fix errors or enable 'Skip errored rows'."
         )
 
+    def _normalize_pk_tuple(raw_pk: Any) -> tuple[Any, ...]:
+        raw_t = raw_pk if isinstance(raw_pk, tuple) else (raw_pk,)
+        typed: list[Any] = []
+        for pk_f, pv in zip(view.meta.primary_keys, raw_t, strict=False):
+            if pv is not None and pk_f.enum_class is not None and not isinstance(pv, pk_f.enum_class):
+                try:
+                    typed.append(pk_f.enum_class(pv))
+                except ValueError:
+                    typed.append(pv)
+            else:
+                typed.append(pv)
+        return tuple(typed)
+
     update_pks: list[tuple[Any, ...]] = []
     for r in report.rows:
         if r.status == "update" and r.existing_pk is not None:
-            pk_t = r.existing_pk if isinstance(r.existing_pk, tuple) else (r.existing_pk,)
-            update_pks.append(pk_t)
+            update_pks.append(_normalize_pk_tuple(r.existing_pk))
     existing_by_pk = _batch_load_by_pk_tuples(session, view, user, update_pks)
 
     created = 0
@@ -1051,11 +1068,24 @@ def commit_dry_run_import(
                 }
                 pending_audits.append(("create", obj, diff))
         elif row.status == "update" and row.existing_pk is not None:
-            pk_key = row.existing_pk if isinstance(row.existing_pk, tuple) else (row.existing_pk,)
+            pk_key = _normalize_pk_tuple(row.existing_pk)
             if pk_key in existing_by_pk:
                 obj = existing_by_pk[pk_key]
+                if not view.can_edit_record(obj, user):
+                    continue
+                dyn_ro = set(view.get_readonly_fields(user, obj))
                 for fname, val in coerced.items():
+                    if fname in dyn_ro:
+                        continue
                     setattr(obj, fname, val)
+                if view.version_column:
+                    vf = view.meta.fields_by_name.get(view.version_column)
+                    if vf is not None and vf.field_type == "integer":
+                        setattr(
+                            obj,
+                            view.version_column,
+                            int(getattr(obj, view.version_column, 0) or 0) + 1,
+                        )
                 view.on_model_change(obj, is_created=False, user=user)
                 updated += 1
                 if row_audit_cb is not None and row.changes:

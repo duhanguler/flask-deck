@@ -34,10 +34,17 @@ class DeckUser:
     is_superuser: bool = False
     tenant_id: Any = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    direct_permissions: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def label(self) -> str:
         return self.display_name or self.username or self.id
+
+    def grants_direct(self, permission: str) -> bool:
+        for pattern in self.direct_permissions:
+            if pattern == "*" or pattern == permission or fnmatch.fnmatchcase(permission, pattern):
+                return True
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +410,8 @@ class RBACAuthProvider(AuthProvider):
         if user is None:
             return False
         if user.is_superuser:
+            return True
+        if user.grants_direct(permission):
             return True
         return any(role.grants(permission) for role in self._user_roles(user))
 

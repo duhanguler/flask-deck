@@ -59,6 +59,7 @@
 </div>
 
 <div class="dk-content">
+  {{ render_slot('detail_above') }}
   <div class="dk-grid">
     <section class="dk-panel dk-span-8">
       <div class="dk-panel-head">
@@ -232,6 +233,7 @@
     </section>
     {% endif %}
   </div>
+  {{ render_slot('detail_below') }}
 </div>
 {% endblock %}
 {% block extra_scripts %}

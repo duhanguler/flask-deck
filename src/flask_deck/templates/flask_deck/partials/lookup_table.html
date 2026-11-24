@@ -1,0 +1,61 @@
+<div class="dk-content" data-deck-lookup-root data-lookup-url="{{ lookup_url }}" data-target-field="{{ target_field }}">
+  <form method="get" action="{{ lookup_url }}" class="dk-lookup-bar" data-deck-lookup-form>
+    <input type="search" name="q" value="{{ q }}" class="dk-input" placeholder="{{ _('Search') }} {{ view.plural_label | lower }}…" autocomplete="off" autofocus>
+    <button type="submit" class="dk-btn dk-btn-sm dk-btn-primary">{{ deck_icon("search", 12) }} {{ _("Search") }}</button>
+    {% if q %}
+    <button type="button" class="dk-btn dk-btn-sm dk-btn-ghost" data-deck-lookup-page="1" data-lookup-q="">{{ _("Reset") }}</button>
+    {% endif %}
+  </form>
+
+  <div class="dk-table-wrap">
+    <table class="dk-table">
+      <thead>
+        <tr>
+          {% for col in visible_cols %}
+          <th>{{ view.get_column_label(col) }}</th>
+          {% endfor %}
+          <th class="dk-td-actions">{{ _("Select") }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          {% for cell in row.cells %}
+          <td>{{ cell }}</td>
+          {% endfor %}
+          <td class="dk-td-actions">
+            <button type="button"
+                    class="dk-btn dk-btn-sm dk-btn-primary"
+                    data-deck-lookup-pick
+                    data-pk="{{ row.pk }}"
+                    data-label="{{ row.label }}"
+                    data-target-field="{{ target_field }}">
+              {{ _("Select") }}
+            </button>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="{{ visible_cols | length + 1 }}" class="dk-chart-empty">{{ _("No matches") }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="dk-pagination dk-mono dk-tabular">
+    <span>Page {{ page }} · {{ rows | length }} shown</span>
+    <div class="dk-pag-btns">
+      {% if has_prev %}
+      <button type="button" class="dk-btn dk-btn-sm" data-deck-lookup-page="{{ page - 1 }}" data-lookup-q="{{ q }}">
+        {{ deck_icon("chevron-left", 12) }} {{ _("Prev") }}
+      </button>
+      {% endif %}
+      {% if has_next %}
+      <button type="button" class="dk-btn dk-btn-sm" data-deck-lookup-page="{{ page + 1 }}" data-lookup-q="{{ q }}">
+        {{ _("Next") }} {{ deck_icon("chevron-right", 12) }}
+      </button>
+      {% endif %}
+    </div>
+  </div>
+</div>

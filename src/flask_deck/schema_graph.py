@@ -55,7 +55,8 @@ def render_schema_erd_svg(
         y = row_y[r]
         shown = min(max_fields_shown, len(meta.fields)) + (1 if len(meta.fields) > max_fields_shown else 0)
         h = header_h + shown * row_h + 10.0
-        positions[meta.model] = (x, y, card_w, h)
+        # Keep primary (first registered) model position when proxy views share a model
+        positions.setdefault(meta.model, (x, y, card_w, h))
         node_data.append((meta, x, y, card_w, h))
 
     parts: list[str] = [

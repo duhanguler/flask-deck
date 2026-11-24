@@ -12,6 +12,8 @@ class FormWidget(ABC):
     """Base declarative widget renderer for ModelView ``field_widgets`` overrides."""
 
     full_width: bool = False
+    media_css: tuple[str, ...] = ()
+    media_js: tuple[str, ...] = ()
 
     @abstractmethod
     def render(
@@ -115,11 +117,13 @@ class ColorWidget(FormWidget):
         val_str = str(value).strip() if value else "#18181b"
         if not val_str.startswith("#") or len(val_str) not in {4, 7}:
             val_str = "#18181b"
+        elif len(val_str) == 4:
+            val_str = "#" + "".join(ch * 2 for ch in val_str[1:])
         return Markup(
-            '<div class="dk-color-widget">'
+            '<div class="dk-color-widget" data-color-widget>'
             f'<input type="color" id="{escape(field_id)}" name="{escape(name)}" '
-            f'value="{escape(val_str)}" class="dk-color-input" aria-label="{escape(label or name)}"{dis}{req}>'
-            f'<span class="dk-mono dk-subtle">{escape(val_str)}</span>'
+            f'value="{escape(val_str)}" class="dk-color-input" data-color-input aria-label="{escape(label or name)}"{dis}{req}>'
+            f'<span class="dk-mono dk-subtle" data-color-label>{escape(val_str)}</span>'
             "</div>"
         )
 
@@ -153,14 +157,14 @@ class TagInputWidget(FormWidget):
         entry_input = (
             ""
             if readonly
-            else f'<input type="text" class="dk-input dk-tag-input" data-tag-entry placeholder="{escape(self.placeholder)}">'
+            else f'<input type="text" class="dk-input dk-tag-input" data-tags-input placeholder="{escape(self.placeholder)}">'
         )
         return Markup(
             '<div class="dk-tag-editor" data-deck-tags>'
-            '<div class="dk-tag-chips" data-tag-chips></div>'
+            '<div class="dk-tag-chips" data-tags-chips></div>'
             f"{entry_input}"
             f'<input type="hidden" id="{escape(field_id)}" name="{escape(name)}" '
-            f'value="{escape(json_val)}" data-tag-hidden aria-label="{escape(label or name)}"{dis}{req}>'
+            f'value="{escape(json_val)}" data-tags-hidden aria-label="{escape(label or name)}"{dis}{req}>'
             "</div>"
         )
 
@@ -196,7 +200,7 @@ class SliderWidget(FormWidget):
         dis = " disabled" if readonly else ""
         val = self.min_value if value in (None, "") else value
         return Markup(
-            '<div class="dk-slider-row" data-deck-slider>'
+            f'<div class="dk-slider-row" data-deck-slider data-slider-suffix="{escape(self.unit)}">'
             f'<input type="range" min="{self.min_value}" max="{self.max_value}" step="{self.step}" '
             f'id="{escape(field_id)}" name="{escape(name)}" value="{escape(str(val))}" '
             f'class="dk-slider" data-slider-input aria-label="{escape(label or name)}"{dis}>'

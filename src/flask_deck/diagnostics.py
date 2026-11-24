@@ -7,8 +7,10 @@ from flask import Flask
 
 from flask_deck.audit import SQLAlchemyAuditStore
 from flask_deck.auth import OpenAuthProvider
+from flask_deck.checks import run_model_view_checks
 from flask_deck.introspection import ModelMeta
 from flask_deck.jobs import ThreadPoolJobBackend
+from flask_deck.query import parse_search_column_spec
 from flask_deck.storage import MemoryFileStorage
 
 if TYPE_CHECKING:
@@ -124,10 +126,11 @@ def run_security_audit(app: Flask, deck: Deck) -> list[dict[str, str]]:
                 }
             )
 
-    # Schema performance & sensitive-column checks
+    # Schema performance checks
     for view in deck.views.values():
         meta: ModelMeta = view.meta
-        for col_spec in view.resolved_searchable:
+        for raw_spec in view.resolved_searchable:
+            col_spec, _ = parse_search_column_spec(raw_spec)
             if "." in col_spec:
                 continue
             if col_spec not in meta.indexed_fields:
@@ -141,15 +144,22 @@ def run_security_audit(app: Flask, deck: Deck) -> list[dict[str, str]]:
                         ),
                     }
                 )
-        for col in view.columns or view.list_columns:
-            if col in meta.sensitive_fields:
-                findings.append(
-                    {
-                        "severity": "HIGH",
-                        "category": "privacy",
-                        "message": f"Sensitive column {meta.name}.{col} appears in declared columns.",
-                    }
-                )
+
+    # Declarative ModelView system checks (DECK-E* / DECK-W*)
+    for chk in run_model_view_checks(deck):
+        sev = (
+            "HIGH"
+            if chk.severity == "error"
+            else ("WARN" if chk.severity == "warn" else "INFO")
+        )
+        findings.append(
+            {
+                "severity": sev,
+                "category": "model_check",
+                "code": chk.code,
+                "message": f"[{chk.code}] {chk.message}",
+            }
+        )
 
     return findings
 

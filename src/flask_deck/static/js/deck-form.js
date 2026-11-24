@@ -7,8 +7,14 @@
   document.querySelectorAll("[data-deck-slider]").forEach((wrap) => {
     const inp = wrap.querySelector("[data-slider-input]");
     const out = wrap.querySelector("[data-slider-val]");
-    const suffix = wrap.getAttribute("data-slider-suffix") || "%";
+    const suffix = wrap.hasAttribute("data-slider-suffix") ? (wrap.getAttribute("data-slider-suffix") || "") : "%";
     if (inp && out) inp.addEventListener("input", () => { out.textContent = inp.value + suffix; });
+  });
+
+  document.querySelectorAll("[data-color-widget]").forEach((wrap) => {
+    const inp = wrap.querySelector("[data-color-input]");
+    const lbl = wrap.querySelector("[data-color-label]");
+    if (inp && lbl) inp.addEventListener("input", () => { lbl.textContent = inp.value; });
   });
 
   document.querySelectorAll("[data-deck-m2m]").forEach((wrap) => {
@@ -132,11 +138,21 @@
       try { const rawDep = wrap.getAttribute("data-dependent"); if (rawDep) depSpec = JSON.parse(rawDep); } catch (_) {}
       if (!searchInput || !hiddenInput || !dropdown) return;
       let fkAbort = null;
+      let curQuery = "";
+      let curPage = 1;
+      let loadedItems = [];
+      const isRawId = searchInput.getAttribute("data-fk-raw-id") === "1";
       const ownerForm = wrap.closest("form") || document;
       const initialOpts = Array.from(dropdown.querySelectorAll(".dk-fk-opt")).map((el) => ({
         id: el.getAttribute("data-id") || "",
         label: el.getAttribute("data-label") || "",
       }));
+      wrap._dkSyncOpt = (id, label, remove) => {
+        const idx = initialOpts.findIndex((o) => o.id === String(id));
+        if (remove) { if (idx >= 0) initialOpts.splice(idx, 1); }
+        else if (idx >= 0) initialOpts[idx].label = label;
+        else initialOpts.unshift({ id: String(id), label: String(label) });
+      };
       function readParentVal(name) {
         const r = ownerForm.querySelector('input[type="radio"][name="' + name + '"]:checked');
         if (r) return r.value;
@@ -144,9 +160,15 @@
         if (!el || el.type === "radio") return "";
         return el.type === "checkbox" ? (el.checked ? "true" : "false") : el.value;
       }
-      function renderOpts(items) {
+      function renderOpts(items, hasMore) {
         dropdown.replaceChildren();
-        if (!items.length) { const e = document.createElement("div"); e.className = "dk-fk-opt dk-muted"; e.textContent = "No matches"; dropdown.appendChild(e); return; }
+        if (!items.length) {
+          const e = document.createElement("div");
+          e.className = "dk-fk-opt dk-muted";
+          e.textContent = D.t("No matches");
+          dropdown.appendChild(e);
+          return;
+        }
         items.forEach((it) => {
           const row = document.createElement("div");
           row.className = "dk-fk-opt";
@@ -162,11 +184,23 @@
           });
           dropdown.appendChild(row);
         });
+        if (hasMore && apiUrl) {
+          const more = document.createElement("div");
+          more.className = "dk-fk-opt dk-fk-more dk-mono";
+          more.textContent = D.t("Load more…");
+          more.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            fetchRemote(curQuery, curPage + 1, true);
+          });
+          dropdown.appendChild(more);
+        }
       }
-      function fetchRemote(q) {
-        if (searchInput.readOnly) return;
-        if (!apiUrl) { renderOpts(initialOpts.filter((o) => o.label.toLowerCase().includes(q.toLowerCase()))); dropdown.hidden = false; return; }
-        let url = apiUrl + (apiUrl.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(q);
+      function fetchRemote(q, page, append) {
+        if (searchInput.readOnly || isRawId) return;
+        const p = page || 1;
+        curQuery = q;
+        if (!apiUrl) { renderOpts(initialOpts.filter((o) => o.label.toLowerCase().includes(q.toLowerCase())), false); dropdown.hidden = false; return; }
+        let url = apiUrl + (apiUrl.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(q) + "&page=" + p;
         if (depSpec && depSpec.parent && depSpec.filter_col) {
           const pVal = readParentVal(depSpec.parent);
           if (pVal) url += "&dep_col=" + encodeURIComponent(depSpec.filter_col) + "&dep_val=" + encodeURIComponent(pVal);
@@ -174,10 +208,18 @@
         if (fkAbort) fkAbort.abort();
         fkAbort = new AbortController();
         fetch(url, { headers: { Accept: "application/json" }, signal: fkAbort.signal })
-          .then((r) => (r.ok ? r.json() : { items: [] }))
+          .then((r) => (r.ok ? r.json() : { items: [], has_more: false }))
           .then((d) => {
             if (document.activeElement !== searchInput) return;
-            renderOpts(Array.isArray(d.items) ? d.items : []);
+            const batch = Array.isArray(d.items) ? d.items : [];
+            curPage = p;
+            if (append) {
+              const seen = new Set(loadedItems.map((x) => String(x.id)));
+              batch.forEach((b) => { if (!seen.has(String(b.id))) { seen.add(String(b.id)); loadedItems.push(b); } });
+            } else {
+              loadedItems = batch;
+            }
+            renderOpts(loadedItems, Boolean(d.has_more));
             dropdown.hidden = false;
           })
           .catch(() => {});
@@ -192,21 +234,26 @@
         });
       }
       searchInput.addEventListener("focus", () => {
-        if (searchInput.readOnly) return;
-        if (depSpec && apiUrl) fetchRemote("");
-        else { renderOpts(initialOpts); dropdown.hidden = false; }
+        if (searchInput.readOnly || isRawId) return;
+        if (depSpec && apiUrl) fetchRemote("", 1, false);
+        else { loadedItems = initialOpts.slice(); curPage = Math.max(1, Math.ceil(initialOpts.length / 25)); renderOpts(loadedItems, Boolean(apiUrl && initialOpts.length >= 50)); dropdown.hidden = false; }
       });
       searchInput.addEventListener("blur", () => { window.setTimeout(() => { dropdown.hidden = true; }, 140); });
       let fkTimer = null;
       searchInput.addEventListener("input", () => {
         if (searchInput.readOnly) return;
         const q = searchInput.value.trim();
+        if (isRawId) {
+          hiddenInput.value = q;
+          hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
+          return;
+        }
         if (!q && hiddenInput.value) {
           hiddenInput.value = "";
           hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
         }
         window.clearTimeout(fkTimer);
-        fkTimer = window.setTimeout(() => fetchRemote(q), 140);
+        fkTimer = window.setTimeout(() => fetchRemote(q, 1, false), 140);
       });
     });
   }
@@ -299,31 +346,54 @@
       }
     });
     if (!inp || !dd || inp.readOnly) return;
-    function fetchOpts(q) {
+    let curPage = 1;
+    let curQ = "";
+    let accItems = [];
+    function renderAsyncList(items, hasMore) {
+      dd.replaceChildren();
+      if (!items.length) { const em = document.createElement("div"); em.className = "dk-fk-opt dk-muted"; em.textContent = D.t("No matches"); dd.appendChild(em); }
+      else items.forEach((it) => {
+        const row = document.createElement("div"); row.className = "dk-fk-opt";
+        const s1 = document.createElement("span"); s1.textContent = it.label;
+        const s2 = document.createElement("span"); s2.className = "dk-mono dk-subtle"; s2.textContent = "#" + it.id;
+        row.appendChild(s1); row.appendChild(s2);
+        row.addEventListener("mousedown", (e) => { e.preventDefault(); addAsyncM2mChip(wrap, it.id, it.label); inp.value = ""; dd.hidden = true; });
+        dd.appendChild(row);
+      });
+      if (hasMore) {
+        const more = document.createElement("div");
+        more.className = "dk-fk-opt dk-fk-more dk-mono";
+        more.textContent = D.t("Load more…");
+        more.addEventListener("mousedown", (e) => { e.preventDefault(); fetchOpts(curQ, curPage + 1, true); });
+        dd.appendChild(more);
+      }
+      dd.hidden = false;
+    }
+    function fetchOpts(q, page, append) {
       if (!url) return;
+      const p = page || 1;
+      curQ = q;
       if (abortCtrl) abortCtrl.abort();
       abortCtrl = new AbortController();
-      fetch(url + (url.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(q), { headers: { Accept: "application/json" }, signal: abortCtrl.signal })
-        .then((r) => (r.ok ? r.json() : { items: [] }))
+      fetch(url + (url.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(q) + "&page=" + p, { headers: { Accept: "application/json" }, signal: abortCtrl.signal })
+        .then((r) => (r.ok ? r.json() : { items: [], has_more: false }))
         .then((d) => {
-          dd.replaceChildren();
-          const items = Array.isArray(d.items) ? d.items : [];
-          if (!items.length) { const em = document.createElement("div"); em.className = "dk-fk-opt dk-muted"; em.textContent = "No matches"; dd.appendChild(em); }
-          else items.forEach((it) => {
-            const row = document.createElement("div"); row.className = "dk-fk-opt";
-            const s1 = document.createElement("span"); s1.textContent = it.label;
-            const s2 = document.createElement("span"); s2.className = "dk-mono dk-subtle"; s2.textContent = "#" + it.id;
-            row.appendChild(s1); row.appendChild(s2);
-            row.addEventListener("mousedown", (e) => { e.preventDefault(); addAsyncM2mChip(wrap, it.id, it.label); inp.value = ""; dd.hidden = true; });
-            dd.appendChild(row);
-          });
-          dd.hidden = false;
+          if (document.activeElement !== inp) return;
+          const batch = Array.isArray(d.items) ? d.items : [];
+          curPage = p;
+          if (append) {
+            const seen = new Set(accItems.map((x) => String(x.id)));
+            batch.forEach((b) => { if (!seen.has(String(b.id))) { seen.add(String(b.id)); accItems.push(b); } });
+          } else {
+            accItems = batch;
+          }
+          renderAsyncList(accItems, Boolean(d.has_more));
         })
         .catch(() => {});
     }
-    inp.addEventListener("focus", () => fetchOpts(inp.value.trim()));
+    inp.addEventListener("focus", () => fetchOpts(inp.value.trim(), 1, false));
     inp.addEventListener("blur", () => { window.setTimeout(() => { dd.hidden = true; }, 140); });
-    inp.addEventListener("input", () => { window.clearTimeout(timer); timer = window.setTimeout(() => fetchOpts(inp.value.trim()), 140); });
+    inp.addEventListener("input", () => { window.clearTimeout(timer); timer = window.setTimeout(() => fetchOpts(inp.value.trim(), 1, false), 140); });
   });
 
   document.querySelectorAll("[data-deck-dropzone]").forEach((dz) => {
@@ -381,8 +451,8 @@
     const hid = wrap.querySelector("[data-tags-hidden]");
     const host = wrap.querySelector("[data-tags-chips]");
     const inp = wrap.querySelector("[data-tags-input]");
-    if (!hid || !host || !inp) return;
-    const isRo = inp.readOnly || inp.disabled;
+    if (!hid || !host) return;
+    const isRo = !inp || inp.readOnly || inp.disabled;
     let items = [];
     try { const p = JSON.parse(hid.value || "[]"); if (Array.isArray(p)) items = p.map(String); } catch (_) {}
     function sync() {
@@ -542,6 +612,7 @@
         panels.forEach((p, i) => { p.hidden = i !== curStep; });
         if (prevBtn) prevBtn.hidden = curStep === 0;
         if (nextBtn) nextBtn.hidden = curStep >= panels.length - 1;
+        formRoot.querySelectorAll("[data-wiz-submit]").forEach((b) => { b.hidden = curStep < panels.length - 1; });
         if (subBtn) subBtn.hidden = curStep < panels.length - 1;
         if (contBtn) contBtn.hidden = curStep < panels.length - 1;
       }
@@ -577,7 +648,28 @@
     }
   }
 
+  function loadLookupUrl(url) {
+    const drawerBody = document.getElementById("dk-drawer-body");
+    if (!drawerBody || !url) return;
+    fetch(url, { headers: { "X-Requested-With": "Flask-Deck" } })
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error("fail"))))
+      .then((html) => {
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        drawerBody.replaceChildren(...Array.from(doc.body.childNodes));
+      })
+      .catch(() => D.showToast(D.t("Network error"), "danger"));
+  }
+
   document.addEventListener("submit", (e) => {
+    const lf = e.target instanceof Element ? e.target.closest("[data-deck-lookup-form]") : null;
+    if (lf) {
+      e.preventDefault();
+      const base = lf.getAttribute("action") || "";
+      const qInp = lf.querySelector('input[name="q"]');
+      const qVal = qInp ? qInp.value.trim() : "";
+      loadLookupUrl(base + (base.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(qVal) + "&page=1");
+      return;
+    }
     const qf = e.target instanceof Element ? e.target.closest("[data-deck-quick-form]") : null;
     if (!qf) return;
     e.preventDefault();
@@ -587,13 +679,14 @@
         const ct = r.headers.get("content-type") || "";
         if (ct.includes("application/json")) {
           const d = await r.json();
-          if (!r.ok || !d.ok) { D.showToast(d.error || "Save failed", "danger"); return; }
+          if (!r.ok || !d.ok) { D.showToast(d.error || D.t("Save failed"), "danger"); return; }
           if (activeRelTarget && activeRelTarget.fkInputId) {
             const srch = document.getElementById(activeRelTarget.fkInputId);
             const wrap = srch && srch.closest("[data-deck-fk]");
             const hid = wrap && wrap.querySelector("[data-fk-value]");
+            if (wrap && typeof wrap._dkSyncOpt === "function") wrap._dkSyncOpt(d.id, d.label, false);
             if (hid) { hid.value = d.id; hid.dispatchEvent(new Event("change", { bubbles: true })); }
-            if (srch) srch.value = d.label;
+            if (srch) srch.value = srch.getAttribute("data-fk-raw-id") === "1" ? d.id : d.label;
           } else if (activeRelTarget && activeRelTarget.m2mField) {
             const fname = activeRelTarget.m2mField;
             const dual = document.querySelector('[data-deck-m2m-dual][data-field-name="' + fname + '"]');
@@ -639,6 +732,137 @@
     const t = e.target;
     if (!(t instanceof Element)) return;
 
+    const pad2 = (n) => String(n).padStart(2, "0");
+    function tzParts(dateObj) {
+      const tzMeta = document.querySelector('meta[name="deck-tz"]');
+      const tz = tzMeta ? tzMeta.content.trim() : "";
+      if (tz && typeof Intl !== "undefined" && Intl.DateTimeFormat) {
+        try {
+          const parts = {};
+          new Intl.DateTimeFormat("en-CA", {
+            timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+          }).formatToParts(dateObj).forEach((p) => { parts[p.type] = p.value; });
+          const hr = parts.hour === "24" ? "00" : parts.hour;
+          if (parts.year && parts.month && parts.day && hr && parts.minute) {
+            return { y: parts.year, mo: parts.month, d: parts.day, h: hr, mi: parts.minute };
+          }
+        } catch (_) {}
+      }
+      return { y: String(dateObj.getFullYear()), mo: pad2(dateObj.getMonth() + 1), d: pad2(dateObj.getDate()), h: pad2(dateObj.getHours()), mi: pad2(dateObj.getMinutes()) };
+    }
+    const todayBtn = t.closest("[data-deck-set-today]");
+    if (todayBtn) {
+      const inp = document.getElementById(todayBtn.getAttribute("data-deck-set-today") || "");
+      if (inp && !inp.readOnly && !inp.disabled) {
+        const p = tzParts(new Date());
+        inp.value = p.y + "-" + p.mo + "-" + p.d;
+        inp.dispatchEvent(new Event("input", { bubbles: true }));
+        inp.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      return;
+    }
+
+    const nowBtn = t.closest("[data-deck-set-now]");
+    if (nowBtn) {
+      const inp = document.getElementById(nowBtn.getAttribute("data-deck-set-now") || "");
+      if (inp && !inp.readOnly && !inp.disabled) {
+        const p = tzParts(new Date());
+        const hm = p.h + ":" + p.mi;
+        inp.value = nowBtn.getAttribute("data-now-kind") === "time"
+          ? hm
+          : p.y + "-" + p.mo + "-" + p.d + "T" + hm;
+        inp.dispatchEvent(new Event("input", { bubbles: true }));
+        inp.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      return;
+    }
+
+    const relLookup = t.closest("[data-deck-rel-lookup]");
+    if (relLookup) {
+      const base = relLookup.getAttribute("data-deck-rel-lookup") || "";
+      const targetId = relLookup.getAttribute("data-rel-target") || "";
+      const title = relLookup.getAttribute("data-rel-title") || D.t("Lookup");
+      if (base) {
+        let url = base + (base.includes("?") ? "&" : "?") + "target_field=" + encodeURIComponent(targetId);
+        const srchEl = document.getElementById(targetId);
+        const fkWrap = srchEl && srchEl.closest("[data-deck-fk]");
+        if (fkWrap) {
+          try {
+            const dep = JSON.parse(fkWrap.getAttribute("data-dependent") || "null");
+            const fm = fkWrap.closest("form") || document;
+            if (dep && dep.parent && dep.filter_col) {
+              const pel = fm.querySelector('[name="' + dep.parent + '"]');
+              const pv = pel ? (pel.type === "checkbox" ? (pel.checked ? "true" : "false") : pel.value) : "";
+              if (pv) url += "&dep_col=" + encodeURIComponent(dep.filter_col) + "&dep_val=" + encodeURIComponent(pv);
+            }
+          } catch (_) {}
+        }
+        D.openDrawer(url, title);
+      }
+      return;
+    }
+
+    const lookupPage = t.closest("[data-deck-lookup-page]");
+    if (lookupPage) {
+      const root = lookupPage.closest("[data-deck-lookup-root]");
+      const base = root ? (root.getAttribute("data-lookup-url") || "") : "";
+      const pg = lookupPage.getAttribute("data-deck-lookup-page") || "1";
+      const q = lookupPage.getAttribute("data-lookup-q") || "";
+      if (base) loadLookupUrl(base + (base.includes("?") ? "&" : "?") + "q=" + encodeURIComponent(q) + "&page=" + encodeURIComponent(pg));
+      return;
+    }
+
+    const lookupPick = t.closest("[data-deck-lookup-pick]");
+    if (lookupPick) {
+      const targetId = lookupPick.getAttribute("data-target-field") || "";
+      const pk = lookupPick.getAttribute("data-pk") || "";
+      const lbl = lookupPick.getAttribute("data-label") || pk;
+      const srch = document.getElementById(targetId);
+      const wrap = srch && srch.closest("[data-deck-fk]");
+      const hid = wrap && wrap.querySelector("[data-fk-value]");
+      if (hid) { hid.value = pk; hid.dispatchEvent(new Event("change", { bubbles: true })); }
+      if (srch) srch.value = srch.getAttribute("data-fk-raw-id") === "1" ? pk : lbl;
+      if (typeof D.closeDrawer === "function") D.closeDrawer();
+      D.showToast(D.t("Select") + ": " + lbl, "ok");
+      return;
+    }
+
+    const relDel = t.closest("[data-deck-rel-del]");
+    if (relDel) {
+      const targetId = relDel.getAttribute("data-rel-target") || "";
+      const srch = document.getElementById(targetId);
+      const wrap = srch && srch.closest("[data-deck-fk]");
+      const hid = wrap && wrap.querySelector("[data-fk-value]");
+      const pk = hid ? String(hid.value || "").trim() : "";
+      if (!pk) { D.showToast("Select a related record first", "warn"); return; }
+      const tpl = relDel.getAttribute("data-deck-rel-del") || "";
+      const delUrl = tpl.replace("__PK__", encodeURIComponent(pk));
+      const impactUrl = relDel.getAttribute("data-impact-url") || "";
+      const lbl = (srch && srch.value) || pk;
+      D.openConfirm({
+        title: relDel.getAttribute("data-rel-title") || D.t("Delete Related"),
+        message: "Delete related record '" + lbl + "'?",
+        impactUrl,
+        impactBody: impactUrl ? { pks: [pk], force: false } : null,
+        onConfirm: () => {
+          fetch(delUrl, {
+            method: "POST",
+            headers: { "X-Deck-CSRFToken": D.CSRF, "X-Requested-With": "Flask-Deck", Accept: "application/json" },
+          })
+            .then((r) => r.json().then((d) => ({ ok: r.ok, data: d })))
+            .then(({ ok, data }) => {
+              if (!ok || !data.ok) { D.showToast(data.error || D.t("Update failed"), "danger"); return; }
+              if (wrap && typeof wrap._dkSyncOpt === "function") wrap._dkSyncOpt(pk, "", true);
+              if (hid) { hid.value = ""; hid.dispatchEvent(new Event("change", { bubbles: true })); }
+              if (srch) srch.value = "";
+              D.showToast(D.t("Delete") + ": " + (data.label || lbl), "ok");
+            })
+            .catch(() => D.showToast(D.t("Network error"), "danger"));
+        },
+      });
+      return;
+    }
+
     const relAdd = t.closest("[data-deck-rel-add]");
     if (relAdd) {
       const url = relAdd.getAttribute("data-deck-rel-add");
@@ -683,12 +907,24 @@
       const tpl = document.querySelector('template[data-inline-template="' + slug + '"]');
       const host = document.querySelector('[data-inline-body="' + slug + '"]');
       if (tpl && host) {
+        const maxRows = Number(host.getAttribute("data-max-rows") || "0");
+        const activeRows = Array.from(host.querySelectorAll("[data-inline-row]")).filter((r) => {
+          const df = r.querySelector("[data-inline-del-flag]");
+          return !df || df.value !== "1";
+        }).length;
+        if (maxRows > 0 && activeRows >= maxRows) {
+          D.showToast("Maximum " + maxRows + " rows allowed", "warn");
+          return;
+        }
         const nextIdx = Number(host.getAttribute("data-next-index") || "0");
         host.setAttribute("data-next-index", String(nextIdx + 1));
         const frag = tpl.content.cloneNode(true);
         frag.querySelectorAll("[name]").forEach((el) => el.setAttribute("name", el.getAttribute("name").replace("__INDEX__", String(nextIdx))));
+        frag.querySelectorAll("[id]").forEach((el) => el.setAttribute("id", el.getAttribute("id").replace("__INDEX__", String(nextIdx))));
+        frag.querySelectorAll("[data-rel-target]").forEach((el) => el.setAttribute("data-rel-target", el.getAttribute("data-rel-target").replace("__INDEX__", String(nextIdx))));
         host.appendChild(frag);
         initFkWidgets(host);
+        host.dispatchEvent(new Event("change", { bubbles: true }));
       }
       return;
     }
@@ -702,7 +938,13 @@
         const isMarked = delInput.value === "1";
         delInput.value = isMarked ? "0" : "1";
         row.classList.toggle("dk-inline-deleted", !isMarked);
-      } else row.remove();
+        row.querySelectorAll("input:not([type='hidden']), select, textarea").forEach((el) => { el.disabled = !isMarked; });
+        delInput.dispatchEvent(new Event("change", { bubbles: true }));
+      } else {
+        const host = row.parentElement;
+        row.remove();
+        if (host) host.dispatchEvent(new Event("change", { bubbles: true }));
+      }
       return;
     }
 

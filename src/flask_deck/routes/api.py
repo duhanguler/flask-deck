@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
 
@@ -31,7 +31,7 @@ from flask_deck.exceptions import (
     ReadOnlyError,
     ValidationError,
 )
-from flask_deck.filters import build_date_hierarchy_predicate, compute_filter_facets
+from flask_deck.filters import compute_filter_facets
 from flask_deck.i18n import to_user_timezone
 from flask_deck.icons import render_icon
 from flask_deck.introspection import introspect_model
@@ -85,7 +85,16 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 ):
                     continue
                 allowed_search, _, _ = deck._allowed_query_fields(v, user)
-                clause, joins = build_search_clause(v.meta, allowed_search, q)
+                v_sess = deck.get_session(v.bind_key)
+                v_dialect = v_sess.get_bind().dialect.name if v_sess.get_bind() is not None else ""
+                clause, joins = build_search_clause(
+                    v.meta,
+                    allowed_search,
+                    q,
+                    dialect_name=v_dialect,
+                    max_tokens=deck.config.max_search_tokens,
+                    max_len=deck.config.max_search_length,
+                )
                 if clause is None:
                     continue
                 stmt = v.scope_query(sa.select(v.model), user)
@@ -95,7 +104,7 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 for rel_attr in joins:
                     stmt = stmt.outerjoin(rel_attr)
                 stmt = stmt.where(clause).limit(deck.config.search_limit_per_model)
-                for item in deck.get_session(v.bind_key).scalars(stmt).unique().all():
+                for item in v_sess.scalars(stmt).unique().all():
                     pk_str = encode_pk(extract_pk(item, v.meta))
                     results.append(
                         {
@@ -118,15 +127,40 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         q = request.args.get("q", "").strip()
         dep_col = request.args.get("dep_col", "").strip()
         dep_val = request.args.get("dep_val", "").strip()
+        owner_slug = request.args.get("owner_slug", "").strip()
+        owner_field = request.args.get("field_name", "").strip()
+        is_m2m = request.args.get("is_m2m", "").strip() == "1"
+        try:
+            page = max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            page = 1
+        try:
+            page_size = max(5, min(50, int(request.args.get("page_size", "25"))))
+        except ValueError:
+            page_size = 25
+
         user = deck._current_user()
         restricted = deck.auth.hidden_fields_for(user, slug) | deck.auth.masked_fields_for(
             user, slug
         )
         allowed_search, _, _ = deck._allowed_query_fields(view, user)
+        sess = deck.get_session(view.bind_key)
+        dialect_name = sess.get_bind().dialect.name if sess.get_bind() is not None else ""
         stmt = view.scope_query(sa.select(view.model), user)
         sd_pred = soft_delete_predicate(view.meta, view.soft_delete_column, trashed=False)
         if sd_pred is not None:
             stmt = stmt.where(sd_pred)
+        if owner_slug and owner_field and owner_slug in deck.views:
+            owner_view = deck.views[owner_slug]
+            if (
+                deck.auth.has_permission(user, f"{owner_slug}:view", model_slug=owner_slug)
+                or deck.auth.has_permission(user, f"{owner_slug}:create", model_slug=owner_slug)
+                or deck.auth.has_permission(user, f"{owner_slug}:edit", model_slug=owner_slug)
+            ):
+                if is_m2m:
+                    stmt = owner_view.formfield_for_manytomany(owner_field, stmt, user)
+                else:
+                    stmt = owner_view.formfield_for_foreignkey(owner_field, stmt, user)
         if (
             dep_col
             and dep_val
@@ -134,17 +168,33 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             and dep_col not in restricted
             and not view.meta.fields_by_name[dep_col].is_sensitive
         ):
-            cond = build_filter_condition(view.meta, dep_col, dep_val)
+            cond = build_filter_condition(view.meta, dep_col, dep_val, dialect_name=dialect_name)
             if cond is not None:
                 stmt = stmt.where(cond)
-        if q and allowed_search:
-            clause, joins = build_search_clause(view.meta, allowed_search, q)
-            for rel_attr in joins:
-                stmt = stmt.outerjoin(rel_attr)
-            if clause is not None:
-                stmt = stmt.where(clause)
-        stmt = stmt.order_by(getattr(view.model, view.meta.primary_keys[0].name).asc()).limit(25)
-        items = list(deck.get_session(view.bind_key).scalars(stmt).unique().all())
+        if q:
+            if view.has_custom_search_results():
+                stmt, _ = view.get_search_results(stmt, q, user)
+            elif allowed_search:
+                clause, joins = build_search_clause(
+                    view.meta,
+                    allowed_search,
+                    q,
+                    dialect_name=dialect_name,
+                    max_tokens=deck.config.max_search_tokens,
+                    max_len=deck.config.max_search_length,
+                )
+                for rel_attr in joins:
+                    stmt = stmt.outerjoin(rel_attr)
+                if clause is not None:
+                    stmt = stmt.where(clause)
+        stmt = (
+            stmt.order_by(getattr(view.model, view.meta.primary_keys[0].name).asc())
+            .limit(page_size + 1)
+            .offset((page - 1) * page_size)
+        )
+        fetched = list(sess.scalars(stmt).unique().all())
+        has_more = len(fetched) > page_size
+        items = fetched[:page_size]
         return jsonify(
             {
                 "items": [
@@ -153,8 +203,129 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                         "label": view.format_record_repr(it, auth=deck.auth, user=user),
                     }
                     for it in items
-                ]
+                ],
+                "page": page,
+                "page_size": page_size,
+                "has_more": has_more,
             }
+        )
+
+    @bp.route("/_api/<slug>/lookup")
+    def api_lookup(slug: str) -> str:
+        """Render searchable, paginated FK/raw_id lookup table inside the Slide-Over Drawer."""
+        view = deck.get_view(slug)
+        if not view.can_view:
+            abort(404)
+        deck._require_perm(f"{slug}:view", model_slug=slug)
+        user = deck._current_user()
+        q = request.args.get("q", "").strip()
+        dep_col = request.args.get("dep_col", "").strip()
+        dep_val = request.args.get("dep_val", "").strip()
+        owner_slug = request.args.get("owner_slug", "").strip()
+        owner_field = request.args.get("field_name", "").strip()
+        target_field = request.args.get("target_field", "").strip()
+        try:
+            page = max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            page = 1
+        page_size = 15
+
+        restricted = deck.auth.hidden_fields_for(user, slug) | deck.auth.masked_fields_for(
+            user, slug
+        )
+        allowed_search, _, _ = deck._allowed_query_fields(view, user)
+        visible_cols = view.visible_list_columns(deck.auth, user)[:5]
+        sess = deck.get_session(view.bind_key)
+        dialect_name = sess.get_bind().dialect.name if sess.get_bind() is not None else ""
+        stmt = view.scope_query(sa.select(view.model), user)
+        sd_pred = soft_delete_predicate(view.meta, view.soft_delete_column, trashed=False)
+        if sd_pred is not None:
+            stmt = stmt.where(sd_pred)
+        if owner_slug and owner_field and owner_slug in deck.views:
+            owner_view = deck.views[owner_slug]
+            if (
+                deck.auth.has_permission(user, f"{owner_slug}:view", model_slug=owner_slug)
+                or deck.auth.has_permission(user, f"{owner_slug}:create", model_slug=owner_slug)
+                or deck.auth.has_permission(user, f"{owner_slug}:edit", model_slug=owner_slug)
+            ):
+                stmt = owner_view.formfield_for_foreignkey(owner_field, stmt, user)
+        if (
+            dep_col
+            and dep_val
+            and dep_col in view.meta.fields_by_name
+            and dep_col not in restricted
+            and not view.meta.fields_by_name[dep_col].is_sensitive
+        ):
+            cond = build_filter_condition(view.meta, dep_col, dep_val, dialect_name=dialect_name)
+            if cond is not None:
+                stmt = stmt.where(cond)
+        if q:
+            if view.has_custom_search_results():
+                stmt, _ = view.get_search_results(stmt, q, user)
+            elif allowed_search:
+                clause, joins = build_search_clause(
+                    view.meta,
+                    allowed_search,
+                    q,
+                    dialect_name=dialect_name,
+                    max_tokens=deck.config.max_search_tokens,
+                    max_len=deck.config.max_search_length,
+                )
+                for rel_attr in joins:
+                    stmt = stmt.outerjoin(rel_attr)
+                if clause is not None:
+                    stmt = stmt.where(clause)
+        stmt = (
+            stmt.order_by(getattr(view.model, view.meta.primary_keys[0].name).desc())
+            .limit(page_size + 1)
+            .offset((page - 1) * page_size)
+        )
+        fetched = list(sess.scalars(stmt).unique().all())
+        has_more = len(fetched) > page_size
+        items = fetched[:page_size]
+        media_builder = deck._media_url_builder(view)
+        rel_url_builder = deck._rel_url_builder(user)
+        rows = [
+            {
+                "pk": encode_pk(extract_pk(it, view.meta)),
+                "label": view.format_record_repr(it, auth=deck.auth, user=user),
+                "cells": [
+                    view.format_cell(
+                        c,
+                        it,
+                        auth=deck.auth,
+                        user=user,
+                        media_url_builder=media_builder,
+                        rel_repr=deck._rel_repr,
+                        rel_url_builder=rel_url_builder,
+                    )
+                    for c in visible_cols
+                ],
+            }
+            for it in items
+        ]
+        lookup_url = url_for(
+            f"{bp_name}.api_lookup",
+            slug=slug,
+            owner_slug=owner_slug or None,
+            field_name=owner_field or None,
+            target_field=target_field or None,
+            dep_col=dep_col or None,
+            dep_val=dep_val or None,
+        )
+        return render_template(
+            "flask_deck/partials/lookup_table.html",
+            view=view,
+            visible_cols=visible_cols,
+            rows=rows,
+            q=q,
+            page=page,
+            has_prev=page > 1,
+            has_next=has_more,
+            lookup_url=lookup_url,
+            target_field=target_field,
+            deck_icon=render_icon,
+            _=deck.translator.translate,
         )
 
     @bp.route("/_api/<slug>/<raw_pk>/drawer")
@@ -165,8 +336,10 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         deck._require_perm(f"{slug}:view", model_slug=slug)
         obj, pk_vals = deck._fetch_scoped_record(view, raw_pk)
         deck._require_perm(f"{slug}:view", model_slug=slug, obj=obj)
-        pk_str = encode_pk(pk_vals)
         user = deck._current_user()
+        if not view.can_view_record(obj, user):
+            raise PermissionDeniedError(f"Not authorized to view this {view.label}.")
+        pk_str = encode_pk(pk_vals)
         hidden = deck.auth.hidden_fields_for(user, slug)
         is_soft_deleted = deck._is_soft_deleted(view, obj)
 
@@ -289,6 +462,9 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         deck._require_perm(f"{slug}:edit", model_slug=slug)
         obj, pk_vals = deck._fetch_scoped_record(view, raw_pk)
         deck._require_perm(f"{slug}:edit", model_slug=slug, obj=obj)
+        user = deck._current_user()
+        if not view.can_edit_record(obj, user):
+            return jsonify({"error": f"Not authorized to edit this {view.label}."}), 403
         if deck._is_soft_deleted(view, obj):
             return jsonify({"error": "Restore record from Trash before editing."}), 409
 
@@ -297,7 +473,6 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             return jsonify({"error": "Expected JSON object payload."}), 400
 
         field_name = str(payload.get("field", "")).strip()
-        user = deck._current_user()
         if deck.approval_store is not None and view.requires_approval(
             user, "edit", obj=obj, payload={field_name: payload.get("value")}
         ):
@@ -309,9 +484,9 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 ),
                 403,
             )
-        writable = set(view.allowed_form_fields(deck.auth, user, mode="edit")) - deck.auth.masked_fields_for(
-            user, slug
-        )
+        writable = set(
+            view.allowed_form_fields(deck.auth, user, mode="edit", obj=obj)
+        ) - deck.auth.masked_fields_for(user, slug)
         quick_allowed = set(view.resolved_inline_editable)
         if view.kanban_column:
             quick_allowed.add(view.kanban_column)
@@ -331,14 +506,18 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         if fmeta.fk_target_model is not None and coerced is not None:
             t_view = deck._views_by_model.get(fmeta.fk_target_model)
             t_meta = t_view.meta if t_view is not None else introspect_model(fmeta.fk_target_model)
-            if len(t_meta.primary_keys) == 1:
-                t_pk_col = getattr(fmeta.fk_target_model, t_meta.primary_keys[0].name)
-                fk_stmt = sa.select(fmeta.fk_target_model).where(t_pk_col == coerced)
+            ref_col_name = getattr(fmeta, "fk_target_column", None) or (
+                t_meta.primary_keys[0].name if len(t_meta.primary_keys) == 1 else None
+            )
+            if ref_col_name and hasattr(fmeta.fk_target_model, ref_col_name):
+                t_ref_col = getattr(fmeta.fk_target_model, ref_col_name)
+                fk_stmt = sa.select(fmeta.fk_target_model).where(t_ref_col == coerced)
                 if t_view is not None:
                     fk_stmt = t_view.scope_query(fk_stmt, user)
                     t_sd = soft_delete_predicate(t_view.meta, t_view.soft_delete_column, trashed=False)
                     if t_sd is not None:
                         fk_stmt = fk_stmt.where(t_sd)
+                fk_stmt = view.formfield_for_foreignkey(field_name, fk_stmt, user, obj=obj)
                 t_sess = deck.get_session(t_view.bind_key if t_view is not None else view.bind_key)
                 if t_sess.scalars(fk_stmt).first() is None:
                     return jsonify({"error": "Referenced record not found or outside your scope."}), 422
@@ -457,7 +636,7 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 return tv.scope_query(s, user) if tv is not None else s
 
             try:
-                view.apply_form_data(
+                vdata_q = view.apply_form_data(
                     sess,
                     obj,
                     request.form,
@@ -465,11 +644,13 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                     user=user,
                     mode="create",
                     max_json_depth=deck.config.max_json_depth,
-                    m2m_getter=request.form.getlist,
+                    m2m_getter=None,
                     m2m_scope=_scope_m2m,
                 )
-                view.on_model_change(obj, is_created=True, user=user)
+                view.invoke_on_model_change(obj, is_created=True, user=user, virtual_data=vdata_q)
                 sess.add(obj)
+                sess.flush()
+                view.save_related(obj, is_created=True, user=user, inline_diffs=[])
                 sess.commit()
                 pk_str = encode_pk(extract_pk(obj, view.meta))
                 safe_repr = view.format_record_repr(obj, auth=deck.auth, user=user)
@@ -526,6 +707,9 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         deck._require_perm(f"{slug}:edit", model_slug=slug)
         obj, pk_vals = deck._fetch_scoped_record(view, raw_pk)
         deck._require_perm(f"{slug}:edit", model_slug=slug, obj=obj)
+        user = deck._current_user()
+        if not view.can_edit_record(obj, user):
+            return jsonify({"error": f"Not authorized to edit this {view.label}."}), 403
         if deck._is_soft_deleted(view, obj):
             return jsonify({"error": "Restore record from Trash before editing."}), 409
         if view.file_fields:
@@ -533,7 +717,6 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 jsonify({"error": "Models with file uploads must use the full edit form."}),
                 400,
             )
-        user = deck._current_user()
         if deck.approval_store is not None and view.requires_approval(user, "edit", obj=obj):
             return (
                 jsonify(
@@ -557,7 +740,8 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 return tv.scope_query(s, user) if tv is not None else s
 
             try:
-                view.apply_form_data(
+                # quick_form.html intentionally omits M2M fields; pass m2m_getter=None so existing M2M links are preserved.
+                vdata_qe = view.apply_form_data(
                     sess,
                     obj,
                     request.form,
@@ -565,10 +749,20 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                     user=user,
                     mode="edit",
                     max_json_depth=deck.config.max_json_depth,
-                    m2m_getter=request.form.getlist,
+                    m2m_getter=None,
                     m2m_scope=_scope_m2m,
                 )
-                view.on_model_change(obj, is_created=False, user=user)
+                if view.version_column:
+                    vf = view.meta.fields_by_name.get(view.version_column)
+                    if vf is not None and vf.field_type == "integer":
+                        setattr(
+                            obj,
+                            view.version_column,
+                            int(before_snap.get(view.version_column) or 0) + 1,
+                        )
+                view.invoke_on_model_change(obj, is_created=False, user=user, virtual_data=vdata_qe)
+                sess.flush()
+                view.save_related(obj, is_created=False, user=user, inline_diffs=[])
                 sess.commit()
                 safe_repr = view.format_record_repr(obj, auth=deck.auth, user=user)
                 diff = compute_diff(
@@ -616,6 +810,109 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         )
         return (html, 422) if errors else html
 
+    @bp.route("/_api/<slug>/<raw_pk>/quick-delete", methods=["POST"])
+    def api_quick_delete(slug: str, raw_pk: str) -> tuple[Response, int]:
+        """Delete a related FK target record from an inline form modal (RBAC + scope + audit)."""
+        view = deck.get_view(slug)
+        if not view.can_delete or deck.config.read_only:
+            return jsonify({"error": "Deletion is disabled for this model."}), 403
+        deck._require_perm(f"{slug}:delete", model_slug=slug)
+        if deck.config.demo_safe_mode and not view.soft_delete_column:
+            return jsonify({"error": "Permanent deletion is disabled in Demo Safe Mode."}), 403
+        obj, pk_vals = deck._fetch_scoped_record(view, raw_pk)
+        deck._require_perm(f"{slug}:delete", model_slug=slug, obj=obj)
+        user = deck._current_user()
+        if not view.can_delete_record(obj, user):
+            return jsonify({"error": f"Not authorized to delete this {view.label}."}), 403
+        if deck.approval_store is not None and view.requires_approval(user, "delete", obj=obj):
+            return (
+                jsonify(
+                    {
+                        "error": "Deletions on this model require four-eyes approval. Delete from the record page."
+                    }
+                ),
+                409,
+            )
+
+        pk_str = encode_pk(pk_vals)
+        repr_str = view.format_record_repr(obj, auth=deck.auth, user=user)
+        before_snap = view.extract_snapshot(obj)
+        sess = deck.get_session(view.bind_key)
+
+        if view.soft_delete_column:
+            if deck._is_soft_deleted(view, obj):
+                return jsonify({"error": "Record is already in Trash."}), 409
+            fmeta = view.meta.fields_by_name.get(view.soft_delete_column)
+            if fmeta is not None:
+                try:
+                    view.on_model_delete(obj, user=user)
+                    setattr(
+                        obj,
+                        view.soft_delete_column,
+                        True if fmeta.field_type == "boolean" else datetime.now(timezone.utc),
+                    )
+                    sess.commit()
+                except SQLAlchemyError as exc:
+                    sess.rollback()
+                    return jsonify({"error": f"Database error: {exc.__class__.__name__}"}), 400
+                deck._record_audit(
+                    action_name="soft_delete",
+                    view=view,
+                    record_pk=pk_str,
+                    record_repr=repr_str,
+                    changes=compute_diff(
+                        before_snap,
+                        view.extract_snapshot(obj),
+                        sensitive_fields=view.meta.sensitive_fields,
+                        extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+                    ),
+                    metadata={"quick_delete": True},
+                )
+                deck._emit_event(
+                    "record.deleted",
+                    model_slug=slug,
+                    record_pk=pk_str,
+                    payload={"soft": True, "quick_delete": True},
+                )
+                return jsonify({"ok": True, "pk": pk_str, "soft": True, "label": repr_str}), 200
+
+        orphan_files = deck._collect_orphan_files(view, obj)
+        try:
+            view.on_model_delete(obj, user=user)
+            sess.delete(obj)
+            sess.commit()
+        except IntegrityError:
+            sess.rollback()
+            return (
+                jsonify({"error": f"Cannot delete {repr_str}: referenced by dependent records."}),
+                409,
+            )
+        except SQLAlchemyError as exc:
+            sess.rollback()
+            return jsonify({"error": f"Database error: {exc.__class__.__name__}"}), 400
+
+        deck._delete_orphan_files_best_effort(orphan_files)
+        deck._record_audit(
+            action_name="delete",
+            view=view,
+            record_pk=pk_str,
+            record_repr=repr_str,
+            changes=compute_diff(
+                before_snap,
+                {},
+                sensitive_fields=view.meta.sensitive_fields,
+                extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+            ),
+            metadata={"quick_delete": True},
+        )
+        deck._emit_event(
+            "record.deleted",
+            model_slug=slug,
+            record_pk=pk_str,
+            payload={"soft": False, "quick_delete": True},
+        )
+        return jsonify({"ok": True, "pk": pk_str, "soft": False, "label": repr_str}), 200
+
     @bp.route("/_api/<slug>/facets")
     def api_facets(slug: str) -> Response:
         view = deck.get_view(slug)
@@ -630,7 +927,6 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             view.quick_tabs[0].key if view.quick_tabs else ""
         )
         trashed = bool(view.soft_delete_column and single.get("trashed") == "1")
-        dh_raw = single.get("dh", "").strip()
         filter_pairs = [
             (k[2:], v.strip()) for k, v in multi_items if k.startswith("f_") and v.strip()
         ]
@@ -639,12 +935,15 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         _, appliers_by_param, _, dh_pred = deck._resolve_custom_filters_and_dh(
             view, multi_items, user
         )
-        if dh_pred is None and dh_raw:
-            dh_pred = build_date_hierarchy_predicate(view.meta, view.date_hierarchy, dh_raw)
         filter_specs = deck._build_filter_specs(view, allowed_filterable, filter_params, user)
         sess = deck.get_session(view.bind_key)
         dialect_name = sess.get_bind().dialect.name if sess.get_bind() is not None else ""
         base_stmt = view.scope_query(sa.select(view.model), user)
+        search_applier = (
+            (lambda s: view.get_search_results(s, search_term, user)[0])
+            if (search_term and view.has_custom_search_results())
+            else None
+        )
         non_filter_where, _, filter_where_by_field, joins = prepare_scoped_clauses(
             view.meta,
             base_stmt=base_stmt,
@@ -661,7 +960,13 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             user=user,
             auth=deck.auth,
             extra_where=[dh_pred] if dh_pred is not None else (),
+            search_applier=search_applier,
+            max_search_tokens=deck.config.max_search_tokens,
+            max_search_length=deck.config.max_search_length,
         )
+        facet_appliers = dict(appliers_by_param)
+        if search_applier is not None:
+            facet_appliers["__search__"] = search_applier
         facets = compute_filter_facets(
             sess,
             view,
@@ -669,11 +974,12 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             joins=joins,
             filter_specs=filter_specs,
             custom_filters=view.resolved_custom_filters,
-            custom_appliers_by_param=appliers_by_param,
+            custom_appliers_by_param=facet_appliers,
             filter_where_by_field=filter_where_by_field,
             build_condition_fn=build_filter_condition,
             user=user,
             dialect_name=dialect_name,
+            base_stmt=base_stmt,
         )
         return jsonify({"facets": facets})
 
@@ -990,11 +1296,15 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         flash(f"Deleted saved view '{rec.name}'.", "ok")
         return redirect(url_for(f"{bp_name}.model_list", slug=slug))
 
-    def _can_write_notes_for(user: Any, slug: str, obj: Any) -> bool:
+    def _can_write_notes_for(user: Any, view: Any, slug: str, obj: Any) -> bool:
         return bool(
             user is not None
+            and view.can_view_record(obj, user)
             and (
-                deck.auth.has_permission(user, f"{slug}:edit", model_slug=slug, obj=obj)
+                (
+                    view.can_edit_record(obj, user)
+                    and deck.auth.has_permission(user, f"{slug}:edit", model_slug=slug, obj=obj)
+                )
                 or deck.auth.has_permission(user, "notes:write", model_slug=slug, obj=obj)
             )
         )
@@ -1008,8 +1318,17 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         if deck.note_store is None:
             abort(404)
         obj, pk_vals = deck._fetch_scoped_record(view, raw_pk)
+        deck._require_perm(f"{slug}:view", model_slug=slug, obj=obj)
         pk_str = encode_pk(pk_vals)
         user = deck._current_user()
+        if not view.can_view_record(obj, user):
+            if _wants_json():
+                return jsonify({"error": f"Not authorized to view this {view.label}."}), 403
+            raise PermissionDeniedError(f"Not authorized to view this {view.label}.")
+        if deck._is_soft_deleted(view, obj):
+            if _wants_json():
+                return jsonify({"error": "Record is in Trash."}), 404
+            abort(404)
 
         if request.method == "GET":
             notes = deck.note_store.list_notes(slug, pk_str)
@@ -1030,7 +1349,7 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 }
             )
 
-        if not _can_write_notes_for(user, slug, obj):
+        if not _can_write_notes_for(user, view, slug, obj):
             if _wants_json():
                 return jsonify({"error": "Missing permission to add record notes."}), 403
             raise PermissionDeniedError("Missing permission to add record notes.")
@@ -1108,9 +1427,18 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         if deck.note_store is None:
             abort(404)
         obj, pk_vals = deck._fetch_scoped_record(view, raw_pk)
+        deck._require_perm(f"{slug}:view", model_slug=slug, obj=obj)
         pk_str = encode_pk(pk_vals)
         user = deck._current_user()
-        if not _can_write_notes_for(user, slug, obj):
+        if not view.can_view_record(obj, user):
+            if _wants_json():
+                return jsonify({"error": f"Not authorized to view this {view.label}."}), 403
+            raise PermissionDeniedError(f"Not authorized to view this {view.label}.")
+        if deck._is_soft_deleted(view, obj):
+            if _wants_json():
+                return jsonify({"error": "Record is in Trash."}), 404
+            abort(404)
+        if not _can_write_notes_for(user, view, slug, obj):
             if _wants_json():
                 return jsonify({"error": "Missing permission to pin notes."}), 403
             raise PermissionDeniedError("Missing permission to pin notes.")
@@ -1133,9 +1461,18 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         if deck.note_store is None:
             abort(404)
         obj, pk_vals = deck._fetch_scoped_record(view, raw_pk)
+        deck._require_perm(f"{slug}:view", model_slug=slug, obj=obj)
         pk_str = encode_pk(pk_vals)
         user = deck._current_user()
-        if not _can_write_notes_for(user, slug, obj):
+        if not view.can_view_record(obj, user):
+            if _wants_json():
+                return jsonify({"error": f"Not authorized to view this {view.label}."}), 403
+            raise PermissionDeniedError(f"Not authorized to view this {view.label}.")
+        if deck._is_soft_deleted(view, obj):
+            if _wants_json():
+                return jsonify({"error": "Record is in Trash."}), 404
+            abort(404)
+        if not _can_write_notes_for(user, view, slug, obj):
             if _wants_json():
                 return jsonify({"error": "Missing permission to delete notes."}), 403
             raise PermissionDeniedError("Missing permission to delete notes.")

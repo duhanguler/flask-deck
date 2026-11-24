@@ -43,6 +43,7 @@ from flask_deck.auth import (
 )
 from flask_deck.branding import ACCENT_PRESETS, BrandConfig
 from flask_deck.cascade import DeleteImpactReport, DependentImpact, analyze_delete_impact
+from flask_deck.checks import CheckFinding, check_model_view, run_model_view_checks
 from flask_deck.config import DeckConfig
 from flask_deck.dashboard import (
     ActivityWidget,
@@ -70,6 +71,7 @@ from flask_deck.events import (
     WebhookSink,
 )
 from flask_deck.exceptions import (
+    ConfigurationError,
     DeckError,
     ImportLimitError,
     InvalidPKError,
@@ -78,7 +80,13 @@ from flask_deck.exceptions import (
     SecurityConfigurationError,
     ValidationError,
 )
-from flask_deck.filters import ListFilter, PredicateListFilter, RangeListFilter
+from flask_deck.filters import (
+    EmptyFieldListFilter,
+    ListFilter,
+    PredicateListFilter,
+    RangeListFilter,
+    RelatedOnlyFieldListFilter,
+)
 from flask_deck.formatters import (
     AvatarFormatter,
     BadgeFormatter,
@@ -94,7 +102,18 @@ from flask_deck.formatters import (
     RelativeTimeFormatter,
 )
 from flask_deck.i18n import BabelTranslator, DictTranslator, Translator
-from flask_deck.iam import IAMGroupRecord, IAMUserRecord, SQLAlchemyAuthProvider
+from flask_deck.iam import (
+    CommonPasswordValidator,
+    ComplexityValidator,
+    IAMGroupRecord,
+    IAMUserRecord,
+    MinimumLengthValidator,
+    NumericPasswordValidator,
+    PasswordValidator,
+    SQLAlchemyAuthProvider,
+    UserAttributeSimilarityValidator,
+    validate_password_strength,
+)
 from flask_deck.importer import (
     InMemoryPreviewStore,
     PreviewStore,
@@ -129,7 +148,10 @@ from flask_deck.model_view import (
     DisplaySpec,
     Fieldset,
     InlineModelView,
+    ModelURL,
     ModelView,
+    ViewMedia,
+    VirtualField,
     action,
     display,
     pydantic_validator,
@@ -141,7 +163,12 @@ from flask_deck.passkeys import (
     SQLAlchemyPasskeyStore,
     is_webauthn_available,
 )
-from flask_deck.query import QuickTab, compute_all_aggregates
+from flask_deck.query import (
+    QuickTab,
+    compute_all_aggregates,
+    parse_search_column_spec,
+    tokenize_search_query,
+)
 from flask_deck.saved_views import (
     InMemoryRecordNoteStore,
     InMemorySavedViewStore,
@@ -213,9 +240,13 @@ __all__ = [
     "BrandConfig",
     "CalloutWidget",
     "ChartWidget",
+    "CheckFinding",
     "CodeFormatter",
     "CodeWidget",
     "ColorWidget",
+    "CommonPasswordValidator",
+    "ComplexityValidator",
+    "ConfigurationError",
     "CurrencyFormatter",
     "DashboardContext",
     "DateTimeFormatter",
@@ -230,6 +261,7 @@ __all__ = [
     "DependentImpact",
     "DictTranslator",
     "DisplaySpec",
+    "EmptyFieldListFilter",
     "Fieldset",
     "FileFieldConfig",
     "FileFormatter",
@@ -270,7 +302,10 @@ __all__ = [
     "MarkdownFormWidget",
     "MarkdownWidget",
     "MemoryFileStorage",
+    "MinimumLengthValidator",
+    "ModelURL",
     "ModelView",
+    "NumericPasswordValidator",
     "OIDCAuthProvider",
     "OIDCProviderConfig",
     "ORMAdapter",
@@ -278,6 +313,7 @@ __all__ = [
     "PageSpec",
     "PasskeyCredential",
     "PasskeyStore",
+    "PasswordValidator",
     "PermissionDeniedError",
     "PredicateListFilter",
     "PreviewStore",
@@ -293,6 +329,7 @@ __all__ = [
     "RecordNoteStore",
     "RedisPreviewStore",
     "RedisRateLimitStore",
+    "RelatedOnlyFieldListFilter",
     "RelativeTimeFormatter",
     "Role",
     "S3StorageBackend",
@@ -329,7 +366,10 @@ __all__ = [
     "ThreadPoolJobBackend",
     "TimelineWidget",
     "Translator",
+    "UserAttributeSimilarityValidator",
     "ValidationError",
+    "ViewMedia",
+    "VirtualField",
     "WebhookDeliveryRecord",
     "WebhookDeliveryStore",
     "WebhookSink",
@@ -342,6 +382,7 @@ __all__ = [
     "build_api_key_record",
     "build_otpauth_uri",
     "build_sql_chart_svg",
+    "check_model_view",
     "compute_all_aggregates",
     "compute_audit_entry_hash",
     "compute_totp",
@@ -354,10 +395,14 @@ __all__ = [
     "introspect_engine_schema",
     "is_webauthn_available",
     "make_approval_request",
+    "parse_search_column_spec",
     "pydantic_validator",
     "render_qr_svg",
     "render_safe_markdown",
     "run_mcp_stdio",
+    "run_model_view_checks",
     "run_security_audit",
+    "tokenize_search_query",
+    "validate_password_strength",
     "verify_totp",
 ]
