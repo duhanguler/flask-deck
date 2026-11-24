@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
@@ -447,7 +447,7 @@ def compute_filter_facets(
             sa.func.count(sa.case((pred, 1))).label(f"f_{i}")
             for i, (_, _, pred) in enumerate(exprs)
         ]
-        stmt: sa.Select[Any] = cast("sa.Select[Any]", sa.select(*agg_cols).select_from(meta.model))
+        stmt: Any = sa.select(*agg_cols).select_from(meta.model)
         for rel_attr in joins:
             stmt = stmt.outerjoin(rel_attr)
         if base_where:
