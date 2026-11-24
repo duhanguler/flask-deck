@@ -385,18 +385,27 @@
       const phraseTpl = bulkBtn.getAttribute("data-confirm-phrase") || "";
       const impactUrl = bulkBtn.getAttribute("data-impact-url") || "";
       const impactForce = bulkBtn.getAttribute("data-impact-force") === "true";
+      const bulkDemoSafe = Boolean(bulkDock && bulkDock.getAttribute("data-demo-safe") === "1");
+      const demoLocked = bulkBtn.getAttribute("data-demo-locked") === "1" || (bulkDemoSafe && selectAcrossActive);
+      const demoLockMsg =
+        bulkBtn.getAttribute("data-demo-lock-msg") ||
+        (selectAcrossActive
+          ? "Select-across mass actions are disabled in public Demo Safe Mode. Select individual rows on this page instead."
+          : "");
       const rawFields = bulkBtn.getAttribute("data-action-fields") || "";
       let fields = [];
       if (rawFields) { try { fields = JSON.parse(rawFields); } catch (_) {} }
       const pks = selectedPks();
       const count = selectAcrossActive ? selectAcrossTotal : pks.length;
       const phrase = phraseTpl ? phraseTpl.replace("{n}", String(count)) : "";
-      if (needConfirm || phrase || fields.length || impactUrl) {
+      if (needConfirm || phrase || fields.length || impactUrl || demoLocked) {
         D.openConfirm({
           title: label,
           message: "Apply '" + label + "' to " + count.toLocaleString() + " selected record(s)?",
           phrase,
           fields,
+          demoLocked,
+          demoLockMsg,
           impactUrl,
           impactBody: impactUrl
             ? {

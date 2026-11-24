@@ -231,6 +231,13 @@ class DeckMCPServer:
         api_key: APIKeyRecord | None,
     ) -> dict[str, Any]:
         deck = self.deck
+        if deck.config.demo_safe_mode and name in {
+            "propose_create",
+            "propose_update",
+            "propose_delete",
+            "propose_action",
+        }:
+            raise PermissionDeniedError("Mutating MCP tools are disabled in public Demo Safe Mode.")
         if name == "list_models":
             models = []
             for slug, view in deck.views.items():

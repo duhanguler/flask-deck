@@ -292,12 +292,21 @@
       });
     }
     const phrase = opts.phrase || "";
+    const demoLocked = Boolean(opts.demoLocked);
+    const demoLockMsg = opts.demoLockMsg || "This action is disabled in public Demo Safe Mode.";
     let impactLoading = false;
     let impactBlocked = false;
+    if (confirmGo) confirmGo.textContent = demoLocked ? "Disabled in Demo" : "Confirm";
     const syncConfirmBtn = () => {
       if (!confirmGo) return;
       const phraseMismatch = Boolean(phrase) && (!confirmInput || confirmInput.value.trim() !== phrase);
-      confirmGo.disabled = impactLoading || impactBlocked || phraseMismatch;
+      confirmGo.disabled = demoLocked || impactLoading || impactBlocked || phraseMismatch;
+    };
+    const makeDemoLockNotice = () => {
+      const box = document.createElement("div");
+      box.className = "dk-alert dk-alert-warn";
+      box.textContent = "DEMO LOCKED · " + demoLockMsg;
+      return box;
     };
     if (confirmPhraseWrap && confirmInput && confirmPhraseLabel) {
       confirmPhraseWrap.hidden = !phrase;
@@ -308,7 +317,8 @@
     if (impactAbort) { impactAbort.abort(); impactAbort = null; }
     if (confirmImpact) {
       confirmImpact.replaceChildren();
-      confirmImpact.hidden = true;
+      confirmImpact.hidden = !demoLocked;
+      if (demoLocked) confirmImpact.appendChild(makeDemoLockNotice());
       if (opts.impactUrl && opts.impactBody) {
         impactLoading = true;
         confirmImpact.hidden = false;
@@ -330,6 +340,7 @@
           .then((r) => (r.ok ? r.json() : Promise.reject(new Error("impact"))))
           .then((rep) => {
             confirmImpact.replaceChildren();
+            if (demoLocked) confirmImpact.appendChild(makeDemoLockNotice());
             if (rep.is_soft_delete) {
               const info = document.createElement("div");
               info.className = "dk-impact-note dk-mono";
@@ -394,6 +405,7 @@
           .catch((err) => {
             if (err && err.name === "AbortError") return;
             confirmImpact.replaceChildren();
+            if (demoLocked) confirmImpact.appendChild(makeDemoLockNotice());
             const warn = document.createElement("div");
             warn.className = "dk-subtle dk-mono";
             warn.textContent = "Unable to compute dependency preview.";
@@ -405,6 +417,7 @@
     }
     syncConfirmBtn();
     pendingConfirmFn = () => {
+      if (demoLocked) return;
       const extras = {};
       for (const [k, { el, spec }] of Object.entries(fieldInputs)) {
         if (spec.type === "boolean") { extras[k] = el.checked ? "true" : "false"; continue; }
@@ -606,6 +619,8 @@
         title: confirmFormBtn.getAttribute("data-confirm-title") || "Confirm Action",
         message: confirmFormBtn.getAttribute("data-confirm-msg") || "This action cannot be undone.",
         phrase: confirmFormBtn.getAttribute("data-confirm-phrase") || "",
+        demoLocked: confirmFormBtn.getAttribute("data-demo-locked") === "1",
+        demoLockMsg: confirmFormBtn.getAttribute("data-demo-lock-msg") || "",
         impactUrl,
         impactBody: impactUrl && impactPk ? { pks: [impactPk], force: rawForce === "1" || rawForce === "true" } : null,
         onConfirm: (txt) => {

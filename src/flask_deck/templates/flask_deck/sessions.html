@@ -11,10 +11,18 @@
     <p class="dk-page-sub">Server-side tracked sessions across all workers with instant token invalidation.</p>
   </div>
   <div class="dk-page-actions">
+    {% if demo_safe_mode %}
+    <span class="dk-badge dk-badge-warn dk-mono">{{ deck_icon("lock", 11) }} DEMO LOCKED</span>
+    {% endif %}
     {% if can_view_all %}
     <a href="{{ url_for(bp_name ~ '.security_sessions', scope='mine') }}" class="dk-btn{% if scope != 'all' %} is-active{% endif %}">My Sessions</a>
     <a href="{{ url_for(bp_name ~ '.security_sessions', scope='all') }}" class="dk-btn{% if scope == 'all' %} is-active{% endif %}">All Users</a>
     {% endif %}
+    {% if demo_safe_mode %}
+    <button type="button" class="dk-btn dk-btn-danger" disabled title="Disabled in public Demo Safe Mode">
+      {{ deck_icon("lock", 13) }} {{ _("Disabled in Demo") }}
+    </button>
+    {% else %}
     <form method="post" action="{{ url_for(bp_name ~ '.security_sessions_revoke_others') }}">
       <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
       <button type="submit" class="dk-btn dk-btn-danger" data-deck-confirm-form
@@ -23,10 +31,13 @@
         {{ deck_icon("log-out", 13) }} Sign Out All Other Sessions
       </button>
     </form>
+    {% endif %}
   </div>
 </div>
 
 <div class="dk-content">
+  {% set demo_lock_message = "Active sessions are visible with privacy-masked client IPs, while remote session revocation is disabled in public Demo Safe Mode." %}
+  {% include "flask_deck/partials/demo_lock_banner.html" %}
   <div class="dk-table-wrap">
     <table class="dk-table">
       <thead>
@@ -64,11 +75,15 @@
           </td>
           <td class="dk-td-actions">
             {% if rec.is_active %}
-            <form method="post" action="{{ url_for(bp_name ~ '.security_session_revoke', sid=rec.session_id) }}">
-              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
-              <input type="hidden" name="scope" value="{{ scope }}">
-              <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger">{{ deck_icon("x", 12) }} Revoke</button>
-            </form>
+              {% if demo_safe_mode %}
+              <button type="button" class="dk-btn dk-btn-sm dk-btn-danger" disabled title="Disabled in public Demo Safe Mode">{{ deck_icon("lock", 12) }} Revoke</button>
+              {% else %}
+              <form method="post" action="{{ url_for(bp_name ~ '.security_session_revoke', sid=rec.session_id) }}">
+                <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+                <input type="hidden" name="scope" value="{{ scope }}">
+                <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger">{{ deck_icon("x", 12) }} Revoke</button>
+              </form>
+              {% endif %}
             {% else %}
             <span class="dk-subtle dk-mono">{{ format_dt(rec.revoked_at) }}</span>
             {% endif %}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -46,7 +47,7 @@ from flask_deck.passkeys import (
     complete_passkey_registration,
     is_webauthn_available,
 )
-from flask_deck.security import is_safe_redirect_url, rotate_csrf_token
+from flask_deck.security import is_safe_redirect_url, mask_ip_address, rotate_csrf_token
 from flask_deck.sessions import DECK_SID_SESSION_KEY, issue_tracked_session
 from flask_deck.sso import OIDCAuthProvider
 
@@ -444,6 +445,11 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
             user_id=None if (can_view_all and scope == "all") else user.id,
             limit=200,
         )
+        if deck.config.demo_safe_mode:
+            records = [
+                replace(rec, ip_address=mask_ip_address(rec.ip_address))
+                for rec in records
+            ]
         return render_template(
             "flask_deck/sessions.html",
             **deck._base_context(

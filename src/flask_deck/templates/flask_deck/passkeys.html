@@ -14,6 +14,9 @@
     <p class="dk-page-sub">Phishing-resistant hardware &amp; platform passkey credentials attached to your account.</p>
   </div>
   <div class="dk-page-actions">
+    {% if demo_safe_mode %}
+    <span class="dk-badge dk-badge-warn dk-mono">{{ deck_icon("lock", 11) }} DEMO LOCKED</span>
+    {% endif %}
     {% if webauthn_available %}
     <span class="dk-badge dk-badge-ok dk-mono"><span class="dk-dot"></span>WEBAUTHN READY</span>
     {% else %}
@@ -23,6 +26,8 @@
 </div>
 
 <div class="dk-content">
+  {% set demo_lock_message = "WebAuthn / FIDO2 credential management is visible for inspection, while registering or removing passkeys is disabled in public Demo Safe Mode." %}
+  {% include "flask_deck/partials/demo_lock_banner.html" %}
   {% if not webauthn_available %}
   <div class="dk-alert dk-alert-neutral" role="note">
     {{ deck_icon("key", 13) }} Install optional WebAuthn support with <code>pip install 'flask-deck[webauthn]'</code> to register hardware or platform passkeys.
@@ -39,14 +44,15 @@
       <div class="dk-inline-row">
         <div class="dk-field">
           <label for="dk-passkey-label">Device Label</label>
-          <input type="text" id="dk-passkey-label" class="dk-input" placeholder="MacBook Touch ID / YubiKey" value="Security Key">
+          <input type="text" id="dk-passkey-label" class="dk-input" placeholder="MacBook Touch ID / YubiKey" value="Security Key"{% if demo_safe_mode %} disabled{% endif %}>
         </div>
         <button type="button" class="dk-btn dk-btn-primary"
+                {% if demo_safe_mode %}disabled title="Disabled in public Demo Safe Mode"{% else %}
                 data-deck-passkey-register
                 data-options-url="{{ url_for(bp_name ~ '.passkey_register_options') }}"
                 data-verify-url="{{ url_for(bp_name ~ '.passkey_register_verify') }}"
-                data-label-input="dk-passkey-label">
-          {{ deck_icon("key", 13) }} Register Passkey
+                data-label-input="dk-passkey-label"{% endif %}>
+          {{ deck_icon("lock" if demo_safe_mode else "key", 13) }} {{ _("Disabled in Demo") if demo_safe_mode else "Register Passkey" }}
         </button>
       </div>
       <div class="dk-subtle dk-mono" data-passkey-status role="status" aria-live="polite"></div>
@@ -75,6 +81,11 @@
           <td class="dk-mono dk-tabular dk-subtle">{{ format_dt(cred.created_at) }}</td>
           <td class="dk-mono dk-tabular dk-subtle">{{ format_dt(cred.last_used_at) if cred.last_used_at else "Never" }}</td>
           <td class="dk-td-actions">
+            {% if demo_safe_mode %}
+            <button type="button" class="dk-btn dk-btn-sm dk-btn-danger" disabled title="Disabled in public Demo Safe Mode">
+              {{ deck_icon("lock", 12) }} Remove
+            </button>
+            {% else %}
             <form method="post" action="{{ url_for(bp_name ~ '.passkey_delete', credential_id=cred.credential_id) }}">
               <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
               <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger" data-deck-confirm-form
@@ -83,6 +94,7 @@
                 {{ deck_icon("trash", 12) }} Remove
               </button>
             </form>
+            {% endif %}
           </td>
         </tr>
         {% else %}

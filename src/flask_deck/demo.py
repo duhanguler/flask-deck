@@ -1904,6 +1904,7 @@ def create_demo_app(
     auto_daily_reset: bool = False,
     reset_timezone: str = "Europe/Istanbul",
     stateless_ephemeral_sessions: bool = False,
+    demo_safe_mode: bool = False,
 ) -> Flask:
     """Create the complete Acme Cloud Ops SaaS demo Flask application."""
     app = Flask(__name__)
@@ -1957,13 +1958,22 @@ def create_demo_app(
         enable_rest_api=True,
         enable_mcp=True,
         demo_role_switcher=True,
+        demo_safe_mode=demo_safe_mode,
         brand=BrandConfig(
             accent="monochrome",
             footer_note="Acme Cloud Ops",
             login_notice=(
-                f"SOC2 Type II Audited · Auto-Resets Daily at 00:00 ({reset_timezone})"
+                (
+                    f"Demo Safe Mode (IAM & Destructive Ops Locked) · Auto-Resets Daily at 00:00 ({reset_timezone})"
+                    if demo_safe_mode
+                    else f"SOC2 Type II Audited · Auto-Resets Daily at 00:00 ({reset_timezone})"
+                )
                 if auto_daily_reset
-                else "SOC2 Type II Audited · Select a Demo RBAC Profile Below"
+                else (
+                    "Demo Safe Mode (IAM & Destructive Ops Locked) · Select a Demo RBAC Profile Below"
+                    if demo_safe_mode
+                    else "SOC2 Type II Audited · Select a Demo RBAC Profile Below"
+                )
             ),
         ),
         demo_credentials=[

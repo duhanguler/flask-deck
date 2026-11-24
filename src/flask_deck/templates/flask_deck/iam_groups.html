@@ -11,6 +11,9 @@
     <p class="dk-page-sub">Configure visual model CRUD/ops permissions alongside field-level hidden, read-only, and masked guards.</p>
   </div>
   <div class="dk-page-actions">
+    {% if demo_safe_mode %}
+    <span class="dk-badge dk-badge-warn dk-mono">{{ deck_icon("lock", 11) }} DEMO LOCKED</span>
+    {% endif %}
     <a href="{{ url_for(bp_name ~ '.security_iam_users') }}" class="dk-btn">{{ deck_icon("users", 13) }} Users</a>
     {% if can_view_rbac %}
     <a href="{{ url_for(bp_name ~ '.rbac_matrix') }}" class="dk-btn">{{ deck_icon("shield", 13) }} Live RBAC Matrix</a>
@@ -22,13 +25,15 @@
 </div>
 
 <div class="dk-content">
+  {% set demo_lock_message = "Permission groups and 4-level RBAC field guards are visible for inspection, but creating, modifying, or deleting groups is disabled in public Demo Safe Mode." %}
+  {% include "flask_deck/partials/demo_lock_banner.html" %}
   <section class="dk-panel">
     <div class="dk-panel-head">
       <h2 class="dk-panel-title">
-        {% if editing_group %}Edit Group · <span class="dk-mono">{{ editing_group.name }}</span>{% else %}Create Permission Group{% endif %}
+        {% if editing_group %}{{ "Inspect Group" if demo_safe_mode else "Edit Group" }} · <span class="dk-mono">{{ editing_group.name }}</span>{% else %}Create Permission Group{% endif %}
       </h2>
       {% if editing_group %}
-      <a href="{{ url_for(bp_name ~ '.security_iam_groups') }}" class="dk-btn dk-btn-sm">Cancel</a>
+      <a href="{{ url_for(bp_name ~ '.security_iam_groups') }}" class="dk-btn dk-btn-sm">{{ "Close" if demo_safe_mode else "Cancel" }}</a>
       {% endif %}
     </div>
     <div class="dk-panel-body">
@@ -40,16 +45,16 @@
           {% if not editing_group %}
           <div class="dk-field dk-span-4">
             <label for="dk-g-name">Group Identifier *</label>
-            <input id="dk-g-name" type="text" name="name" class="dk-input dk-mono" required maxlength="80" placeholder="billing_ops">
+            <input id="dk-g-name" type="text" name="name" class="dk-input dk-mono" required maxlength="80" placeholder="billing_ops"{% if demo_safe_mode %} disabled{% endif %}>
           </div>
           {% endif %}
           <div class="dk-field dk-span-4">
             <label for="dk-g-label">Display Label</label>
-            <input id="dk-g-label" type="text" name="label" class="dk-input" value="{{ editing_group.label if editing_group else '' }}" maxlength="120" placeholder="Billing Operations">
+            <input id="dk-g-label" type="text" name="label" class="dk-input" value="{{ editing_group.label if editing_group else '' }}" maxlength="120" placeholder="Billing Operations"{% if demo_safe_mode %} disabled{% endif %}>
           </div>
           <div class="dk-field dk-span-{{ '8' if editing_group else '4' }}">
             <label for="dk-g-desc">Description</label>
-            <input id="dk-g-desc" type="text" name="description" class="dk-input" value="{{ editing_group.description if editing_group else '' }}" placeholder="Access scope summary">
+            <input id="dk-g-desc" type="text" name="description" class="dk-input" value="{{ editing_group.description if editing_group else '' }}" placeholder="Access scope summary"{% if demo_safe_mode %} disabled{% endif %}>
           </div>
         </div>
 
@@ -76,7 +81,7 @@
                   {% set pcode = m.slug ~ ':' ~ act %}
                   <td>
                     <input type="checkbox" name="perm" value="{{ pcode }}" aria-label="{{ m.slug }} {{ act }}"
-                           {% if editing_group and pcode in editing_group.permissions %} checked{% endif %}>
+                           {% if editing_group and pcode in editing_group.permissions %} checked{% endif %}{% if demo_safe_mode %} disabled{% endif %}>
                   </td>
                   {% endfor %}
                 </tr>
@@ -93,7 +98,7 @@
               {% for pcode, plabel in system_permissions %}
               {% if pcode != '*' or (current_user and current_user.is_superuser) %}
               <label class="dk-checkbox">
-                <input type="checkbox" name="perm" value="{{ pcode }}"{% if editing_group and pcode in editing_group.permissions %} checked{% endif %}>
+                <input type="checkbox" name="perm" value="{{ pcode }}"{% if editing_group and pcode in editing_group.permissions %} checked{% endif %}{% if demo_safe_mode %} disabled{% endif %}>
                 <span>{{ plabel }} <code class="dk-code">{{ pcode }}</code></span>
               </label>
               {% endif %}
@@ -102,7 +107,7 @@
           </div>
           <div class="dk-field dk-span-6">
             <label for="dk-g-extra">Extra Wildcards / Custom Action Patterns</label>
-            <textarea id="dk-g-extra" name="extra_permissions" rows="5" class="dk-textarea dk-mono" placeholder="*:view&#10;orders:action:mark_shipped">{{ extra_perms_text }}</textarea>
+            <textarea id="dk-g-extra" name="extra_permissions" rows="5" class="dk-textarea dk-mono" placeholder="*:view&#10;orders:action:mark_shipped"{% if demo_safe_mode %} disabled{% endif %}>{{ extra_perms_text }}</textarea>
             <div class="dk-help-text">One glob pattern per line or comma-separated (e.g. <code class="dk-code">*:view</code>, <code class="dk-code">orders:action:*</code>).</div>
           </div>
         </div>
@@ -110,21 +115,21 @@
         <div class="dk-grid">
           <div class="dk-field dk-span-4">
             <label for="dk-g-hidden">Hidden Fields (JSON)</label>
-            <textarea id="dk-g-hidden" name="hidden_fields_json" rows="4" class="dk-textarea dk-mono">{{ hidden_json }}</textarea>
+            <textarea id="dk-g-hidden" name="hidden_fields_json" rows="4" class="dk-textarea dk-mono"{% if demo_safe_mode %} disabled{% endif %}>{{ hidden_json }}</textarea>
           </div>
           <div class="dk-field dk-span-4">
             <label for="dk-g-ro">Read-Only Fields (JSON)</label>
-            <textarea id="dk-g-ro" name="readonly_fields_json" rows="4" class="dk-textarea dk-mono">{{ readonly_json }}</textarea>
+            <textarea id="dk-g-ro" name="readonly_fields_json" rows="4" class="dk-textarea dk-mono"{% if demo_safe_mode %} disabled{% endif %}>{{ readonly_json }}</textarea>
           </div>
           <div class="dk-field dk-span-4">
             <label for="dk-g-masked">Masked / PII Fields (JSON)</label>
-            <textarea id="dk-g-masked" name="masked_fields_json" rows="4" class="dk-textarea dk-mono">{{ masked_json }}</textarea>
+            <textarea id="dk-g-masked" name="masked_fields_json" rows="4" class="dk-textarea dk-mono"{% if demo_safe_mode %} disabled{% endif %}>{{ masked_json }}</textarea>
           </div>
         </div>
 
         <div>
-          <button type="submit" class="dk-btn dk-btn-primary">
-            {{ "Update Permission Group" if editing_group else "Create Permission Group" }}
+          <button type="submit" class="dk-btn dk-btn-primary"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>
+            {% if demo_safe_mode %}{{ deck_icon("lock", 12) }} {{ _("Disabled in Demo") }}{% else %}{{ "Update Permission Group" if editing_group else "Create Permission Group" }}{% endif %}
           </button>
         </div>
       </form>
@@ -153,7 +158,12 @@
           </td>
           <td class="dk-td-actions">
             <div class="dk-row-actions">
-              <a href="{{ url_for(bp_name ~ '.security_iam_groups', edit=grp.id) }}" class="dk-btn dk-btn-sm">{{ deck_icon("edit", 12) }} Edit</a>
+              <a href="{{ url_for(bp_name ~ '.security_iam_groups', edit=grp.id) }}" class="dk-btn dk-btn-sm">{{ deck_icon("eye" if demo_safe_mode else "edit", 12) }} {{ _("Inspect") if demo_safe_mode else _("Edit") }}</a>
+              {% if demo_safe_mode %}
+              <button type="button" class="dk-btn dk-btn-sm dk-btn-danger" disabled title="Disabled in public Demo Safe Mode">
+                {{ deck_icon("lock", 12) }} {{ _("Delete") }}
+              </button>
+              {% else %}
               <form method="post" action="{{ url_for(bp_name ~ '.security_iam_group_delete', group_id=grp.id) }}">
                 <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
                 <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger" data-deck-confirm-form
@@ -162,6 +172,7 @@
                   {{ deck_icon("trash", 12) }} Delete
                 </button>
               </form>
+              {% endif %}
             </div>
           </td>
         </tr>

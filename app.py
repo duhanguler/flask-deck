@@ -48,6 +48,11 @@ def _resolve_reset_timezone() -> str:
     return os.environ.get("FLASK_DECK_RESET_TIMEZONE", "Europe/Istanbul").strip() or "Europe/Istanbul"
 
 
+def _resolve_demo_safe_mode() -> bool:
+    raw = os.environ.get("FLASK_DECK_DEMO_SAFE_MODE", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 _db_uri = _resolve_db_uri()
 app = create_demo_app(
     db_uri=_db_uri,
@@ -56,6 +61,7 @@ app = create_demo_app(
     auto_daily_reset=_resolve_auto_reset(),
     reset_timezone=_resolve_reset_timezone(),
     stateless_ephemeral_sessions=(_db_uri == "sqlite:///:memory:"),
+    demo_safe_mode=_resolve_demo_safe_mode(),
 )
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)  # type: ignore[method-assign]
 if os.environ.get("VERCEL"):

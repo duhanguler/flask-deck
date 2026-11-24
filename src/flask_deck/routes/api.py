@@ -25,7 +25,12 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from flask_deck.adapters.sqlalchemy import decode_pk, encode_pk, extract_pk
 from flask_deck.audit import AuditEntry, compute_diff
 from flask_deck.cascade import analyze_delete_impact
-from flask_deck.exceptions import InvalidPKError, PermissionDeniedError, ValidationError
+from flask_deck.exceptions import (
+    InvalidPKError,
+    PermissionDeniedError,
+    ReadOnlyError,
+    ValidationError,
+)
 from flask_deck.filters import build_date_hierarchy_predicate, compute_filter_facets
 from flask_deck.i18n import to_user_timezone
 from flask_deck.icons import render_icon
@@ -876,6 +881,17 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         scope = cast(SavedViewScope, raw_scope)
 
         if scope in {"team", "role"}:
+            if deck.config.demo_safe_mode:
+                if _wants_json():
+                    return (
+                        jsonify(
+                            {"error": "Shared team/role saved views are locked in public Demo Safe Mode."}
+                        ),
+                        403,
+                    )
+                raise ReadOnlyError(
+                    "Shared team/role saved views are locked in public Demo Safe Mode."
+                )
             can_manage = user is not None and (
                 user.is_superuser or deck.auth.has_permission(user, "saved_views:manage")
             )
@@ -953,6 +969,19 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             if _wants_json():
                 return jsonify({"error": "Only the owner or superuser may delete this view."}), 403
             raise PermissionDeniedError("Only the owner or superuser may delete this view.")
+        if deck.config.demo_safe_mode and rec.scope in {"team", "role"}:
+            if _wants_json():
+                return (
+                    jsonify(
+                        {
+                            "error": "Shared team/role saved views cannot be deleted in public Demo Safe Mode."
+                        }
+                    ),
+                    403,
+                )
+            raise ReadOnlyError(
+                "Shared team/role saved views cannot be deleted in public Demo Safe Mode."
+            )
         deck.saved_view_store.delete(
             view_id, actor_id=user.id, is_superuser=user.is_superuser
         )

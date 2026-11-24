@@ -33,6 +33,7 @@
     <a href="{{ url_for(bp_name ~ '.model_edit', slug=view.meta.slug, raw_pk=pk_str, _return_qs=(return_qs or None)) }}" class="dk-btn dk-btn-primary">{{ deck_icon("edit", 13) }} {{ _("Edit") }}</a>
     {% endif %}
     {% if (can_force_delete if is_soft_deleted else can_delete) %}
+    {% set delete_demo_locked = demo_safe_mode and (is_soft_deleted or not view.soft_delete_column) %}
     <form method="post" action="{{ url_for(bp_name ~ '.model_delete', slug=view.meta.slug, raw_pk=pk_str) }}">
       <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
       <input type="hidden" name="_return_qs" value="{{ return_qs or '' }}">
@@ -40,12 +41,17 @@
       <button type="submit"
               class="dk-btn dk-btn-danger"
               data-deck-confirm-form
+              {% if delete_demo_locked %}
+              data-demo-locked="1"
+              data-demo-lock-msg="Dependency preview is live, but permanent deletion is disabled in public Demo Safe Mode."
+              title="Preview delete impact (permanent delete disabled in Demo Safe Mode)"
+              {% endif %}
               data-impact-url="{{ url_for(bp_name ~ '.api_delete_impact', slug=view.meta.slug) if config.enable_cascade_impact else '' }}"
               data-impact-pk="{{ pk_str }}"
               data-impact-force="{{ '1' if is_soft_deleted else '0' }}"
               data-confirm-title="{{ 'Permanently Delete' if is_soft_deleted else ('Move to Trash' if view.soft_delete_column else 'Delete') }} {{ view.label }}"
               data-confirm-msg="{{ 'Permanently erase' if (is_soft_deleted or not view.soft_delete_column) else 'Move to Trash:' }} {{ record_repr }}?">
-        {{ deck_icon("trash", 13) }} {{ "Force Delete" if is_soft_deleted else _("Delete") }}
+        {{ deck_icon("trash", 13) }} {{ "Force Delete" if is_soft_deleted else _("Delete") }}{% if delete_demo_locked %} {{ deck_icon("lock", 12) }}{% endif %}
       </button>
     </form>
     {% endif %}

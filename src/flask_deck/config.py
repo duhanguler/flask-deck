@@ -50,6 +50,7 @@ class DeckConfig:
     enable_sql_console: bool = False
     sql_console_max_rows: int = 200
     demo_role_switcher: bool = False
+    demo_safe_mode: bool = False
     # v0.3.0 Enterprise capabilities
     brand: BrandConfig = field(default_factory=BrandConfig)
     default_locale: str = "en"

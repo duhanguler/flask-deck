@@ -4,6 +4,7 @@ import csv
 import io
 import json
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -25,7 +26,7 @@ from flask_deck.audit import AuditEntry, compute_diff
 from flask_deck.exceptions import PermissionDeniedError, ValidationError
 from flask_deck.i18n import LOCALE_SESSION_KEY, TZ_SESSION_KEY, is_valid_timezone, normalize_locale
 from flask_deck.model_view import coerce_form_value
-from flask_deck.security import is_safe_redirect_url, sanitize_csv_cell
+from flask_deck.security import is_safe_redirect_url, mask_ip_address, sanitize_csv_cell
 
 if TYPE_CHECKING:
     from flask_deck.deck import Deck
@@ -106,6 +107,10 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
             offset=(page - 1) * limit,
         )
         entries = [deck._sanitize_audit_entry(e, user) for e in raw_entries]
+        if deck.config.demo_safe_mode:
+            entries = [
+                replace(e, actor_ip=mask_ip_address(e.actor_ip)) for e in entries
+            ]
         audit_models = [
             (slug, v)
             for slug, v in deck.views.items()
@@ -182,7 +187,12 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
                 if not batch:
                     break
                 for entry in batch:
-                    yield deck._sanitize_audit_entry(entry, user)
+                    safe_entry = deck._sanitize_audit_entry(entry, user)
+                    if deck.config.demo_safe_mode:
+                        safe_entry = replace(
+                            safe_entry, actor_ip=mask_ip_address(safe_entry.actor_ip)
+                        )
+                    yield safe_entry
                 offset += len(batch)
                 if offset >= total_cnt:
                     break

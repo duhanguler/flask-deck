@@ -1,0 +1,10 @@
+{% if demo_safe_mode %}
+<div class="dk-alert dk-alert-warn dk-demo-lock-banner" role="note">
+  <span class="dk-demo-lock-icon">{{ deck_icon("lock", 14) }}</span>
+  <div class="dk-demo-lock-copy">
+    <strong>{{ _("Demo Safe Mode") }} · {{ _("Read-Only Preview") }}</strong>
+    <span>{{ demo_lock_message or _("You can inspect every control on this page, but mutations are disabled in the public live demo so shared accounts and data remain intact.") }}</span>
+  </div>
+  <span class="dk-badge dk-badge-warn dk-mono">DEMO LOCKED</span>
+</div>
+{% endif %}

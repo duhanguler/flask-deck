@@ -11,6 +11,9 @@
     <p class="dk-page-sub">Database-backed operator accounts, role memberships, instant password reset, and active-superuser protection.</p>
   </div>
   <div class="dk-page-actions">
+    {% if demo_safe_mode %}
+    <span class="dk-badge dk-badge-warn dk-mono">{{ deck_icon("lock", 11) }} DEMO LOCKED</span>
+    {% endif %}
     <a href="{{ url_for(bp_name ~ '.security_iam_groups') }}" class="dk-btn">{{ deck_icon("shield", 13) }} Groups &amp; Roles</a>
     {% if editing_user %}
     <a href="{{ url_for(bp_name ~ '.security_iam_users') }}" class="dk-btn dk-btn-primary">{{ deck_icon("plus", 13) }} New User</a>
@@ -19,12 +22,14 @@
 </div>
 
 <div class="dk-content">
+  {% set demo_lock_message = "Operator accounts, role memberships, and password resets are visible for inspection, but creating, editing, deleting users, or resetting passwords is disabled in the public demo." %}
+  {% include "flask_deck/partials/demo_lock_banner.html" %}
   {% if editing_user %}
   <div class="dk-grid">
     <section class="dk-panel dk-span-8">
       <div class="dk-panel-head">
-        <h2 class="dk-panel-title">Edit User · <span class="dk-mono">{{ editing_user.username }}</span></h2>
-        <a href="{{ url_for(bp_name ~ '.security_iam_users') }}" class="dk-btn dk-btn-sm">Cancel</a>
+        <h2 class="dk-panel-title">{{ "Inspect User" if demo_safe_mode else "Edit User" }} · <span class="dk-mono">{{ editing_user.username }}</span></h2>
+        <a href="{{ url_for(bp_name ~ '.security_iam_users') }}" class="dk-btn dk-btn-sm">{{ "Close" if demo_safe_mode else "Cancel" }}</a>
       </div>
       <div class="dk-panel-body">
         <form method="post" action="{{ url_for(bp_name ~ '.security_iam_user_update', user_id=editing_user.id) }}" class="dk-content">
@@ -32,15 +37,15 @@
           <div class="dk-grid">
             <div class="dk-field dk-span-4">
               <label for="dk-u-display">Display Name</label>
-              <input id="dk-u-display" type="text" name="display_name" class="dk-input" value="{{ editing_user.display_name }}" required maxlength="160">
+              <input id="dk-u-display" type="text" name="display_name" class="dk-input" value="{{ editing_user.display_name }}" required maxlength="160"{% if demo_safe_mode %} disabled{% endif %}>
             </div>
             <div class="dk-field dk-span-4">
               <label for="dk-u-email">Email</label>
-              <input id="dk-u-email" type="email" name="email" class="dk-input" value="{{ editing_user.email }}" maxlength="255">
+              <input id="dk-u-email" type="email" name="email" class="dk-input" value="{{ editing_user.email }}" maxlength="255"{% if demo_safe_mode %} disabled{% endif %}>
             </div>
             <div class="dk-field dk-span-4">
               <label for="dk-u-tenant">Tenant ID (optional)</label>
-              <input id="dk-u-tenant" type="text" name="tenant_id" class="dk-input dk-mono" value="{{ editing_user.tenant_id or '' }}" maxlength="120">
+              <input id="dk-u-tenant" type="text" name="tenant_id" class="dk-input dk-mono" value="{{ editing_user.tenant_id or '' }}" maxlength="120"{% if demo_safe_mode %} disabled{% endif %}>
             </div>
           </div>
           <div class="dk-field">
@@ -48,7 +53,7 @@
             <div class="dk-chip-group">
               {% for grp in groups %}
               <label class="dk-checkbox">
-                <input type="checkbox" name="group_ids" value="{{ grp.id }}"{% if grp.id in editing_user.group_ids %} checked{% endif %}>
+                <input type="checkbox" name="group_ids" value="{{ grp.id }}"{% if grp.id in editing_user.group_ids %} checked{% endif %}{% if demo_safe_mode %} disabled{% endif %}>
                 <span>{{ grp.label }} <span class="dk-subtle dk-mono">({{ grp.name }})</span></span>
               </label>
               {% endfor %}
@@ -56,18 +61,20 @@
           </div>
           <div class="dk-chip-group">
             <label class="dk-checkbox">
-              <input type="checkbox" name="is_active" value="1"{% if editing_user.is_active %} checked{% endif %}>
+              <input type="checkbox" name="is_active" value="1"{% if editing_user.is_active %} checked{% endif %}{% if demo_safe_mode %} disabled{% endif %}>
               <span>Account Active</span>
             </label>
             {% if current_user and current_user.is_superuser %}
             <label class="dk-checkbox">
-              <input type="checkbox" name="is_superuser" value="1"{% if editing_user.is_superuser %} checked{% endif %}>
+              <input type="checkbox" name="is_superuser" value="1"{% if editing_user.is_superuser %} checked{% endif %}{% if demo_safe_mode %} disabled{% endif %}>
               <span>Superuser (unrestricted access)</span>
             </label>
             {% endif %}
           </div>
           <div>
-            <button type="submit" class="dk-btn dk-btn-primary">Save Changes</button>
+            <button type="submit" class="dk-btn dk-btn-primary"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>
+              {% if demo_safe_mode %}{{ deck_icon("lock", 12) }} {{ _("Disabled in Demo") }}{% else %}Save Changes{% endif %}
+            </button>
           </div>
         </form>
       </div>
@@ -82,10 +89,12 @@
           <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
           <div class="dk-field">
             <label for="dk-u-reset-pwd">New Temporary Password</label>
-            <input id="dk-u-reset-pwd" type="password" name="new_password" class="dk-input" required minlength="8" autocomplete="new-password">
+            <input id="dk-u-reset-pwd" type="password" name="new_password" class="dk-input" required minlength="8" autocomplete="new-password"{% if demo_safe_mode %} disabled{% endif %}>
             <div class="dk-help-text">Revokes all active sessions for this user immediately.</div>
           </div>
-          <button type="submit" class="dk-btn dk-btn-danger">{{ deck_icon("key", 13) }} Reset Password &amp; Sign Out</button>
+          <button type="submit" class="dk-btn dk-btn-danger"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>
+            {{ deck_icon("lock" if demo_safe_mode else "key", 13) }} {{ _("Disabled in Demo") if demo_safe_mode else "Reset Password & Sign Out" }}
+          </button>
         </form>
       </div>
     </section>
@@ -101,32 +110,32 @@
         <div class="dk-grid">
           <div class="dk-field dk-span-3">
             <label for="dk-nu-user">Username *</label>
-            <input id="dk-nu-user" type="text" name="username" class="dk-input" required maxlength="120" placeholder="ops@acme.dev">
+            <input id="dk-nu-user" type="text" name="username" class="dk-input" required maxlength="120" placeholder="ops@acme.dev"{% if demo_safe_mode %} disabled{% endif %}>
           </div>
           <div class="dk-field dk-span-3">
             <label for="dk-nu-disp">Display Name</label>
-            <input id="dk-nu-disp" type="text" name="display_name" class="dk-input" maxlength="160" placeholder="Jane Doe">
+            <input id="dk-nu-disp" type="text" name="display_name" class="dk-input" maxlength="160" placeholder="Jane Doe"{% if demo_safe_mode %} disabled{% endif %}>
           </div>
           <div class="dk-field dk-span-3">
             <label for="dk-nu-email">Email</label>
-            <input id="dk-nu-email" type="email" name="email" class="dk-input" maxlength="255" placeholder="ops@acme.dev">
+            <input id="dk-nu-email" type="email" name="email" class="dk-input" maxlength="255" placeholder="ops@acme.dev"{% if demo_safe_mode %} disabled{% endif %}>
           </div>
           <div class="dk-field dk-span-3">
             <label for="dk-nu-pwd">Initial Password *</label>
-            <input id="dk-nu-pwd" type="password" name="password" class="dk-input" required minlength="8" autocomplete="new-password">
+            <input id="dk-nu-pwd" type="password" name="password" class="dk-input" required minlength="8" autocomplete="new-password"{% if demo_safe_mode %} disabled{% endif %}>
           </div>
         </div>
         <div class="dk-grid">
           <div class="dk-field dk-span-4">
             <label for="dk-nu-tenant">Tenant ID (optional)</label>
-            <input id="dk-nu-tenant" type="text" name="tenant_id" class="dk-input dk-mono" maxlength="120">
+            <input id="dk-nu-tenant" type="text" name="tenant_id" class="dk-input dk-mono" maxlength="120"{% if demo_safe_mode %} disabled{% endif %}>
           </div>
           <div class="dk-field dk-span-8">
             <label>Assign Groups</label>
             <div class="dk-chip-group">
               {% for grp in groups %}
               <label class="dk-checkbox">
-                <input type="checkbox" name="group_ids" value="{{ grp.id }}">
+                <input type="checkbox" name="group_ids" value="{{ grp.id }}"{% if demo_safe_mode %} disabled{% endif %}>
                 <span>{{ grp.label }} <span class="dk-subtle dk-mono">({{ grp.name }})</span></span>
               </label>
               {% endfor %}
@@ -135,18 +144,20 @@
         </div>
         <div class="dk-chip-group">
           <label class="dk-checkbox">
-            <input type="checkbox" name="is_active" value="1" checked>
+            <input type="checkbox" name="is_active" value="1" checked{% if demo_safe_mode %} disabled{% endif %}>
             <span>Active</span>
           </label>
           {% if current_user and current_user.is_superuser %}
           <label class="dk-checkbox">
-            <input type="checkbox" name="is_superuser" value="1">
+            <input type="checkbox" name="is_superuser" value="1"{% if demo_safe_mode %} disabled{% endif %}>
             <span>Superuser</span>
           </label>
           {% endif %}
         </div>
         <div>
-          <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("plus", 13) }} Create User</button>
+          <button type="submit" class="dk-btn dk-btn-primary"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>
+            {{ deck_icon("lock" if demo_safe_mode else "plus", 13) }} {{ _("Disabled in Demo") if demo_safe_mode else "Create User" }}
+          </button>
         </div>
       </form>
     </div>
@@ -182,7 +193,12 @@
           <td class="dk-mono dk-subtle">{{ format_dt(u.last_login_at) if u.last_login_at else "Never" }}</td>
           <td class="dk-td-actions">
             <div class="dk-row-actions">
-              <a href="{{ url_for(bp_name ~ '.security_iam_users', edit=u.id) }}" class="dk-btn dk-btn-sm">{{ deck_icon("edit", 12) }} Edit</a>
+              <a href="{{ url_for(bp_name ~ '.security_iam_users', edit=u.id) }}" class="dk-btn dk-btn-sm">{{ deck_icon("eye" if demo_safe_mode else "edit", 12) }} {{ _("Inspect") if demo_safe_mode else _("Edit") }}</a>
+              {% if demo_safe_mode %}
+              <button type="button" class="dk-btn dk-btn-sm dk-btn-danger" disabled title="Disabled in public Demo Safe Mode">
+                {{ deck_icon("lock", 12) }} {{ _("Delete") }}
+              </button>
+              {% else %}
               <form method="post" action="{{ url_for(bp_name ~ '.security_iam_user_delete', user_id=u.id) }}">
                 <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
                 <button type="submit" class="dk-btn dk-btn-sm dk-btn-danger" data-deck-confirm-form
@@ -191,6 +207,7 @@
                   {{ deck_icon("trash", 12) }} Delete
                 </button>
               </form>
+              {% endif %}
             </div>
           </td>
         </tr>

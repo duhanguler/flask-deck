@@ -28,7 +28,12 @@ from werkzeug.datastructures import MultiDict
 from flask_deck.adapters.sqlalchemy import decode_pk, encode_pk, extract_pk
 from flask_deck.approvals import make_approval_request
 from flask_deck.audit import AuditEntry, compute_diff
-from flask_deck.exceptions import ImportLimitError, PermissionDeniedError, ValidationError
+from flask_deck.exceptions import (
+    ImportLimitError,
+    PermissionDeniedError,
+    ReadOnlyError,
+    ValidationError,
+)
 from flask_deck.exporter import iter_export_chunks, stream_export_response
 from flask_deck.filters import (
     collect_shared_facet_exprs,
@@ -1588,6 +1593,8 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         force_delete = request.form.get("force", "").strip() == "1"
         if view.soft_delete_column and force_delete:
             deck._require_perm(f"{slug}:force_delete", model_slug=slug)
+        if deck.config.demo_safe_mode and (not view.soft_delete_column or force_delete):
+            raise ReadOnlyError("Permanent record deletion is disabled in public Demo Safe Mode.")
         obj, pk_vals = deck._fetch_scoped_record(view, raw_pk)
         deck._require_perm(f"{slug}:delete", model_slug=slug, obj=obj)
         cur_user = deck._current_user()
@@ -1844,6 +1851,18 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 flash("Select at least one record.", "warn")
                 return redirect(list_return_url)
             decoded_pks = [decode_pk(p, view.meta) for p in raw_pks]
+
+        if deck.config.demo_safe_mode:
+            if action_name == "force_delete" or (
+                action_name == "delete" and not view.soft_delete_column
+            ):
+                raise ReadOnlyError(
+                    "Permanent bulk deletion is disabled in public Demo Safe Mode."
+                )
+            if select_across:
+                raise ReadOnlyError(
+                    "Select-across mass actions are disabled in public Demo Safe Mode."
+                )
 
         def _load_pk_batch(session_obj: Any, pk_batch: list[tuple[Any, ...]]) -> list[Any]:
             q = view.scope_query(sa.select(view.model), user)
@@ -2674,6 +2693,10 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         if request.method == "POST":
             step = request.form.get("step", "preview").strip().lower()
             if step == "commit":
+                if deck.config.demo_safe_mode:
+                    raise ReadOnlyError(
+                        "Committing imports is disabled in public Demo Safe Mode (Dry-Run SAVEPOINT preview remains available)."
+                    )
                 token = request.form.get("preview_token", "").strip()
                 skip_errors = request.form.get("skip_errors") in {"1", "true", "on"}
                 async_commit = request.form.get("async_commit") in {"1", "true", "on"}

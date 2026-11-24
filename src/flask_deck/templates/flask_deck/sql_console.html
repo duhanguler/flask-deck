@@ -58,6 +58,9 @@
   <section class="dk-panel">
     <div class="dk-panel-head">
       <h2 class="dk-panel-title">Save &amp; Pin to Dashboard</h2>
+      {% if demo_safe_mode %}
+      <span class="dk-badge dk-badge-warn dk-mono">{{ deck_icon("lock", 11) }} DEMO LOCKED</span>
+      {% endif %}
     </div>
     <form method="post" action="{{ url_for(bp_name ~ '.sql_save') }}" class="dk-panel-body">
       <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
@@ -65,12 +68,14 @@
       <input type="hidden" name="bind_key" value="{{ selected_bind }}">
       <input type="hidden" name="chart_type" value="{{ chart_type }}">
       <div class="dk-toolbar-left">
-        <input type="text" name="name" class="dk-input" required maxlength="120" placeholder="Saved query name (e.g. Daily Orders)">
+        <input type="text" name="name" class="dk-input" required maxlength="120" placeholder="Saved query name (e.g. Daily Orders)"{% if demo_safe_mode %} disabled{% endif %}>
         <label class="dk-checkbox">
-          <input type="checkbox" name="pin" value="1">
+          <input type="checkbox" name="pin" value="1"{% if demo_safe_mode %} disabled{% endif %}>
           <span>Pin to Dashboard</span>
         </label>
-        <button type="submit" class="dk-btn dk-btn-sm dk-btn-primary">{{ deck_icon("bookmark", 12) }} Save Query</button>
+        <button type="submit" class="dk-btn dk-btn-sm dk-btn-primary"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>
+          {{ deck_icon("lock" if demo_safe_mode else "bookmark", 12) }} {{ _("Disabled in Demo") if demo_safe_mode else "Save Query" }}
+        </button>
       </div>
     </form>
   </section>
@@ -96,6 +101,10 @@
         </div>
         {% if can_save_queries and (is_superuser or sq.owner_id == current_user_id) %}
         <div class="dk-page-actions">
+          {% if demo_safe_mode %}
+          <button type="button" class="dk-btn dk-btn-sm" disabled title="Disabled in public Demo Safe Mode">{{ deck_icon("lock", 12) }} {{ "Unpin" if sq.is_pinned_to_dashboard else "Pin" }}</button>
+          <button type="button" class="dk-btn dk-btn-ghost dk-btn-sm" disabled title="Disabled in public Demo Safe Mode" aria-label="Delete saved query (disabled in demo)">{{ deck_icon("trash", 12) }}</button>
+          {% else %}
           <form method="post" action="{{ url_for(bp_name ~ '.sql_pin', query_id=sq.id) }}">
             <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
             <button type="submit" class="dk-btn dk-btn-sm">{{ "Unpin" if sq.is_pinned_to_dashboard else "Pin" }}</button>
@@ -104,6 +113,7 @@
             <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
             <button type="submit" class="dk-btn dk-btn-ghost dk-btn-sm" aria-label="Delete saved query">{{ deck_icon("trash", 12) }}</button>
           </form>
+          {% endif %}
         </div>
         {% endif %}
       </div>

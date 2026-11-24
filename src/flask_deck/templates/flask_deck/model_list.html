@@ -185,12 +185,12 @@
             <select id="dk-sv-scope" name="scope" class="dk-select">
               <option value="personal">Personal</option>
               {% if can_manage_shared_views %}
-              <option value="team">Team (shared)</option>
-              <option value="role">Role Default</option>
+              <option value="team"{% if demo_safe_mode %} disabled{% endif %}>{{ "Team (shared · Demo Locked)" if demo_safe_mode else "Team (shared)" }}</option>
+              <option value="role"{% if demo_safe_mode %} disabled{% endif %}>{{ "Role Default (Demo Locked)" if demo_safe_mode else "Role Default" }}</option>
               {% endif %}
             </select>
           </div>
-          {% if can_manage_shared_views %}
+          {% if can_manage_shared_views and not demo_safe_mode %}
           <div class="dk-field">
             <label for="dk-sv-role">Role (if Role Default)</label>
             <input id="dk-sv-role" type="text" name="default_for_role" class="dk-input" maxlength="64" placeholder="support">
@@ -242,10 +242,14 @@
       {{ deck_icon("bookmark", 11) }} {{ sv.name }} <span class="dk-badge dk-mono">{{ sv.scope }}</span>
     </a>
     {% if is_superuser or sv.owner_id == current_user_id %}
-    <form method="post" action="{{ url_for(bp_name ~ '.api_saved_view_delete', slug=view.meta.slug, view_id=sv.id) }}">
-      <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
-      <button type="submit" class="dk-btn dk-btn-ghost dk-btn-sm" aria-label="Delete saved view">{{ deck_icon("x", 11) }}</button>
-    </form>
+      {% if demo_safe_mode and sv.scope in ['team', 'role'] %}
+      <button type="button" class="dk-btn dk-btn-ghost dk-btn-sm" disabled title="Shared showcase views are locked in Demo Safe Mode" aria-label="Shared view locked">{{ deck_icon("lock", 11) }}</button>
+      {% else %}
+      <form method="post" action="{{ url_for(bp_name ~ '.api_saved_view_delete', slug=view.meta.slug, view_id=sv.id) }}">
+        <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+        <button type="submit" class="dk-btn dk-btn-ghost dk-btn-sm" aria-label="Delete saved view">{{ deck_icon("x", 11) }}</button>
+      </form>
+      {% endif %}
     {% endif %}
   </span>
   {% endfor %}
@@ -782,7 +786,7 @@
   <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
 </form>
 
-<div class="dk-bulk-dock" id="dk-bulk-dock" hidden="hidden" role="region" aria-label="Bulk actions">
+<div class="dk-bulk-dock" id="dk-bulk-dock" hidden="hidden" role="region" aria-label="Bulk actions"{% if demo_safe_mode %} data-demo-safe="1"{% endif %}>
   <strong id="dk-bulk-count" class="dk-mono dk-tabular">0 selected</strong>
   {% if can_export %}
   <a class="dk-btn dk-btn-sm" data-deck-export-selected data-base-href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='csv', trashed=('1' if trashed else None)) }}" data-base-filtered-href="{{ url_for(bp_name ~ '.model_export', slug=view.meta.slug, fmt='csv') }}">Export CSV</a>
@@ -805,10 +809,11 @@
           data-url="{{ url_for(bp_name ~ '.model_action', slug=view.meta.slug, action_name='force_delete') }}"
           data-label="Force Delete Selected"
           data-confirm="true"
+          {% if demo_safe_mode %}data-demo-locked="1" data-demo-lock-msg="Dependency preview is live, but permanent bulk deletion is disabled in public Demo Safe Mode."{% endif %}
           data-impact-url="{{ url_for(bp_name ~ '.api_delete_impact', slug=view.meta.slug) if config.enable_cascade_impact else '' }}"
           data-impact-force="true"
           {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="DELETE {n}"{% endif %}>
-    {{ deck_icon("trash", 12) }} Force Delete
+    {{ deck_icon("trash", 12) }} Force Delete{% if demo_safe_mode %} {{ deck_icon("lock", 11) }}{% endif %}
   </button>
   {% endif %}
   {% else %}
@@ -825,16 +830,18 @@
   </button>
   {% endfor %}
   {% if can_delete %}
+  {% set bulk_del_locked = demo_safe_mode and not view.soft_delete_column %}
   <button type="button"
           class="dk-btn dk-btn-sm dk-btn-danger"
           data-deck-bulk-action
           data-url="{{ url_for(bp_name ~ '.model_action', slug=view.meta.slug, action_name='delete') }}"
           data-label="Delete Selected"
           data-confirm="true"
+          {% if bulk_del_locked %}data-demo-locked="1" data-demo-lock-msg="Dependency preview is live, but permanent bulk deletion is disabled in public Demo Safe Mode."{% endif %}
           data-impact-url="{{ url_for(bp_name ~ '.api_delete_impact', slug=view.meta.slug) if config.enable_cascade_impact else '' }}"
           data-impact-force="false"
           {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="DELETE {n}"{% endif %}>
-    {{ deck_icon("trash", 12) }} {{ _("Delete") }}
+    {{ deck_icon("trash", 12) }} {{ _("Delete") }}{% if bulk_del_locked %} {{ deck_icon("lock", 11) }}{% endif %}
   </button>
   {% endif %}
   {% endif %}

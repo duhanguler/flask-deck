@@ -101,17 +101,23 @@
         </td>
         <td class="dk-td-actions">
           {% if can_revert and entry.is_revertible %}
-          <form method="post" action="{{ url_for(bp_name ~ '.audit_revert', entry_id=entry.id) }}">
-            <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
-            <button type="submit"
-                    class="dk-btn dk-btn-sm"
-                    data-deck-confirm-form
-                    data-confirm-title="Revert Mutation"
-                    data-confirm-msg="Restore previous field values on {{ entry.record_repr }}?"
-                    {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="REVERT"{% endif %}>
-              {{ deck_icon("rotate-ccw", 12) }} Revert
+            {% if demo_safe_mode %}
+            <button type="button" class="dk-btn dk-btn-sm" disabled title="Audit rollback is disabled in public Demo Safe Mode">
+              {{ deck_icon("lock", 12) }} Revert
             </button>
-          </form>
+            {% else %}
+            <form method="post" action="{{ url_for(bp_name ~ '.audit_revert', entry_id=entry.id) }}">
+              <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+              <button type="submit"
+                      class="dk-btn dk-btn-sm"
+                      data-deck-confirm-form
+                      data-confirm-title="Revert Mutation"
+                      data-confirm-msg="Restore previous field values on {{ entry.record_repr }}?"
+                      {% if config.environment == 'production' and config.require_confirm_text_in_prod %}data-confirm-phrase="REVERT"{% endif %}>
+                {{ deck_icon("rotate-ccw", 12) }} Revert
+              </button>
+            </form>
+            {% endif %}
           {% else %}
           <span class="dk-null">—</span>
           {% endif %}

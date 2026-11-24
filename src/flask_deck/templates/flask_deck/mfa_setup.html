@@ -11,6 +11,9 @@
     <p class="dk-page-sub">Zero-dependency RFC 6238 authenticator protection with replay defense &amp; single-use recovery codes.</p>
   </div>
   <div class="dk-page-actions">
+    {% if demo_safe_mode %}
+    <span class="dk-badge dk-badge-warn dk-mono">{{ deck_icon("lock", 11) }} DEMO LOCKED</span>
+    {% endif %}
     {% if enrollment and enrollment.enabled %}
     <span class="dk-badge dk-badge-ok dk-mono"><span class="dk-dot"></span>MFA ACTIVE</span>
     {% else %}
@@ -20,6 +23,8 @@
 </div>
 
 <div class="dk-content">
+  {% set demo_lock_message = "Pure SSR SVG QR code and Base32 secret generation are live for inspection, while activating or disabling 2FA is locked so shared demo accounts remain accessible to everyone." %}
+  {% include "flask_deck/partials/demo_lock_banner.html" %}
   {% if error_msg %}
   <div class="dk-alert dk-alert-danger" role="alert">{{ error_msg }}</div>
   {% endif %}
@@ -63,14 +68,20 @@
         <div class="dk-field">
           <label for="dk-mfa-disable-code">Confirm Current 6-Digit Authenticator or Recovery Code</label>
           <input type="text" id="dk-mfa-disable-code" name="code" class="dk-input dk-mono dk-tabular"
-                 placeholder="123456 or ABCD-1234" autocomplete="one-time-code" required>
+                 placeholder="123456 or ABCD-1234" autocomplete="one-time-code" required{% if demo_safe_mode %} disabled{% endif %}>
         </div>
         <div>
+          {% if demo_safe_mode %}
+          <button type="button" class="dk-btn dk-btn-danger" disabled title="Disabled in public Demo Safe Mode">
+            {{ deck_icon("lock", 13) }} {{ _("Disabled in Demo") }}
+          </button>
+          {% else %}
           <button type="submit" class="dk-btn dk-btn-danger" data-deck-confirm-form
                   data-confirm-title="Disable 2FA"
                   data-confirm-msg="Disable two-factor authentication for your account?">
             {{ deck_icon("shield", 13) }} Disable 2FA
           </button>
+          {% endif %}
         </div>
       </form>
       {% endif %}
@@ -107,10 +118,12 @@
           <div class="dk-field">
             <label for="dk-mfa-activate-code">6-Digit Verification Code</label>
             <input type="text" id="dk-mfa-activate-code" name="code" class="dk-input dk-mono dk-tabular"
-                   placeholder="000000" inputmode="numeric" autocomplete="one-time-code" required>
+                   placeholder="000000" inputmode="numeric" autocomplete="one-time-code" required{% if demo_safe_mode %} disabled{% endif %}>
           </div>
           <div>
-            <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("shield-check", 13) }} Activate 2FA</button>
+            <button type="submit" class="dk-btn dk-btn-primary"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>
+              {{ deck_icon("lock" if demo_safe_mode else "shield-check", 13) }} {{ _("Disabled in Demo") if demo_safe_mode else "Activate 2FA" }}
+            </button>
           </div>
         </form>
       </div>

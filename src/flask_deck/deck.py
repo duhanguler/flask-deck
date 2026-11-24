@@ -1756,6 +1756,7 @@ class Deck:
             "deck_version": __version__,
             "deck_version_short": SHORT_VERSION,
             "config": self.config,
+            "demo_safe_mode": self.config.demo_safe_mode,
             "brand": self.config.brand,
             "brand_css_hash": self._brand_css_hash,
             "bp_name": bp_name,
@@ -2725,6 +2726,15 @@ class Deck:
                 g._deck_api_key = key_rec
                 g._deck_real_user = None
                 g._deck_user = api_key_to_user(key_rec)
+                if (
+                    deck.config.demo_safe_mode
+                    and endpoint.startswith(f"{bp_name}.rest_v1_")
+                    and request.method not in {"GET", "HEAD", "OPTIONS"}
+                ):
+                    return (
+                        jsonify({"error": "Write REST API requests are disabled in public Demo Safe Mode."}),
+                        403,
+                    )  # type: ignore[return-value]
                 return None
 
             # 2. Strict CSRF + Origin/Sec-Fetch-Site validation on EVERY cookie mutation
@@ -2819,6 +2829,50 @@ class Deck:
                         next_target = url_for(f"{bp_name}.index")
                     return redirect(url_for(f"{bp_name}.login", next=next_target))  # type: ignore[return-value]
                 abort(403, description="Authentication required.")
+
+            if (
+                deck.config.demo_safe_mode
+                and request.method not in {"GET", "HEAD", "OPTIONS"}
+            ):
+                _demo_locked_endpoints = {
+                    f"{bp_name}.security_change_password",
+                    f"{bp_name}.security_iam_user_create",
+                    f"{bp_name}.security_iam_user_update",
+                    f"{bp_name}.security_iam_user_reset_password",
+                    f"{bp_name}.security_iam_user_delete",
+                    f"{bp_name}.security_iam_group_create",
+                    f"{bp_name}.security_iam_group_update",
+                    f"{bp_name}.security_iam_group_delete",
+                    f"{bp_name}.security_mfa",
+                    f"{bp_name}.security_session_revoke",
+                    f"{bp_name}.security_sessions_revoke_others",
+                    f"{bp_name}.passkey_register_options",
+                    f"{bp_name}.passkey_register_verify",
+                    f"{bp_name}.passkey_delete",
+                    f"{bp_name}.security_api_keys_create",
+                    f"{bp_name}.security_api_keys_revoke",
+                    f"{bp_name}.webhooks_test",
+                    f"{bp_name}.webhook_redeliver",
+                    f"{bp_name}.sql_save",
+                    f"{bp_name}.sql_pin",
+                    f"{bp_name}.sql_delete",
+                    f"{bp_name}.audit_revert",
+                }
+                if endpoint in _demo_locked_endpoints:
+                    if (
+                        is_api
+                        or endpoint
+                        in {
+                            f"{bp_name}.passkey_register_options",
+                            f"{bp_name}.passkey_register_verify",
+                        }
+                        or "application/json" in (request.headers.get("Accept") or "")
+                    ):
+                        return (
+                            jsonify({"error": "This action is disabled in public Demo Safe Mode."}),
+                            403,
+                        )  # type: ignore[return-value]
+                    raise ReadOnlyError("This action is disabled in public Demo Safe Mode.")
 
             # 4. Enforce require_mfa_for_superusers whenever configured with an active MFA store
             if (

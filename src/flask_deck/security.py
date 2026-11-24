@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import re
 import secrets
@@ -561,3 +562,19 @@ class RedisRateLimitStore:
     def record_success(self, ip: str, username: str = "") -> None:
         for key in _bucket_keys(ip, username)[1:]:
             self._client.delete(self._rkey(key))
+
+
+def mask_ip_address(raw_ip: str) -> str:
+    """Mask an IPv4/IPv6 address to a non-identifying prefix for public demo displays."""
+    clean = str(raw_ip or "").strip()
+    if not clean:
+        return "redacted"
+    try:
+        addr = ipaddress.ip_address(clean)
+    except ValueError:
+        return "redacted"
+    if isinstance(addr, ipaddress.IPv4Address):
+        parts = str(addr).split(".")
+        return f"{parts[0]}.{parts[1]}.xxx.xxx"
+    parts6 = addr.exploded.split(":")
+    return f"{parts6[0]}:{parts6[1]}::xxxx"

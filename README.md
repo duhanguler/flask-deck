@@ -44,8 +44,9 @@ Open `http://127.0.0.1:5055/admin/` and explore the **`showcase`** control-plane
 #### Deploy Live Demo on Vercel
 
 `flask-deck` includes a zero-config Vercel Flask entrypoint ([app.py](https://github.com/duhanguler/flask-deck/blob/main/app.py)) and [vercel.json](https://github.com/duhanguler/flask-deck/blob/main/vercel.json) scheduled reset configuration:
+- **Demo Safe Mode (`FLASK_DECK_DEMO_SAFE_MODE=1` default on Vercel):** Keeps every IAM, 2FA/Passkey, API Key, Webhook, Saved Query, Dry-Run Import, and Cascade Delete Impact control **visible for inspection** (`DEMO SAFE` / `DEMO LOCKED` badges + masked visitor IPs) while enforcing fail-closed HTTP `403` guards against mutating users/groups, rotating demo credentials, revoking keys/sessions, committing imports, running write REST/MCP calls, or permanently deleting records.
 - **Daily `00:00` (`Europe/Istanbul`) Auto-Reset:** Vercel Schedules invokes `POST /api/cron/reset-demo` daily at `00:00 Europe/Istanbul` (protected by Bearer `CRON_SECRET`), and an in-process day-rollover guard automatically resets ephemeral/persistent demo state across midnight on the next request.
-- **Optional Environment Variables:** `CRON_SECRET` (recommended on Vercel), `DATABASE_URL` / `FLASK_DECK_DEMO_DB_URI` (optional Postgres backing), `FLASK_DECK_SECRET_KEY`, `FLASK_DECK_DEMO_PROFILE` (`showcase` default or `standard`), `FLASK_DECK_AUTO_DAILY_RESET` (`1` default), `FLASK_DECK_RESET_TIMEZONE` (`Europe/Istanbul` default).
+- **Optional Environment Variables:** `CRON_SECRET` (recommended on Vercel), `DATABASE_URL` / `FLASK_DECK_DEMO_DB_URI` (optional Postgres backing), `FLASK_DECK_SECRET_KEY`, `FLASK_DECK_DEMO_PROFILE` (`showcase` default or `standard`), `FLASK_DECK_DEMO_SAFE_MODE` (`1` default in `app.py`), `FLASK_DECK_AUTO_DAILY_RESET` (`1` default), `FLASK_DECK_RESET_TIMEZONE` (`Europe/Istanbul` default).
 
 Optional extras (zero mandatory bloat in the base wheel):
 

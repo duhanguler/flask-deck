@@ -231,6 +231,10 @@ def register_ops_routes(bp: Blueprint, deck: Deck) -> None:
                 "info",
             ),
         ]
+        if deck.config.demo_safe_mode:
+            checks.append(
+                ("Demo Safe Mode", "Active (IAM, Security & Destructive Ops Locked)", "info")
+            )
         lens_info = detect_flask_lens(deck.app)
         if lens_info is not None:
             checks.append(

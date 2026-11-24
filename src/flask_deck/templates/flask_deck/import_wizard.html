@@ -104,6 +104,8 @@
   {% endif %}
 
   {% if report %}
+  {% set demo_lock_message = "CSV/JSON/XLSX parsing, column mapping, and SQLAlchemy SAVEPOINT Dry-Run Diff validation work live, while committing rows to the database is disabled in public Demo Safe Mode." %}
+  {% include "flask_deck/partials/demo_lock_banner.html" %}
   <div class="dk-grid">
     <div class="dk-kpi dk-span-3">
       <div class="dk-kpi-top"><span>Creates (+INSERT)</span></div>
@@ -139,12 +141,14 @@
           <input type="hidden" name="step" value="commit">
           <input type="hidden" name="preview_token" value="{{ report.token }}">
           {% if report.errors > 0 %}
-          <label class="dk-pop-item"><input type="checkbox" name="skip_errors" value="1"> Skip {{ report.errors }} errored row(s)</label>
+          <label class="dk-pop-item"><input type="checkbox" name="skip_errors" value="1"{% if demo_safe_mode %} disabled{% endif %}> Skip {{ report.errors }} errored row(s)</label>
           {% endif %}
           {% if can_view_jobs %}
-          <label class="dk-pop-item"><input type="checkbox" name="async_commit" value="1"> Run as Background Job</label>
+          <label class="dk-pop-item"><input type="checkbox" name="async_commit" value="1"{% if demo_safe_mode %} disabled{% endif %}> Run as Background Job</label>
           {% endif %}
-          <button type="submit" class="dk-btn dk-btn-primary">{{ deck_icon("check", 13) }} Commit {{ report.applicable_count }} Change(s)</button>
+          <button type="submit" class="dk-btn dk-btn-primary"{% if demo_safe_mode %} disabled title="Disabled in public Demo Safe Mode"{% endif %}>
+            {% if demo_safe_mode %}{{ deck_icon("lock", 13) }} {{ _("Disabled in Demo") }} ({{ report.applicable_count }}){% else %}{{ deck_icon("check", 13) }} Commit {{ report.applicable_count }} Change(s){% endif %}
+          </button>
         </form>
         {% endif %}
       </div>
