@@ -2,6 +2,32 @@
 
 All notable changes to `flask-deck` are documented in this file.
 
+## [0.6.1] - 2026-11-27
+
+### Security & Bug Fixes
+- **Auth, OIDC SSO, IAM & Session Hardening (`sso.py`, `routes/auth.py`, `routes/iam.py`, `security.py`, `passkeys.py`):**
+  - Enforced fail-closed OIDC JWT/JWKS claim verification (`iss`, `aud`, `nonce`, `alg`, `exp`) and domain allowlist validation.
+  - Hardened MFA login flows, session revocation, password-change/reset race guards, and RBAC permission boundaries across IAM and passkey routes.
+- **Governance, Four-Eyes Approvals & Multi-Tenant Scoping (`approvals.py`, `routes/governance.py`, `dashboard.py`, `demo.py`):**
+  - Made Four-Eyes approval resolution atomic via single-claim conditional updates / transactional locking (preventing TOCTOU double-execution under concurrent reviewers).
+  - Preserved original requester capabilities during approved edits/actions and ensured dashboard sparkline queries preserve both `scope_query` `WHERE` clauses and soft-delete predicates.
+  - Fixed seeded showcase approval payloads so interactive demo approval execution succeeds end-to-end.
+- **SQL Console, SSRF & Export/Import Integrity (`sql_console.py`, `events.py`, `exporter.py`, `importer.py`, `cascade.py`):**
+  - Extended the dialect-aware read-only SQL firewall to block PostgreSQL dollar-quoted strings (`$$...$$`), `COPY`, `SET`, write CTEs, and additional alias bypasses in secret redaction.
+  - Hardened `WebhookSink` SSRF protection to re-validate DNS/IP targets on every HTTP redirect hop.
+  - Tightened CSV/XLSX formula-injection sanitization (including leading whitespace/tab/CR/LF prefixes), dry-run savepoint import edge cases, and cascade impact analysis.
+- **REST API v1, MCP Server, CRUD & Frontend Reliability (`rest_api.py`, `mcp_server.py`, `routes/crud.py`, `routes/api.py`, `query.py`, `filters.py`, `static/js/deck-form.js`):**
+  - Hardened REST API v1 OCC (`ETag` / `If-Match`), cursor pagination, CIDR/scope/throttling checks, and JSON-RPC 2.0 MCP tool validation & origin-rebinding guards.
+  - Fixed strict-CSP DOM/form edge cases in `deck-form.js`, `model_form.html`, and `quick_form.html`, plus filter/query edge cases across SQLite and PostgreSQL dialects.
+
+### Testing, CI & Benchmarking
+- **6-Job Verification Matrix (`.github/workflows/ci.yml`):**
+  - Enforced **≥90% branch coverage** (`--cov-fail-under=90`) and `-W error::ResourceWarning` across Python 3.10–3.13 (`SQLAlchemy 2.0` & `2.1`) with 194 core/route/protocol contract tests.
+  - Added parametrized store-parity contract suites across `InMemory`, `SQLite`, `PostgreSQL 16`, and `Redis 7`.
+  - Added fail-closed live **PostgreSQL 16 + Redis 7** integration suite (`15` tests covering `JSONB`, `ARRAY`, `tsvector` `__fts`, `pg_class.reltuples`, `FOR UPDATE`, and Redis TTL stores).
+  - Added live **Playwright Chromium** E2E, Air-Gap & Strict-CSP suite (`7` tests asserting 0 external requests, 0 CSP violations, and 0 console/page errors).
+  - Stabilized `benchmarks/bench_deck.py` against short-TTL metadata cache boundaries and lowered Keyset Cursor steady-state query count to `3`.
+
 ## [0.6.0] - 2026-11-24
 
 ### Added

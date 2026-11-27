@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flask-deck"
-version = "0.6.0"
+version = "0.6.1"
 description = "Enterprise & AI-Agent Operations Control Plane for Flask and SQLAlchemy 2.0 — zero Node build, zero CDN, SSO/Passkeys/MFA, four-eyes approvals, hash-chained audit, REST API & MCP server."
 readme = "README.md"
 license = { text = "MIT" }
