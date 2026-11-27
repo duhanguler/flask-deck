@@ -14,6 +14,7 @@
   <img src="https://img.shields.io/badge/SQLAlchemy-2.0%2B-18181b?style=flat-square&logo=sqlalchemy&logoColor=white" alt="SQLAlchemy 2.0+" />
   <img src="https://img.shields.io/badge/Core%20Assets-18.25%20KB%20gz-18181b?style=flat-square" alt="18.25 KB core gzip" />
   <img src="https://img.shields.io/badge/CSP-Strict%20Nonce%20%280%20unsafe--inline%29-18181b?style=flat-square" alt="Strict Nonce CSP" />
+  <img src="https://img.shields.io/badge/Coverage-90%25%2B%20Branch-18181b?style=flat-square" alt="90%+ Branch Coverage" />
   <img src="https://img.shields.io/badge/Dependencies-5%20Core%20Only-18181b?style=flat-square" alt="5 Core Dependencies" />
   <a href="https://github.com/duhanguler/flask-deck/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-18181b?style=flat-square" alt="MIT License" /></a>
 </p>
@@ -29,7 +30,8 @@
   <a href="#full-django-admin-parity--beyond-v060"><strong>What's New in v0.6.0</strong></a> ·
   <a href="#ecosystem-comparison"><strong>Comparison</strong></a> ·
   <a href="#performance-architecture--benchmarks"><strong>Benchmarks</strong></a> ·
-  <a href="#security-architecture-owasp-defense-in-depth"><strong>Security</strong></a>
+  <a href="#security-architecture-owasp-defense-in-depth"><strong>Security</strong></a> ·
+  <a href="#verification--quality-engineering"><strong>Verification</strong></a>
 </p>
 
 ---
@@ -50,9 +52,10 @@ Most Python admin panels force a painful tradeoff: legacy Bootstrap/jQuery templ
 
 **`flask-deck`** is a precision, fail-closed **Enterprise & AI-Agent Operations Control Plane** for Flask and SQLAlchemy 2.0 — combining the craft of **Linear / Vercel / Django-Unfold** with full **Django Admin parity**, enterprise **IAM 2.0** (DB users/groups, Passkeys, encrypted TOTP, OIDC SSO), **Four-Eyes Maker-Checker approvals**, **hash-chained audit ledgers**, **OpenAPI 3.1 REST API v1**, **HITL MCP Server**, **media storage**, **i18n/RTL**, and **SQL BI charts** directly on WSGI.
 
-- **Ultra-Lean, Air-Gap Ready:** Zero Node build, zero external CDN, only 5 mandatory dependencies (`flask`, `werkzeug`, `sqlalchemy`, `jinja2`, `markupsafe`). Core bundle is **`18.25 KB` gzip** (`10.50 KB` CSS + `7.75 KB` JS); modular per-route totals stay **`20.90–28.54 KB` gzip** with pure SSR SVG charts & QR codes.
+- **Ultra-Lean, Air-Gap Ready:** Zero Node build, zero external CDN, only 5 mandatory dependencies (`flask`, `werkzeug`, `sqlalchemy`, `jinja2`, `markupsafe`). Core bundle is **`18.25 KB` gzip** (`10.50 KB` CSS + `7.75 KB` JS); modular per-route totals stay **`20.90–28.65 KB` gzip** with pure SSR SVG charts & QR codes.
 - **Strict Nonce CSP by Default:** Per-request cryptographic nonce, **0 `'unsafe-inline'`**, **0 `<style>` tags**, **0 inline `style=` or `on*=` attributes**, **0 untrusted `innerHTML`**. Custom `#RRGGBB` brand themes compile into an external SHA-256 cached `/_theme.css` with automatic WCAG 2.1 contrast.
 - **Full Django Admin Parity — & Beyond (`v0.6.0`):** Every power-user feature teams miss from Django Admin (`date_hierarchy`, `ListFilter`, facets, `^`/`=`/`@` tokenized relational search, dynamic per-record hooks, `VirtualField`, Rich Inlines 2.0, hybrid atomic batch editing, `raw_id_fields` lookup modal, `save_as`, `ModelViewChecks`, `get_urls()`, `createsuperuser`, `jsi18n`) **plus** modern control-plane superpowers Django Admin lacks out of the box.
+- **CI-Verified Production Hardening:** **90%+ branch coverage** enforced across Python 3.10–3.13 (`SQLAlchemy 2.0` & `2.1`, zero `ResourceWarning`s), fail-closed **PostgreSQL 16 + Redis 7** integration & store-contract suites, and a **Playwright Chromium** E2E gate asserting zero external requests and zero CSP violations.
 
 ---
 
@@ -389,7 +392,7 @@ deck.add_webhook(
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Flask / WSGI Native** | **Yes** | Yes | Yes | No (ASGI) | No (Django) |
 | **Pure SQLAlchemy 2.0 + Multi-Bind DBs** | **Yes** | Partial | No | Yes | N/A |
-| **Zero Node Build & Zero CDN** | **Yes (`18.25 KB` core / ≤`28.54 KB` route gz)** | Partial | Partial | No | Partial |
+| **Zero Node Build & Zero CDN** | **Yes (`18.25 KB` core / ≤`28.65 KB` route gz)** | Partial | Partial | No | Partial |
 | **Tokenized Search (`^`/`=`/`@` + Relational `EXISTS`)** | **Yes (Multi-hop RBAC)** | Partial | Partial | Partial | Yes |
 | **Dynamic Hooks, `VirtualField`, Rich Inlines 2.0 & Atomic Batch Edit** | **Yes** | Partial | No | No | Partial |
 | **Slide-Over Related Drawer (`+`/`✏️`/`👁️`/`×`) & `raw_id_fields` Lookup** | **Yes (Strict-CSP)** | No | No | No | Popup only |
@@ -407,19 +410,19 @@ deck.add_webhook(
 
 ## Performance Architecture & Benchmarks
 
-Measured on Python 3.13 + SQLAlchemy 2.0 + SQLite via `uv run python benchmarks/bench_deck.py`:
+Measured on Python 3.13 + SQLAlchemy 2.x + SQLite via `uv run python benchmarks/bench_deck.py`:
 
 | Workload | Result | Engineering Mechanism |
 | :--- | :--- | :--- |
-| **Frontend Asset Payload** | **`18.25 KB` core gzip** (`10.50 KB` CSS + `7.75 KB` core JS) · **`20.90–28.54 KB`** per-route total | Modular vanilla ES6 (`deck.js` + route-scoped `deck-grid.js` / `deck-form.js` / `deck-ops.js`), zero icon fonts, zero chart/QR libs; SHA-256 immutable caching (`?v=<hash>`). |
-| **Offset List View (50 / 2,000 rows + FK + 4 Tabs)** | **`5.29 ms` p50 · `4` SQL queries** | Auto `joinedload`/`selectinload` (zero N+1, `lazy="dynamic"`/`write_only`-safe), single-pass `CASE` Quick Tab & Trash aggregation, `defer()` heavy blobs. |
-| **Keyset Cursor List (50 / 2,000 rows, `count=none`)** | **`4.93 ms` p50 · `4` SQL queries** | HMAC-signed opaque cursor (`LIMIT N+1`, no `OFFSET` scan, zero `COUNT(*)` overhead). |
-| **Enriched List (`date_hierarchy` + `RangeListFilter` + Eager Facets)** | **`6.54 ms` p50 · `6` SQL queries** | SARGable `date_hierarchy` range predicate + shared conditional facets folded right into the single-pass QuickTab query. |
-| **SQL Cascade Delete Impact Analyzer (Parent + 80 Children)** | **`1.08 ms` · `2` SQL queries** | O(tables) BFS over `mapper.registry.mappers` running pure SQL `COUNT(*)` + authorized `LIMIT 5` samples with cycle deduplication & non-PK unique FK support. |
-| **Streaming CSV Export (2,000 rows)** | **`57.6 ms` (`34,701 rows/s`) · `2,894 KiB` peak** | `session.scalars(stmt).yield_per(500)` + generator streaming (`O(1)` RAM) shared with Background CSV Jobs; CSV/XLSX formula & sheet-title sanitization. |
-| **Dry-Run Savepoint Import (1,000 rows)** | **`153.4 ms` · `0` leaked mutations** | Chunked `IN (...)` batch preload (`batch_size=500`) + released `SAVEPOINT` validation + unconditional `finally: rollback()`; auto-async above `max_sync_import_rows`. |
+| **Frontend Asset Payload** | **`18.25 KB` core gzip** (`10.50 KB` CSS + `7.75 KB` core JS) · **`20.90–28.65 KB`** per-route total | Modular vanilla ES6 (`deck.js` + route-scoped `deck-grid.js` / `deck-form.js` / `deck-ops.js`), zero icon fonts, zero chart/QR libs; SHA-256 immutable caching (`?v=<hash>`). |
+| **Offset List View (50 / 2,000 rows + FK + 4 Tabs)** | **`6.54 ms` p50 · `4` SQL queries** | Auto `joinedload`/`selectinload` (zero N+1, `lazy="dynamic"`/`write_only`-safe), single-pass `CASE` Quick Tab & Trash aggregation, `defer()` heavy blobs. |
+| **Keyset Cursor List (50 / 2,000 rows, `count=none`)** | **`5.87 ms` p50 · `3` SQL queries** | HMAC-signed opaque cursor (`LIMIT N+1`, no `OFFSET` scan, zero `COUNT(*)` overhead). |
+| **Enriched List (`date_hierarchy` + `RangeListFilter` + Eager Facets)** | **`7.90 ms` p50 · `6` SQL queries** | SARGable `date_hierarchy` range predicate + shared conditional facets folded right into the single-pass QuickTab query. |
+| **SQL Cascade Delete Impact Analyzer (Parent + 80 Children)** | **`1.64 ms` · `2` SQL queries** | O(tables) BFS over `mapper.registry.mappers` running pure SQL `COUNT(*)` + authorized `LIMIT 5` samples with cycle deduplication & non-PK unique FK support. |
+| **Streaming CSV Export (2,000 rows)** | **`67.5 ms` (`29,625 rows/s`) · `2,894 KiB` peak** | `session.scalars(stmt).yield_per(500)` + generator streaming (`O(1)` RAM) shared with Background CSV Jobs; RFC-safe CSV/XLSX formula & sheet-title sanitization. |
+| **Dry-Run Savepoint Import (1,000 rows)** | **`297.3 ms` · `0` leaked mutations** | Chunked `IN (...)` batch preload (`batch_size=500`) + released `SAVEPOINT` validation + unconditional `finally: rollback()`; auto-async above `max_sync_import_rows`. |
 
-Every page footer displays live request telemetry (`SQLAlchemy 2.0 · 4 queries · 0.3 ms SQL · 5.2 ms`) via lightweight request-scoped SQLAlchemy event listeners.
+Every page footer displays live request telemetry (`SQLAlchemy 2.x · 4 queries · 0.3 ms SQL · 6.5 ms`) via lightweight request-scoped SQLAlchemy event listeners.
 
 ---
 
@@ -430,12 +433,25 @@ Every page footer displays live request telemetry (`SQLAlchemy 2.0 · 4 queries 
 | **Unauthenticated Exposure** | **Fail-closed:** Refuses to mount when `app.debug is False` without an explicit `AuthProvider` or `SECRET_KEY` (`SecurityConfigurationError`). Startup `ModelViewChecks` fail fast in `production`. Demo role switcher is hard-blocked in `production`. |
 | **XSS & Script Injection** | Strict per-request nonce CSP (`default-src 'none'; script-src 'self' 'nonce-…'; style-src 'self'; frame-ancestors 'none'`), **0 `'unsafe-inline'`**, **0 `<style>`**, **0 inline `style=` / `on*=`**, **0 untrusted `innerHTML`**, hardened `render_safe_markdown` (blocking `/\evil.com` & URL attribute injection), validated `#RRGGBB` `/_theme.css`, allowlisted `template_slots`. |
 | **Privilege Escalation & IAM** | Delegated `iam:manage` operators cannot grant glob/wildcard (`**`, `*:*`, `iam:*`) permissions or modify/assign privileged groups; impersonation is hard-blocked (`403`) on password, session, passkey, and API-key endpoints; deactivated user accounts immediately invalidate Bearer API keys (`401`) and password reset tokens; last-active-superuser protection. |
-| **File Upload & Media Attacks** | Pure-Python magic-byte MIME verification (SVG XSS blocked by default), PNG/JPEG/GIF/WebP decompression-bomb guard (`max_image_pixels`), path-traversal-proof keys, RBAC + `can_view_record` + `scope_query` enforcement on `/_media` & inline media, `X-Content-Type-Options: nosniff`, `Content-Disposition: attachment`. |
-| **Account Takeover & SSO** | `SecretCipher`-encrypted TOTP 2FA secrets & recovery codes at rest, WebAuthn Passkeys, PKCE `S256` + `state`/`nonce` OIDC SSO with `allowed_domains`, server-side Session Registry (`/_security/sessions`) with remote revocation, opt-in anti-enumeration Forgot Password (`Referrer-Policy: no-referrer`, `Cache-Control: no-store`), sliding-window login rate limiter (`429 Retry-After`), and `session.clear()` fixation rotation. |
-| **CSRF, Replay & Concurrency** | Cryptographic per-session token (`hmac.compare_digest`) + `Sec-Fetch-Site` / `Origin` enforcement on every cookie mutation (plus Origin-rebinding guard on `/_mcp`), optimistic concurrency control (`ETag` / `If-Match` `409 Conflict`), and `X-Frame-Options: DENY`. |
+| **File Upload, Media & Export Attacks** | Pure-Python magic-byte MIME verification (SVG XSS blocked by default), PNG/JPEG/GIF/WebP decompression-bomb guard (`max_image_pixels`), path-traversal-proof keys, RBAC + `can_view_record` + `scope_query` enforcement on `/_media` & inline media, `X-Content-Type-Options: nosniff`, `Content-Disposition: attachment`, and leading-whitespace-aware CSV/XLSX formula-injection neutralization. |
+| **Account Takeover & SSO** | `SecretCipher`-encrypted TOTP 2FA secrets & recovery codes at rest, WebAuthn Passkeys, PKCE `S256` + fail-closed OIDC JWT/JWKS verification (`iss`, `aud`, `nonce`, `alg`, `allowed_domains`), server-side Session Registry (`/_security/sessions`) with remote revocation, opt-in anti-enumeration Forgot Password (`Referrer-Policy: no-referrer`, `Cache-Control: no-store`), sliding-window login rate limiter (`429 Retry-After`), and `session.clear()` fixation rotation. |
+| **CSRF, Replay & Concurrency** | Cryptographic per-session token (`hmac.compare_digest`) + `Sec-Fetch-Site` / `Origin` enforcement on every cookie mutation (plus Origin-rebinding guard on `/_mcp`), optimistic concurrency control (`ETag` / `If-Match` `409 Conflict`), atomic single-claim approval resolution (no TOCTOU double execution), and `X-Frame-Options: DENY`. |
 | **Governance, Agents & APIs** | Declarative four-eyes `approval_required` Maker-Checker queue across UI, REST API v1 (`202 Accepted`), and AI-Agent MCP proposals; SHA-256 hashed Bearer API keys (`dk_live_...`) with scoped permissions, CIDR allowlists, tenant propagation, and sliding-window `429 Retry-After` throttling. |
-| **Mass Assignment & Tampering** | Strict `allowed_form_fields()` allowlist + isolated `VirtualField` dicts + inline child IDOR/`validate_rows()`/`max_rows` enforcement; uniform `scope_query` & `can_view/edit/delete_record` across UI, notes, exports, audit revert, REST & MCP; cryptographic SHA-256 hash-chained Audit Ledger (`hash_chain=True`, `verify_chain()`). |
-| **SQL Console & SSRF** | Dialect-aware read-only SQL firewall (blocking `\'` escapes, nested `/* /* */`, MySQL `/*!`, PG `E'...'`, PG `#` bypasses, and internal `_flask_deck_*` tables) + parenthesized `SELECT` `[REDACTED]` secret masking + unconditional transaction rollback. `WebhookSink` pins validated DNS/IPs, blocking loopback, RFC 1918, CGNAT & cloud metadata (`169.254.169.254`). |
+| **Mass Assignment & Tampering** | Strict `allowed_form_fields()` allowlist + isolated `VirtualField` dicts + inline child IDOR/`validate_rows()`/`max_rows` enforcement; uniform `scope_query`, soft-delete & `can_view/edit/delete_record` across UI, dashboard sparklines, notes, exports, audit revert, REST & MCP; cryptographic SHA-256 hash-chained Audit Ledger (`hash_chain=True`, `verify_chain()`). |
+| **SQL Console & SSRF** | Dialect-aware read-only SQL firewall (blocking `\'` escapes, nested `/* /* */`, PG `$$...$$`, `COPY`, `SET`, write CTEs, MySQL `/*!`, PG `E'...'` / `#` bypasses, and internal `_flask_deck_*` tables) + alias-aware `[REDACTED]` secret masking + unconditional rollback. `WebhookSink` pins validated DNS/IPs and re-validates every redirect hop, blocking loopback, RFC 1918, CGNAT & cloud metadata (`169.254.169.254`). |
+
+---
+
+## Verification & Quality Engineering
+
+Every pull request and `main` commit passes a 6-job CI matrix in [.github/workflows/ci.yml](https://github.com/duhanguler/flask-deck/blob/main/.github/workflows/ci.yml):
+
+| Verification Tier | Scope & Enforcement |
+| :--- | :--- |
+| **Core, Route & Protocol Contracts** (`Python 3.10–3.13`) | **194 tests** across `SQLAlchemy 2.0` & `2.1`, **`≥90%` branch coverage** (`--cov-fail-under=90`), `-W error::ResourceWarning` zero-leak gate, strict `mypy src` & `ruff`, OpenAPI 3.1 REST API v1 & JSON-RPC 2.0 MCP Server contracts, plus asset & SQL query-count benchmarks. |
+| **Store & Backend Parity Contracts** | Parametrized behavioral contract matrix validating identical semantics across `InMemory`, `SQLite`, `PostgreSQL 16`, and `Redis 7` for `AuditStore`, `ApprovalStore`, `SavedViewStore`, `RateLimitStore`, and `ImportPreviewStore`. |
+| **Live PostgreSQL 16 + Redis 7 Integration** | **15 fail-closed CI tests** (`CI=true`, no silent skips) verifying `JSONB` containment/keys, `ARRAY` overlap/any, `tsvector` full-text search (`__fts`), `pg_class.reltuples` O(1) estimated counts, `FOR UPDATE` transactional locking, and Redis TTL/sliding-window stores. |
+| **Playwright Chromium E2E, Air-Gap & Strict-CSP Gate** | **7 live browser journeys** enforcing **0 external network requests** (true air-gap check), **0 CSP violations**, and **0 `console.error` / `pageerror`** across list views, quick-peek drawers, inline CRUD, Four-Eyes AI-Agent Approvals, SQL BI charts, and Arabic RTL rendering. |
 
 ---
 
@@ -466,7 +482,13 @@ See the 1-to-1 migration guide in [docs/migration-from-flask-admin.md](https://g
 git clone https://github.com/duhanguler/flask-deck.git
 cd flask-deck
 uv sync --extra dev
-make check
+make check                         # ruff + mypy + pytest (≥90% branch cov) + benchmarks
+
+# Optional: Live PostgreSQL 16 + Redis 7 integration & Playwright Chromium E2E suites
+uv sync --extra dev --extra integration --extra e2e
+uv run playwright install chromium
+make test-integration              # requires FLASK_DECK_TEST_PG_URL & FLASK_DECK_TEST_REDIS_URL
+make test-e2e                      # Chromium E2E + Air-Gap & Strict-CSP gate
 ```
 
 ## License
