@@ -59,6 +59,63 @@ class BenchOrderView(ModelView):
     )
 
 
+def _reset_short_ttl_caches(deck: Deck) -> None:
+    """Expire short-TTL SQLAlchemy metadata caches so the next warm-up populates a fresh window."""
+    approval_store = getattr(deck, "approval_store", None)
+    if approval_store is not None and hasattr(approval_store, "_pending_cache"):
+        lock = getattr(approval_store, "_lock", None)
+        if lock is not None:
+            with lock:
+                approval_store._pending_cache = None
+        else:
+            approval_store._pending_cache = None
+    saved_view_store = getattr(deck, "saved_view_store", None)
+    if saved_view_store is not None and hasattr(saved_view_store, "_model_cache"):
+        lock = getattr(saved_view_store, "_lock", None)
+        if lock is not None:
+            with lock:
+                saved_view_store._model_cache.clear()
+        else:
+            saved_view_store._model_cache.clear()
+
+
+def _measure_list_route(
+    client: object,
+    engine: sa.Engine,
+    deck: Deck,
+    path: str,
+    *,
+    iterations: int = 15,
+) -> tuple[int, float, list[str]]:
+    """Warm up a list endpoint on a fresh metadata cache window and measure queries & p50 latency."""
+    _reset_short_ttl_caches(deck)
+    get = client.get  # type: ignore[attr-defined]
+    assert get(path).status_code == 200
+
+    latencies_ms: list[float] = []
+    worst_queries: list[str] = []
+    for _ in range(iterations):
+        seen: list[str] = []
+
+        def _count(_c: object, _cur: object, stmt: str, *_a: object, _buf: list[str] = seen) -> None:
+            _buf.append(stmt)
+
+        sa.event.listen(engine, "before_cursor_execute", _count)
+        t0 = time.perf_counter()
+        resp = get(path)
+        latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+        sa.event.remove(engine, "before_cursor_execute", _count)
+        assert resp.status_code == 200
+        if len(seen) > len(worst_queries):
+            worst_queries = seen
+
+    return len(worst_queries), statistics.median(latencies_ms), worst_queries
+
+
+def _format_queries(queries: list[str]) -> str:
+    return "\n".join(f"  Q{i}: {' '.join(q.split())[:160]}" for i, q in enumerate(queries, 1))
+
+
 def main() -> None:
     # 1. Dual Asset Budget Check (Core Shell < 22 KB gz, Max Route Page < 32 KB gz)
     pkg_static = Path(__file__).resolve().parents[1] / "src" / "flask_deck" / "static"
@@ -119,29 +176,13 @@ def main() -> None:
     deck.register(BenchOrg, BenchOrderView)
 
     client = app.test_client()
-    # Warm up
-    assert client.get("/admin/bench-orders/?page_size=50").status_code == 200
 
     # 3. Measure List View Latency + Query Count (50 rows + FK + 4 QuickTabs)
-    q_counts: list[int] = []
-    latencies_ms: list[float] = []
-    for _ in range(15):
-        seen: list[str] = []
-
-        def _count(_c: object, _cur: object, stmt: str, *_a: object, _buf: list[str] = seen) -> None:
-            _buf.append(stmt)
-
-        sa.event.listen(engine, "before_cursor_execute", _count)
-        t0 = time.perf_counter()
-        resp = client.get("/admin/bench-orders/?page_size=50")
-        latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-        sa.event.remove(engine, "before_cursor_execute", _count)
-        assert resp.status_code == 200
-        q_counts.append(len(seen))
-
-    p50 = statistics.median(latencies_ms)
-    print(f"[List 50/2000 rows + FK + 4 Tabs] queries={max(q_counts)} | p50={p50:.2f} ms")
-    assert max(q_counts) <= 4, f"Expected <= 4 queries, got {max(q_counts)}"
+    list_q, p50, list_sql = _measure_list_route(
+        client, engine, deck, "/admin/bench-orders/?page_size=50"
+    )
+    print(f"[List 50/2000 rows + FK + 4 Tabs] queries={list_q} | p50={p50:.2f} ms")
+    assert list_q <= 4, f"Expected <= 4 queries, got {list_q}:\n{_format_queries(list_sql)}"
 
     # 4. Streaming CSV Export (2,000 rows) throughput & peak memory
     tracemalloc.start()
@@ -197,26 +238,11 @@ def main() -> None:
         count_mode = "none"
 
     deck.register(BenchCursorOrderView)
-    cur_latencies: list[float] = []
-    cur_queries: list[int] = []
-    for _ in range(15):
-        seen_c: list[str] = []
-
-        def _cnt_c(_c: object, _cur: object, stmt: str, *_a: object, _buf: list[str] = seen_c) -> None:
-            _buf.append(stmt)
-
-        sa.event.listen(engine, "before_cursor_execute", _cnt_c)
-        t0 = time.perf_counter()
-        resp = client.get("/admin/bench-orders-cursor/?page_size=50")
-        cur_latencies.append((time.perf_counter() - t0) * 1000.0)
-        sa.event.remove(engine, "before_cursor_execute", _cnt_c)
-        assert resp.status_code == 200
-        cur_queries.append(len(seen_c))
-    print(
-        f"[Keyset Cursor 50/2000 rows (count=none)] queries={max(cur_queries)} | "
-        f"p50={statistics.median(cur_latencies):.2f} ms"
+    cur_q, cur_p50, cur_sql = _measure_list_route(
+        client, engine, deck, "/admin/bench-orders-cursor/?page_size=50"
     )
-    assert max(cur_queries) <= 4
+    print(f"[Keyset Cursor 50/2000 rows (count=none)] queries={cur_q} | p50={cur_p50:.2f} ms")
+    assert cur_q <= 4, f"Expected <= 4 queries for cursor list, got {cur_q}:\n{_format_queries(cur_sql)}"
 
     # 7. Enriched List View (date_hierarchy + custom RangeListFilter + eager batched facets <= 6 queries)
     class BenchEnrichedOrderView(BenchOrderView):
@@ -236,27 +262,16 @@ def main() -> None:
         )
 
     deck.register(BenchEnrichedOrderView)
-    assert client.get("/admin/bench-orders-enriched/?page_size=50").status_code == 200
-    enr_latencies: list[float] = []
-    enr_queries: list[int] = []
-    for _ in range(15):
-        seen_e: list[str] = []
-
-        def _cnt_e(_c: object, _cur: object, stmt: str, *_a: object, _buf: list[str] = seen_e) -> None:
-            _buf.append(stmt)
-
-        sa.event.listen(engine, "before_cursor_execute", _cnt_e)
-        t0 = time.perf_counter()
-        resp = client.get("/admin/bench-orders-enriched/?page_size=50")
-        enr_latencies.append((time.perf_counter() - t0) * 1000.0)
-        sa.event.remove(engine, "before_cursor_execute", _cnt_e)
-        assert resp.status_code == 200
-        enr_queries.append(len(seen_e))
-    print(
-        f"[Enriched List (DH + RangeFilter + Eager Facets)] queries={max(enr_queries)} | "
-        f"p50={statistics.median(enr_latencies):.2f} ms"
+    enr_q, enr_p50, enr_sql = _measure_list_route(
+        client, engine, deck, "/admin/bench-orders-enriched/?page_size=50"
     )
-    assert max(enr_queries) <= 6, f"Expected <= 6 queries for enriched list, got {max(enr_queries)}"
+    print(
+        f"[Enriched List (DH + RangeFilter + Eager Facets)] queries={enr_q} | "
+        f"p50={enr_p50:.2f} ms"
+    )
+    assert enr_q <= 6, (
+        f"Expected <= 6 queries for enriched list, got {enr_q}:\n{_format_queries(enr_sql)}"
+    )
 
     # 8. Cascade Delete Impact Analyzer O(tables) SQL check (parent org -> 80 child orders)
     org_view = deck.get_view("bench-orgs")

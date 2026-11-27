@@ -1431,7 +1431,11 @@ def _seed_showcase_control_plane(
                 "operation": "edit",
                 "record_pk": str(orgs[2].id),
                 "record_repr": orgs[2].name,
-                "payload": {"plan": "enterprise", "seats_limit": 60, "mrr_cents": 495000},
+                "payload": {
+                    "values": {"plan": "enterprise", "seats_limit": 60, "mrr_cents": 495000},
+                    "_actor_roles": ["superadmin"],
+                    "_actor_superuser": True,
+                },
                 "diff": {
                     "plan": {"old": "growth", "new": "enterprise"},
                     "seats_limit": {"old": 25, "new": 60},
@@ -1450,7 +1454,11 @@ def _seed_showcase_control_plane(
                 "operation": "edit",
                 "record_pk": str(tickets[1].id),
                 "record_repr": f"{tickets[1].ticket_key} · {tickets[1].subject[:48]}",
-                "payload": {"priority": "critical", "status": "in_progress", "sla_health": 32},
+                "payload": {
+                    "values": {"priority": "critical", "status": "in_progress", "sla_health": 32},
+                    "_actor_roles": ["superadmin"],
+                    "_actor_superuser": True,
+                },
                 "diff": {
                     "priority": {"old": "high", "new": "critical"},
                     "status": {"old": "open", "new": "in_progress"},
@@ -1468,7 +1476,7 @@ def _seed_showcase_control_plane(
                 "operation": "action",
                 "record_pk": str(orders[3].id),
                 "record_repr": orders[3].order_number,
-                "payload": {"action": "issue_refund", "selected_pks": [str(orders[3].id)]},
+                "payload": {"action_name": "issue_refund", "pks": [str(orders[3].id)], "params": {}},
                 "diff": {"status": {"old": orders[3].status.value, "new": "refunded"}},
                 "reason": "Customer duplicate billing adjustment requested by Maya Chen (requires checker sign-off).",
                 "requester_id": "support",
@@ -1483,7 +1491,7 @@ def _seed_showcase_control_plane(
                 "operation": "edit",
                 "record_pk": str(orgs[5].id),
                 "record_repr": orgs[5].name,
-                "payload": {"plan": "growth", "seats_limit": 25, "mrr_cents": 149000},
+                "payload": {"values": {"plan": "growth", "seats_limit": 25, "mrr_cents": 149000}},
                 "diff": {
                     "plan": {"old": "starter", "new": "growth"},
                     "seats_limit": {"old": 10, "new": 25},
@@ -1591,7 +1599,7 @@ def _seed_showcase_control_plane(
             SavedQueryRecord(
                 id="sq-bi-sla-risk",
                 name="Open Critical & High SLA Tickets",
-                sql="SELECT ticket_key, priority, status, sla_health, subject FROM demo_tickets WHERE deleted_at IS NULL AND UPPER(status) IN ('OPEN', 'IN_PROGRESS') ORDER BY sla_health ASC LIMIT 10",
+                sql="SELECT ticket_key, priority, status, sla_health, subject FROM demo_tickets WHERE deleted_at IS NULL AND UPPER(CAST(status AS TEXT)) IN ('OPEN', 'IN_PROGRESS') ORDER BY sla_health ASC LIMIT 10",
                 owner_id="support",
                 owner_name="Maya Chen",
                 is_pinned_to_dashboard=False,
@@ -2442,6 +2450,7 @@ def create_demo_app(
                 deck.session_store,
                 deck._preview_store,
                 deck._rate_limiter,
+                deck.job_backend,
             )
             with engine.begin() as conn:
                 for store in stores:

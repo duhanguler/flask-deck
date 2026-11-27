@@ -408,7 +408,8 @@ def _send_pinned_request(
 
     req_headers = dict(headers)
     default_port = 443 if scheme == "https" else 80
-    req_headers.setdefault("Host", host if port == default_port else f"{host}:{port}")
+    host_hdr = f"[{host}]" if ":" in host else host
+    req_headers.setdefault("Host", host_hdr if port == default_port else f"{host_hdr}:{port}")
     try:
         conn.request("POST", path, body=body, headers=req_headers)
         resp = conn.getresponse()
@@ -606,9 +607,7 @@ class WebhookSink:
             raise last_exc
         return rec
 
-    def __call__(self, event: DeckEvent) -> None:
-        if not self.matches(event.name):
-            return
+    def _dispatch(self, event: DeckEvent) -> None:
         payload_json = json.dumps(event.to_dict(), default=str, separators=(",", ":"))
         body = payload_json.encode("utf-8")
         rec = WebhookDeliveryRecord(
@@ -630,6 +629,15 @@ class WebhookSink:
         # Keep direct synchronous callers strict when no DLQ/retry policy overrides behavior.
         raise_on_fail = self._max_retries == 0 and self._delivery_store is None
         self._attempt_deliver(rec, body, event.name, raise_on_failure=raise_on_fail)
+
+    def __call__(self, event: DeckEvent) -> None:
+        if not self.matches(event.name):
+            return
+        self._dispatch(event)
+
+    def send_test(self, event: DeckEvent) -> None:
+        """Dispatch an explicit operator test event even when the sink filters specific event names."""
+        self._dispatch(event)
 
     def redeliver(self, rec: WebhookDeliveryRecord) -> WebhookDeliveryRecord:
         """Manually replay a tracked or dead-letter webhook delivery."""

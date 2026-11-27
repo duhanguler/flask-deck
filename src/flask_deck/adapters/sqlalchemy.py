@@ -7,7 +7,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -255,6 +255,10 @@ def resolve_adapter(
     return PureSQLAlchemyAdapter(session_factory=session_factory, engine=engine, binds=binds)
 
 
+_PK_INT64_MIN = -(1 << 63)
+_PK_INT64_MAX = (1 << 63) - 1
+
+
 def coerce_pk_value(raw: Any, field: FieldMeta) -> Any:
     """Strictly coerce a primary key segment to its declared Python type."""
     if raw is None or raw == "":
@@ -263,7 +267,10 @@ def coerce_pk_value(raw: Any, field: FieldMeta) -> Any:
         if field.field_type == "integer":
             if isinstance(raw, bool):
                 raise InvalidPKError(f"Invalid integer PK: {raw!r}")
-            return int(raw)
+            iv = int(raw)
+            if iv < _PK_INT64_MIN or iv > _PK_INT64_MAX:
+                raise InvalidPKError(f"Integer PK out of 64-bit range: {raw!r}")
+            return iv
         if field.field_type == "uuid":
             return raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
         if field.field_type == "enum" and field.enum_class is not None:
@@ -284,11 +291,14 @@ def coerce_pk_value(raw: Any, field: FieldMeta) -> Any:
                 raise InvalidPKError(f"Non-finite decimal PK: {raw!r}")
             return val
         if field.python_type is int:
-            return int(raw)
+            iv = int(raw)
+            if iv < _PK_INT64_MIN or iv > _PK_INT64_MAX:
+                raise InvalidPKError(f"Integer PK out of 64-bit range: {raw!r}")
+            return iv
         return str(raw)
     except InvalidPKError:
         raise
-    except (TypeError, ValueError, KeyError) as exc:
+    except (TypeError, ValueError, KeyError, InvalidOperation) as exc:
         raise InvalidPKError(f"Invalid primary key value for {field.name}: {raw!r}") from exc
 
 
@@ -309,7 +319,7 @@ def encode_pk(values: tuple[Any, ...]) -> str:
     """Encode single or composite primary key values into a URL-safe string."""
     if len(values) == 1:
         text = _pk_part_to_str(values[0])
-        if "/" in text or text.startswith(("pk:", "ck:")):
+        if "/" in text or "," in text or text.startswith(("pk:", "ck:")):
             return f"pk:{quote(text, safe='')}"
         return text
     serialized = json.dumps([_pk_part_to_str(v) for v in values], separators=(",", ":")).encode("utf-8")

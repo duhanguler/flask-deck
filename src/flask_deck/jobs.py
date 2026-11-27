@@ -7,6 +7,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -14,6 +15,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 import sqlalchemy as sa
 from flask import Flask
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import StaticPool
 
 logger = logging.getLogger("flask_deck.jobs")
 
@@ -366,21 +368,33 @@ class ThreadPoolJobBackend:
             return (
                 rec is not None
                 and rec.status in {"failed", "cancelled"}
+                and rec.finished_at is not None
                 and job_id in self._callables
             )
 
-    def retry(self, job_id: str) -> JobRecord | None:
+    def retry(
+        self,
+        job_id: str,
+        *,
+        actor_id: str | None = None,
+        actor_name: str | None = None,
+    ) -> JobRecord | None:
         with self._lock:
             rec = self._jobs.get(job_id)
             spec = self._callables.get(job_id)
-            if rec is None or spec is None or rec.status not in {"failed", "cancelled"}:
+            if (
+                rec is None
+                or spec is None
+                or rec.status not in {"failed", "cancelled"}
+                or rec.finished_at is None
+            ):
                 return None
             fn, app, on_complete = spec
         return self.submit(
             name=rec.name,
-            label=f"Retry: {rec.label}",
-            actor_id=rec.actor_id,
-            actor_name=rec.actor_name,
+            label=f"Retry: {rec.label}"[:255],
+            actor_id=actor_id or rec.actor_id,
+            actor_name=actor_name or rec.actor_name,
             model_slug=rec.model_slug,
             fn=fn,
             app=app,
@@ -505,6 +519,8 @@ class SQLAlchemyJobBackend:
             kwargs: dict[str, Any] = {}
             if db_uri.startswith("sqlite"):
                 kwargs["connect_args"] = {"check_same_thread": False}
+                if db_uri in {"sqlite://", "sqlite:///:memory:"} or ":memory:" in db_uri:
+                    kwargs["poolclass"] = StaticPool
             self._engine: Engine = sa.create_engine(db_uri, **kwargs)
         else:
             self._engine = engine
@@ -537,6 +553,12 @@ class SQLAlchemyJobBackend:
             thread_name_prefix="flask-deck-sajob",
         )
         self._lock = threading.Lock()
+        # StaticPool shares a single DB-API connection across threads (e.g. sqlite:///:memory:).
+        # Serialize DB access only on StaticPool so pooled engines (PostgreSQL/MySQL) stay lock-free
+        # while worker threads never collide with concurrent polling reads on shared SQLite connections.
+        self._db_guard: AbstractContextManager[Any] = (
+            threading.RLock() if isinstance(self._engine.pool, StaticPool) else nullcontext()
+        )
         self._cancel_events: dict[str, threading.Event] = {}
         self._callables: dict[
             str, tuple[JobCallable, Flask | None, Callable[[JobRecord], None] | None]
@@ -582,7 +604,7 @@ class SQLAlchemyJobBackend:
         ev = self._cancel_events.get(job_id)
         if ev is not None and ev.is_set():
             return True
-        with self._engine.connect() as conn:
+        with self._db_guard, self._engine.connect() as conn:
             st = conn.execute(
                 sa.select(self._table.c.status).where(self._table.c.id == job_id)
             ).scalar_one_or_none()
@@ -613,7 +635,7 @@ class SQLAlchemyJobBackend:
         if finished_at is not None:
             values["finished_at"] = finished_at
         if values:
-            with self._engine.begin() as conn:
+            with self._db_guard, self._engine.begin() as conn:
                 conn.execute(
                     self._table.update().where(self._table.c.id == job_id).values(**values)
                 )
@@ -622,7 +644,7 @@ class SQLAlchemyJobBackend:
     def _append_log(self, job_id: str, line: str) -> None:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         entry = f"[{ts}] {line}"
-        with self._lock, self._engine.begin() as conn:
+        with self._lock, self._db_guard, self._engine.begin() as conn:
             raw = conn.execute(
                 sa.select(self._table.c.logs_json).where(self._table.c.id == job_id)
             ).scalar_one_or_none()
@@ -642,7 +664,7 @@ class SQLAlchemyJobBackend:
             )
 
     def _attach_artifact(self, job_id: str, *, key: str, filename: str, content_type: str) -> None:
-        with self._engine.begin() as conn:
+        with self._db_guard, self._engine.begin() as conn:
             conn.execute(
                 self._table.update()
                 .where(self._table.c.id == job_id)
@@ -718,7 +740,7 @@ class SQLAlchemyJobBackend:
             model_slug=model_slug,
             created_at=now,
         )
-        with self._engine.begin() as conn:
+        with self._db_guard, self._engine.begin() as conn:
             conn.execute(
                 self._table.insert().values(
                     id=job_id,
@@ -748,10 +770,10 @@ class SQLAlchemyJobBackend:
                     self._cancel_events.pop(oldest_ev, None)
 
         def _runner() -> None:
-            cur = self.get(job_id)
-            if cur is None:
-                return
-            if cancel_ev.is_set() or cur.status == "cancelled":
+            if cancel_ev.is_set():
+                cur = self.get(job_id)
+                if cur is None:
+                    return
                 cancelled = self._update(
                     job_id,
                     status="cancelled",
@@ -760,20 +782,36 @@ class SQLAlchemyJobBackend:
                 )
                 _invoke_completion(job_id, cancelled, app, on_complete)
                 return
-            self._update(
-                job_id,
-                status="running",
-                progress=5,
-                message="Running…",
-                started_at=datetime.now(timezone.utc),
-            )
+            with self._db_guard, self._engine.begin() as conn:
+                claimed = conn.execute(
+                    self._table.update()
+                    .where(sa.and_(self._table.c.id == job_id, self._table.c.status == "queued"))
+                    .values(
+                        status="running",
+                        progress=5,
+                        message="Running…",
+                        started_at=datetime.now(timezone.utc),
+                    )
+                ).rowcount
+            if claimed != 1:
+                cur = self.get(job_id)
+                if cur is not None and cur.status == "cancelled":
+                    if cur.finished_at is None:
+                        cur = self._update(
+                            job_id,
+                            status="cancelled",
+                            message="Cancelled before start",
+                            finished_at=datetime.now(timezone.utc),
+                        )
+                    _invoke_completion(job_id, cur, app, on_complete)
+                return
             _execute_job(self, job_id, cancel_ev, fn, app, on_complete)
 
         self._executor.submit(_runner)
         return rec
 
     def get(self, job_id: str) -> JobRecord | None:
-        with self._engine.connect() as conn:
+        with self._db_guard, self._engine.connect() as conn:
             row = conn.execute(
                 sa.select(self._table).where(self._table.c.id == job_id)
             ).first()
@@ -791,7 +829,7 @@ class SQLAlchemyJobBackend:
         stmt = stmt.order_by(self._table.c.created_at.desc(), self._table.c.id.desc()).limit(
             max(1, limit)
         )
-        with self._engine.connect() as conn:
+        with self._db_guard, self._engine.connect() as conn:
             return [self._row_to_record(r) for r in conn.execute(stmt)]
 
     def cancel(self, job_id: str) -> bool:
@@ -799,25 +837,25 @@ class SQLAlchemyJobBackend:
         if ev is not None:
             ev.set()
         now = datetime.now(timezone.utc)
-        with self._engine.begin() as conn:
+        with self._db_guard, self._engine.begin() as conn:
             cur = conn.execute(
                 sa.select(self._table.c.status).where(self._table.c.id == job_id)
             ).scalar_one_or_none()
             if cur is None or cur in TERMINAL_JOB_STATUSES:
                 return False
             if cur == "queued":
-                conn.execute(
+                res = conn.execute(
                     self._table.update()
-                    .where(self._table.c.id == job_id)
+                    .where(sa.and_(self._table.c.id == job_id, self._table.c.status == "queued"))
                     .values(status="cancelled", message="Cancelled", finished_at=now)
                 )
             else:
-                conn.execute(
+                res = conn.execute(
                     self._table.update()
-                    .where(self._table.c.id == job_id)
-                    .values(message="Cancellation requested")
+                    .where(sa.and_(self._table.c.id == job_id, self._table.c.status == cur))
+                    .values(status="cancelled", message="Cancellation requested")
                 )
-            return True
+            return bool(res.rowcount == 1)
 
     def shutdown(self, *, wait: bool = False, cancel_futures: bool = True) -> None:
         """Stop executor threads cleanly and dispose owned engine."""

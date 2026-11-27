@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from flask_deck.adapters.sqlalchemy import decode_pk, encode_pk, extract_pk
 from flask_deck.audit import compute_diff, serialize_audit_value
 from flask_deck.auth import AuthProvider, DeckUser
-from flask_deck.exceptions import PermissionDeniedError, ValidationError
+from flask_deck.exceptions import InvalidPKError, PermissionDeniedError, ValidationError
 from flask_deck.filters import resolve_custom_filters
 from flask_deck.formatters import (
     BadgeFormatter,
@@ -2008,7 +2008,7 @@ class ModelView:
                 for rid in raw_ids:
                     try:
                         decoded_pks.append(decode_pk(str(rid), target_meta))
-                    except ValueError:
+                    except (InvalidPKError, ValueError):
                         errors.setdefault(field_name, []).append(f"Invalid reference ID: {rid}")
                 if decoded_pks:
                     if len(target_meta.primary_keys) == 1:
@@ -2215,7 +2215,6 @@ class ModelView:
         if not active_inlines:
             return []
 
-        parent_pk = getattr(parent_obj, self.meta.primary_keys[0].name)
         events: list[tuple[InlineModelView, str, Any, dict[str, Any], str | None]] = []
         local_newly_stored: list[tuple[FileFieldConfig, str]] = []
         local_orphans: list[tuple[FileFieldConfig, str]] = []
@@ -2230,6 +2229,12 @@ class ModelView:
             for inline in active_inlines:
                 prefix = f"inline__{inline.meta.slug}__"
                 fk_col_name = inline.resolve_fk_column(self.meta)
+                fk_fmeta_inl = inline.meta.fields_by_name.get(fk_col_name)
+                parent_match_col = (
+                    getattr(fk_fmeta_inl, "fk_target_column", None)
+                    or self.meta.primary_keys[0].name
+                )
+                parent_pk = getattr(parent_obj, parent_match_col)
                 child_view = views_by_model.get(inline.model) if views_by_model is not None else None
                 eff_child_slug = child_view.meta.slug if child_view is not None else inline.meta.slug
                 child_hidden = auth.hidden_fields_for(user, eff_child_slug)
@@ -2296,7 +2301,7 @@ class ModelView:
                         try:
                             decoded_pk = decode_pk(raw_pk, inline.meta)
                             canonical_key = encode_pk(decoded_pk)
-                        except ValueError:
+                        except (InvalidPKError, ValueError):
                             errors.setdefault(inline.meta.slug, []).append(
                                 f"Row {idx + 1}: invalid child ID."
                             )

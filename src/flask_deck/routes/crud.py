@@ -16,6 +16,7 @@ from flask import (
     Response,
     abort,
     flash,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -740,8 +741,13 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         # Parse submitted rows: batch__<idx>___pk and batch__<idx>__<field> (or JSON rows)
         parsed_rows: list[tuple[str, dict[str, Any]]] = []
         if request.is_json:
-            payload = request.get_json(silent=True) or {}
-            for item in payload.get("rows", []):
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, Mapping):
+                return jsonify({"error": "Invalid JSON object payload."}), 400
+            raw_rows = payload.get("rows", [])
+            if not isinstance(raw_rows, list):
+                return jsonify({"error": "'rows' must be a JSON array."}), 400
+            for item in raw_rows:
                 if isinstance(item, Mapping) and item.get("pk") and isinstance(item.get("values"), Mapping):
                     parsed_rows.append((str(item["pk"]).strip(), dict(item["values"])))
         else:
@@ -1088,6 +1094,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                         }
                     sess.rollback()
                     deck._delete_orphan_files_best_effort(newly_stored)
+                    _imp_real = getattr(g, "_deck_real_user", None)
                     req = make_approval_request(
                         model_slug=slug,
                         model_label=view.label,
@@ -1098,6 +1105,11 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                             "form_items": [[k, v] for k, v in request.form.items(multi=True)],
                             "_actor_roles": list(cur_user.roles) if cur_user else [],
                             "_actor_superuser": bool(cur_user.is_superuser) if cur_user else False,
+                            **(
+                                {"_impersonator_id": _imp_real.id}
+                                if _imp_real is not None
+                                else {}
+                            ),
                         },
                         diff=diff,
                         reason=request.form.get("approval_reason", "").strip(),
@@ -1277,8 +1289,45 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         for rel in view.meta.relationships:
             if rel.name in hidden:
                 continue
+            t_view = deck._views_by_model.get(rel.target_model)
+            if t_view is not None and (
+                not t_view.can_view
+                or not deck.auth.has_permission(
+                    user, f"{t_view.meta.slug}:view", model_slug=t_view.meta.slug
+                )
+            ):
+                continue
             val = getattr(obj, rel.name, None)
-            items = list(val) if (rel.uselist and val is not None) else ([val] if val is not None else [])
+            raw_items = (
+                list(val)
+                if (rel.uselist and val is not None)
+                else ([val] if val is not None else [])
+            )
+            if t_view is not None and raw_items:
+                allowed_pks: set[tuple[Any, ...]] | None = None
+                t_pk_cols = [getattr(t_view.model, pk.name) for pk in t_view.meta.primary_keys]
+                loaded_pks = [extract_pk(it, t_view.meta) for it in raw_items]
+                t_stmt = t_view.scope_query(sa.select(*t_pk_cols), user)
+                t_sd = soft_delete_predicate(t_view.meta, t_view.soft_delete_column, trashed=False)
+                if t_sd is not None:
+                    t_stmt = t_stmt.where(t_sd)
+                if len(t_pk_cols) == 1:
+                    t_stmt = t_stmt.where(t_pk_cols[0].in_([pk[0] for pk in loaded_pks]))
+                else:
+                    t_stmt = t_stmt.where(sa.tuple_(*t_pk_cols).in_(loaded_pks))
+                t_sess = deck.get_session(t_view.bind_key)
+                allowed_pks = {tuple(r) for r in t_sess.execute(t_stmt).all()}
+                items = [
+                    it
+                    for it, pk_t in zip(raw_items, loaded_pks, strict=True)
+                    if pk_t in allowed_pks
+                    and deck.auth.has_permission(
+                        user, f"{t_view.meta.slug}:view", model_slug=t_view.meta.slug, obj=it
+                    )
+                    and t_view.can_view_record(it, user)
+                ]
+            else:
+                items = raw_items
             relations_display.append(
                 {
                     "name": rel.name,
@@ -1294,63 +1343,55 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     ],
                 }
             )
-            if rel.uselist:
-                t_view = deck._views_by_model.get(rel.target_model)
-                if (
-                    t_view is not None
-                    and t_view.can_view
-                    and deck.auth.has_permission(
-                        user, f"{t_view.meta.slug}:view", model_slug=t_view.meta.slug
-                    )
-                ):
-                    t_cols = t_view.visible_list_columns(deck.auth, user)[:6]
-                    t_media = deck._media_url_builder(t_view)
-                    active_items = [it for it in items if not deck._is_soft_deleted(t_view, it)]
-                    sub_rows = []
-                    for it in active_items[:25]:
-                        it_pk = encode_pk(extract_pk(it, t_view.meta))
-                        sub_rows.append(
-                            {
-                                "pk_str": it_pk,
-                                "detail_url": url_for(
-                                    f"{bp_name}.model_detail", slug=t_view.meta.slug, raw_pk=it_pk
-                                ),
-                                "cells": [
-                                    t_view.format_cell(
-                                        c,
-                                        it,
-                                        auth=deck.auth,
-                                        user=user,
-                                        media_url_builder=t_media,
-                                        rel_repr=deck._rel_repr,
-                                        rel_url_builder=rel_url_builder,
-                                    )
-                                    for c in t_cols
-                                ],
-                            }
-                        )
-                    t_create_url = (
-                        url_for(f"{bp_name}.model_create", slug=t_view.meta.slug)
-                        if (
-                            t_view.can_create
-                            and not deck.config.read_only
-                            and deck.auth.has_permission(
-                                user, f"{t_view.meta.slug}:create", model_slug=t_view.meta.slug
-                            )
-                        )
-                        else None
-                    )
-                    subtables.append(
+            if rel.uselist and t_view is not None:
+                t_cols = t_view.visible_list_columns(deck.auth, user)[:6]
+                t_media = deck._media_url_builder(t_view)
+                active_items = items
+                sub_rows = []
+                for it in active_items[:25]:
+                    it_pk = encode_pk(extract_pk(it, t_view.meta))
+                    sub_rows.append(
                         {
-                            "label": rel.label,
-                            "target_view": t_view,
-                            "cols": t_cols,
-                            "rows": sub_rows,
-                            "total_count": len(active_items),
-                            "list_url": url_for(f"{bp_name}.model_list", slug=t_view.meta.slug),
-                            "create_url": t_create_url,
+                            "pk_str": it_pk,
+                            "detail_url": url_for(
+                                f"{bp_name}.model_detail", slug=t_view.meta.slug, raw_pk=it_pk
+                            ),
+                            "cells": [
+                                t_view.format_cell(
+                                    c,
+                                    it,
+                                    auth=deck.auth,
+                                    user=user,
+                                    media_url_builder=t_media,
+                                    rel_repr=deck._rel_repr,
+                                    rel_url_builder=rel_url_builder,
+                                )
+                                for c in t_cols
+                            ],
                         }
                     )
+                t_create_url = (
+                    url_for(f"{bp_name}.model_create", slug=t_view.meta.slug)
+                    if (
+                        t_view.can_create
+                        and not deck.config.read_only
+                        and deck.auth.has_permission(
+                            user, f"{t_view.meta.slug}:create", model_slug=t_view.meta.slug
+                        )
+                    )
+                    else None
+                )
+                subtables.append(
+                    {
+                        "label": rel.label,
+                        "target_view": t_view,
+                        "cols": t_cols,
+                        "rows": sub_rows,
+                        "total_count": len(active_items),
+                        "list_url": url_for(f"{bp_name}.model_list", slug=t_view.meta.slug),
+                        "create_url": t_create_url,
+                    }
+                )
 
         history: list[AuditEntry] = []
         if deck.audit_store is not None and deck.auth.has_permission(user, "audit:view"):
@@ -1583,9 +1624,13 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                         mode="create",
                         default_max_bytes=deck.config.max_upload_bytes,
                     )
-                    view.invoke_on_model_change(
-                        new_obj, is_created=True, user=cur_user, virtual_data=vdata_as
+                    needs_approval_as = deck.approval_store is not None and view.requires_approval(
+                        cur_user, "create", payload=dict(clone_md)
                     )
+                    if not needs_approval_as:
+                        view.invoke_on_model_change(
+                            new_obj, is_created=True, user=cur_user, virtual_data=vdata_as
+                        )
                     sess.add(new_obj)
                     sess.flush()
                     inline_diffs_as = view.apply_inline_forms(
@@ -1600,12 +1645,12 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                         views_by_model=deck._views_by_model,
                         newly_stored_files=newly_stored_as,
                     )
-                    view.save_related(
-                        new_obj, is_created=True, user=cur_user, inline_diffs=inline_diffs_as
-                    )
-                    if deck.approval_store is not None and view.requires_approval(
-                        cur_user, "create", payload=dict(clone_md)
-                    ):
+                    if not needs_approval_as:
+                        view.save_related(
+                            new_obj, is_created=True, user=cur_user, inline_diffs=inline_diffs_as
+                        )
+                    if needs_approval_as:
+                        assert deck.approval_store is not None
                         safe_repr = view.format_record_repr(new_obj, auth=deck.auth, user=cur_user)
                         diff = compute_diff(
                             {},
@@ -1615,6 +1660,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                         )
                         sess.rollback()
                         deck._delete_orphan_files_best_effort(newly_stored_as)
+                        _imp_real = getattr(g, "_deck_real_user", None)
                         req = make_approval_request(
                             model_slug=slug,
                             model_label=view.label,
@@ -1625,6 +1671,11 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                                 "form_items": [[k, v] for k, v in clone_md.items(multi=True)],
                                 "_actor_roles": list(cur_user.roles) if cur_user else [],
                                 "_actor_superuser": bool(cur_user.is_superuser) if cur_user else False,
+                                **(
+                                    {"_impersonator_id": _imp_real.id}
+                                    if _imp_real is not None
+                                    else {}
+                                ),
                             },
                             diff=diff,
                             reason=request.form.get("approval_reason", "").strip(),
@@ -1866,6 +1917,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                             }
                         sess.rollback()
                         deck._delete_orphan_files_best_effort(newly_stored)
+                        _imp_real = getattr(g, "_deck_real_user", None)
                         req = make_approval_request(
                             model_slug=slug,
                             model_label=view.label,
@@ -1877,6 +1929,11 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                                 "expected_version": current_ver,
                                 "_actor_roles": list(cur_user.roles) if cur_user else [],
                                 "_actor_superuser": bool(cur_user.is_superuser) if cur_user else False,
+                                **(
+                                    {"_impersonator_id": _imp_real.id}
+                                    if _imp_real is not None
+                                    else {}
+                                ),
                             },
                             diff=diff,
                             reason=request.form.get("approval_reason", "").strip(),
@@ -2032,6 +2089,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
                 )
             sess.rollback()
+            _imp_real = getattr(g, "_deck_real_user", None)
             req = make_approval_request(
                 model_slug=slug,
                 model_label=view.label,
@@ -2042,6 +2100,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     "force": force_delete,
                     "_actor_roles": list(cur_user.roles) if cur_user else [],
                     "_actor_superuser": bool(cur_user.is_superuser) if cur_user else False,
+                    **({"_impersonator_id": _imp_real.id} if _imp_real is not None else {}),
                 },
                 diff=del_diff,
                 reason=request.form.get("approval_reason", "").strip(),
@@ -2072,9 +2131,9 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                         True if fmeta.field_type == "boolean" else datetime.now(timezone.utc),
                     )
                     sess.commit()
-                except SQLAlchemyError:
+                except (ValidationError, SQLAlchemyError) as exc:
                     sess.rollback()
-                    flash(f"Could not move {repr_str} to Trash.", "danger")
+                    flash(f"Could not move {repr_str} to Trash: {exc}", "danger")
                     return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=pk_str))
                 after_snap = view.extract_snapshot(obj)
                 deck._record_audit(
@@ -2112,6 +2171,10 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 f"Cannot delete {repr_str}: referenced by dependent records.",
                 "danger",
             )
+            return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=pk_str))
+        except (ValidationError, SQLAlchemyError) as exc:
+            sess.rollback()
+            flash(f"Cannot delete {repr_str}: {exc}", "danger")
             return redirect(url_for(f"{bp_name}.model_detail", slug=slug, raw_pk=pk_str))
 
         deck._delete_orphan_files_best_effort(orphan_files)
@@ -2151,6 +2214,8 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             abort(404)
         pk_str = encode_pk(pk_vals)
         cur_user = deck._current_user()
+        if not view.can_edit_record(obj, cur_user):
+            raise PermissionDeniedError(f"Not authorized to restore this {view.label}.")
         repr_str = view.format_record_repr(obj, auth=deck.auth, user=cur_user)
         return_qs = (
             deck._sanitize_return_qs(request.values.get("_return_qs", ""))
@@ -2165,7 +2230,15 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
         sess = deck.get_session(view.bind_key)
         try:
             setattr(obj, view.soft_delete_column, False if fmeta.field_type == "boolean" else None)
-            view.on_model_change(obj, is_created=False, user=cur_user)
+            if view.version_column:
+                vf = view.meta.fields_by_name.get(view.version_column)
+                if vf is not None and vf.field_type == "integer":
+                    setattr(
+                        obj,
+                        view.version_column,
+                        int(before_snap.get(view.version_column) or 0) + 1,
+                    )
+            view.invoke_on_model_change(obj, is_created=False, user=cur_user)
             sess.commit()
         except (ValidationError, SQLAlchemyError) as exc:
             sess.rollback()
@@ -2237,7 +2310,9 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             )
             pk_cols = [getattr(view.model, pk.name) for pk in view.meta.primary_keys]
             pk_rows = sess.execute(
-                scoped_pk_stmt.with_only_columns(*pk_cols).limit(deck.config.max_select_across + 1)
+                scoped_pk_stmt.with_only_columns(*pk_cols)
+                .distinct()
+                .limit(deck.config.max_select_across + 1)
             ).all()
             if len(pk_rows) > deck.config.max_select_across:
                 flash(
@@ -2245,7 +2320,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     "danger",
                 )
                 return redirect(trash_return_url if is_trash_bulk else list_return_url)
-            decoded_pks = [tuple(row) for row in pk_rows]
+            decoded_pks = list(dict.fromkeys(tuple(row) for row in pk_rows))
             raw_pks = [encode_pk(pk) for pk in decoded_pks]
             if not decoded_pks:
                 flash("No matching authorized records found.", "warn")
@@ -2404,74 +2479,79 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             def _run_chunked_bulk(job_ctx: JobContext) -> str:
                 job_sess = deck.get_session(view.bind_key)
                 processed = 0
-                orphan_queue: list[tuple[Any, str]] = []
                 sd_col_name = view.soft_delete_column
                 sd_f = view.meta.fields_by_name.get(sd_col_name) if sd_col_name else None
                 for idx_c, chunk in enumerate(pk_chunks_all, start=1):
                     if job_ctx.is_cancelled():
                         return f"Cancelled after {processed} record(s)."
                     recs_c = _load_pk_batch(job_sess, chunk)
-                    if action_name == "restore" and sd_col_name and sd_f is not None:
-                        for r in recs_c:
-                            if not (
-                                deck.auth.has_permission(user, bulk_perm, model_slug=slug, obj=r)
-                                and view.can_edit_record(r, user)
-                            ):
-                                raise PermissionDeniedError(f"Missing permission: {bulk_perm}")
-                            setattr(r, sd_col_name, False if sd_f.field_type == "boolean" else None)
-                            view.invoke_on_model_change(r, is_created=False, user=user)
-                    elif action_name == "force_delete":
-                        for r in recs_c:
-                            if not (
-                                deck.auth.has_permission(
-                                    user, f"{slug}:delete", model_slug=slug, obj=r
-                                )
-                                and deck.auth.has_permission(
-                                    user, f"{slug}:force_delete", model_slug=slug, obj=r
-                                )
-                                and view.can_delete_record(r, user)
-                            ):
-                                raise PermissionDeniedError(f"Missing permission: {slug}:force_delete")
-                            orphan_queue.extend(deck._collect_orphan_files(view, r))
-                            view.on_model_delete(r, user=user)
-                            job_sess.delete(r)
-                    elif action_name == "delete":
-                        for r in recs_c:
-                            if not (
-                                deck.auth.has_permission(
-                                    user, f"{slug}:delete", model_slug=slug, obj=r
-                                )
-                                and view.can_delete_record(r, user)
-                            ):
-                                raise PermissionDeniedError(f"Missing permission: {slug}:delete")
-                            if sd_col_name and sd_f is not None:
-                                view.on_model_delete(r, user=user)
-                                setattr(
-                                    r,
-                                    sd_col_name,
-                                    True
-                                    if sd_f.field_type == "boolean"
-                                    else datetime.now(timezone.utc),
-                                )
-                            else:
-                                orphan_queue.extend(deck._collect_orphan_files(view, r))
+                    chunk_orphans: list[tuple[Any, str]] = []
+                    try:
+                        if action_name == "restore" and sd_col_name and sd_f is not None:
+                            for r in recs_c:
+                                if not (
+                                    deck.auth.has_permission(user, bulk_perm, model_slug=slug, obj=r)
+                                    and view.can_edit_record(r, user)
+                                ):
+                                    raise PermissionDeniedError(f"Missing permission: {bulk_perm}")
+                                setattr(r, sd_col_name, False if sd_f.field_type == "boolean" else None)
+                                view.invoke_on_model_change(r, is_created=False, user=user)
+                        elif action_name == "force_delete":
+                            for r in recs_c:
+                                if not (
+                                    deck.auth.has_permission(
+                                        user, f"{slug}:delete", model_slug=slug, obj=r
+                                    )
+                                    and deck.auth.has_permission(
+                                        user, f"{slug}:force_delete", model_slug=slug, obj=r
+                                    )
+                                    and view.can_delete_record(r, user)
+                                ):
+                                    raise PermissionDeniedError(f"Missing permission: {slug}:force_delete")
+                                chunk_orphans.extend(deck._collect_orphan_files(view, r))
                                 view.on_model_delete(r, user=user)
                                 job_sess.delete(r)
-                    elif bulk_spec is not None and bulk_handler is not None:
-                        for r in recs_c:
-                            if not deck.auth.has_permission(
-                                user, bulk_perm, model_slug=slug, obj=r
-                            ):
-                                raise PermissionDeniedError(f"Missing permission: {bulk_perm}")
-                        if bulk_spec.async_job:
-                            bulk_handler(recs_c, form_snap, user, job_ctx)
-                        else:
-                            bulk_handler(recs_c, form_snap, user)
-                    job_sess.commit()
+                        elif action_name == "delete":
+                            for r in recs_c:
+                                if not (
+                                    deck.auth.has_permission(
+                                        user, f"{slug}:delete", model_slug=slug, obj=r
+                                    )
+                                    and view.can_delete_record(r, user)
+                                ):
+                                    raise PermissionDeniedError(f"Missing permission: {slug}:delete")
+                                if sd_col_name and sd_f is not None:
+                                    view.on_model_delete(r, user=user)
+                                    setattr(
+                                        r,
+                                        sd_col_name,
+                                        True
+                                        if sd_f.field_type == "boolean"
+                                        else datetime.now(timezone.utc),
+                                    )
+                                else:
+                                    chunk_orphans.extend(deck._collect_orphan_files(view, r))
+                                    view.on_model_delete(r, user=user)
+                                    job_sess.delete(r)
+                        elif bulk_spec is not None and bulk_handler is not None:
+                            for r in recs_c:
+                                if not deck.auth.has_permission(
+                                    user, bulk_perm, model_slug=slug, obj=r
+                                ):
+                                    raise PermissionDeniedError(f"Missing permission: {bulk_perm}")
+                            if bulk_spec.async_job:
+                                bulk_handler(recs_c, form_snap, user, job_ctx)
+                            else:
+                                bulk_handler(recs_c, form_snap, user)
+                        job_sess.commit()
+                    except Exception:
+                        job_sess.rollback()
+                        raise
+                    if chunk_orphans:
+                        deck._delete_orphan_files_best_effort(chunk_orphans)
                     processed += len(recs_c)
                     pct = int((idx_c / max(1, len(pk_chunks_all))) * 100)
                     job_ctx.set_progress(pct, f"Processed {processed:,}/{target_total:,} records")
-                deck._delete_orphan_files_best_effort(orphan_queue)
                 return f"Processed {processed:,} {view.plural_label}."
 
             def _on_chunk_done(rec: JobRecord) -> None:
@@ -2614,6 +2694,10 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                 sess.rollback()
                 flash("Bulk force delete failed due to foreign key references.", "danger")
                 return redirect(trash_return_url)
+            except (ValidationError, SQLAlchemyError) as exc:
+                sess.rollback()
+                flash(f"Bulk force delete failed: {exc}", "danger")
+                return redirect(trash_return_url)
             deck._delete_orphan_files_best_effort(orphan_files)
             deck._record_audit(
                 action_name="bulk_action",
@@ -2690,6 +2774,10 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             except IntegrityError:
                 sess.rollback()
                 flash("Bulk delete failed due to foreign key references.", "danger")
+                return redirect(list_return_url)
+            except (ValidationError, SQLAlchemyError) as exc:
+                sess.rollback()
+                flash(f"Bulk delete failed: {exc}", "danger")
                 return redirect(list_return_url)
 
             deck._delete_orphan_files_best_effort(orphan_files)
@@ -2782,6 +2870,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
             }
             for pk_k, pk_v in action_params.items():
                 act_diff[f"param:{pk_k}"] = {"old": None, "new": pk_v}
+            _imp_real = getattr(g, "_deck_real_user", None)
             req = make_approval_request(
                 model_slug=slug,
                 model_label=view.label,
@@ -2795,6 +2884,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                     "params": action_params,
                     "_actor_roles": list(user.roles) if user else [],
                     "_actor_superuser": bool(user.is_superuser) if user else False,
+                    **({"_impersonator_id": _imp_real.id} if _imp_real is not None else {}),
                 },
                 diff=act_diff,
                 reason=request.form.get("approval_reason", "").strip(),
@@ -3148,19 +3238,34 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                         f"Import contains {cached.errors} errored row(s). "
                         "Fix errors or enable 'Skip errored rows'."
                     )
+                elif deck.approval_store is not None and (
+                    (cached.creates > 0 and view.requires_approval(user, "create"))
+                    or (cached.updates > 0 and view.requires_approval(user, "edit"))
+                ):
+                    deck._preview_store.put(cached, user_id=user_id, session_token=sess_token)
+                    report = cached
+                    error_msg = (
+                        "Bulk import commit is blocked on models requiring four-eyes approval. "
+                        "Submit individual changes through the approval workflow."
+                    )
                 elif deck.job_backend is not None and (
                     async_commit or cached.applicable_count > deck.config.max_sync_import_rows
                 ):
                     def _run_async_import(job_ctx: JobContext) -> str:
                         job_ctx.set_progress(15, f"Importing {cached.applicable_count} rows into {view.plural_label}…")
                         job_sess = deck.get_session(view.bind_key)
-                        c_created, c_updated = commit_dry_run_import(
-                            job_sess,
-                            view,
-                            cached,
-                            user=user,
-                            skip_errors=skip_errors,
-                        )
+                        try:
+                            c_created, c_updated = commit_dry_run_import(
+                                job_sess,
+                                view,
+                                cached,
+                                user=user,
+                                skip_errors=skip_errors,
+                                views_by_model=deck._views_by_model,
+                            )
+                        except Exception:
+                            job_sess.rollback()
+                            raise
                         job_ctx.set_progress(100, f"Committed +{c_created} / ~{c_updated}.")
                         deck._record_audit(
                             action_name="import",
@@ -3221,6 +3326,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                             user=user,
                             skip_errors=skip_errors,
                             row_audit_cb=_collect_import_audit,
+                            views_by_model=deck._views_by_model,
                         )
                         for row_op, row_pk, row_repr, row_diff in import_row_audits:
                             deck._record_audit(
@@ -3259,7 +3365,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                             "ok",
                         )
                         return redirect(url_for(f"{bp_name}.model_list", slug=slug))
-                    except (ImportLimitError, SQLAlchemyError) as exc:
+                    except (ImportLimitError, ValidationError, ValueError, SQLAlchemyError) as exc:
                         bind_sess.rollback()
                         error_msg = str(exc)
             elif step == "map":
@@ -3382,6 +3488,7 @@ def register_crud_routes(bp: Blueprint, deck: Deck) -> None:
                             max_rows=deck.config.max_import_rows,
                             max_columns=deck.config.max_import_columns,
                             max_json_depth=deck.config.max_json_depth,
+                            views_by_model=deck._views_by_model,
                         )
                         bind_sess.rollback()
                         deck._preview_store.put(

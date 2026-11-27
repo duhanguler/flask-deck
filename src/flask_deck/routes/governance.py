@@ -14,6 +14,7 @@ from flask import (
     Response,
     abort,
     flash,
+    g,
     redirect,
     render_template,
     request,
@@ -24,7 +25,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from flask_deck.adapters.sqlalchemy import encode_pk
 from flask_deck.audit import AuditEntry, compute_diff
-from flask_deck.exceptions import PermissionDeniedError, ValidationError
+from flask_deck.exceptions import InvalidPKError, PermissionDeniedError, ValidationError
 from flask_deck.i18n import LOCALE_SESSION_KEY, TZ_SESSION_KEY, is_valid_timezone, normalize_locale
 from flask_deck.introspection import introspect_model
 from flask_deck.model_view import coerce_form_value
@@ -501,15 +502,16 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
             model_slug=model_filter,
             limit=100,
         )
+        excluded_models = deck._excluded_audit_models(user)
         sanitized_reqs: list[dict[str, Any]] = []
         for req in raw_reqs:
-            hidden = deck.auth.hidden_fields_for(user, req.model_slug)
-            filtered_diff = {
-                k: v for k, v in req.diff.items() if k not in hidden
-            }
+            if req.model_slug in excluded_models and (user is None or req.requester_id != user.id):
+                continue
+            filtered_diff = deck._sanitize_approval_diff(req.model_slug, req.diff, user)
             sanitized_reqs.append({"req": req, "diff": filtered_diff})
         can_review = (
             not deck.config.read_only
+            and getattr(g, "_deck_real_user", None) is None
             and user is not None
             and (user.is_superuser or deck.auth.has_permission(user, "approvals:review"))
         )
@@ -530,6 +532,10 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
     def approval_approve(approval_id: str) -> Any:
         if deck.approval_store is None:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "Four-eyes approvals cannot be decided while impersonating another user."
+            )
         user = deck._current_user()
         if user is None or not (
             user.is_superuser or deck.auth.has_permission(user, "approvals:review")
@@ -538,7 +544,8 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
         req = deck.approval_store.get(approval_id)
         if req is None:
             abort(404)
-        if user.id == req.requester_id:
+        impersonator_id = req.payload.get("_impersonator_id") if isinstance(req.payload, dict) else None
+        if user.id == req.requester_id or (impersonator_id and user.id == str(impersonator_id)):
             raise PermissionDeniedError("Four-eyes policy forbids approving your own request.")
         if req.status != "pending":
             flash(f"Approval #{req.id} is already {req.status}.", "warn")
@@ -561,10 +568,19 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
 
         try:
             deck._execute_approved_request(resolved, reviewer=user)
-        except (ValueError, ValidationError, SQLAlchemyError) as exc:
+        except (
+            ValueError,
+            ValidationError,
+            PermissionDeniedError,
+            InvalidPKError,
+            SQLAlchemyError,
+        ) as exc:
             target_view = deck.views.get(resolved.model_slug)
             if target_view is not None:
                 deck.get_session(target_view.bind_key).rollback()
+            reopen_fn = getattr(deck.approval_store, "reopen", None)
+            if callable(reopen_fn):
+                reopen_fn(resolved.id)
             flash(f"Approved request #{resolved.id} failed during execution: {exc}", "danger")
             return redirect(url_for(f"{bp_name}.approvals_list"))
 
@@ -578,6 +594,10 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
     def approval_reject(approval_id: str) -> Any:
         if deck.approval_store is None:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "Four-eyes approvals cannot be decided while impersonating another user."
+            )
         user = deck._current_user()
         if user is None or not (
             user.is_superuser or deck.auth.has_permission(user, "approvals:review")
@@ -586,7 +606,8 @@ def register_governance_routes(bp: Blueprint, deck: Deck) -> None:
         req = deck.approval_store.get(approval_id)
         if req is None:
             abort(404)
-        if user.id == req.requester_id:
+        impersonator_id = req.payload.get("_impersonator_id") if isinstance(req.payload, dict) else None
+        if user.id == req.requester_id or (impersonator_id and user.id == str(impersonator_id)):
             raise PermissionDeniedError("Four-eyes policy forbids rejecting your own request.")
         if req.status != "pending":
             flash(f"Approval #{req.id} is already {req.status}.", "warn")

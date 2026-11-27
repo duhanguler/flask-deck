@@ -103,6 +103,13 @@ dev = [
     "flask-sqlalchemy>=3.1.0",
     "flask-login>=0.6.3",
 ]
+integration = [
+    "psycopg[binary]>=3.2.0",
+    "redis>=5.0.0",
+]
+e2e = [
+    "playwright>=1.49.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/duhanguler/flask-deck"
@@ -136,7 +143,12 @@ include = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -m 'not e2e and not postgres and not redis'"
+markers = [
+    "postgres: integration tests requiring a live PostgreSQL server (FLASK_DECK_TEST_PG_URL)",
+    "redis: integration tests requiring a live Redis server (FLASK_DECK_TEST_REDIS_URL)",
+    "e2e: browser end-to-end tests requiring Playwright Chromium",
+]
 
 [tool.ruff]
 target-version = "py310"
@@ -159,6 +171,9 @@ module = [
     "flask_login.*",
     "sqlalchemy.*",
     "pytest.*",
+    "psycopg.*",
+    "redis.*",
+    "playwright.*",
 ]
 ignore_missing_imports = true
 
@@ -168,8 +183,11 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
-exclude_lines = [
-    "pragma: no cover",
+exclude_also = [
     "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "^\\s*\\.\\.\\.\\s*$",
+    "@overload",
+    "@(abc\\.)?abstractmethod",
     "raise NotImplementedError",
 ]

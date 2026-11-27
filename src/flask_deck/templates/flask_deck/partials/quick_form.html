@@ -1,5 +1,6 @@
 <form method="post" action="{{ action_url }}" class="dk-content" data-deck-quick-form>
   <input type="hidden" name="{{ csrf_field }}" value="{{ csrf_token }}">
+  {% if occ_version %}<input type="hidden" name="_deck_version" value="{{ occ_version }}">{% endif %}
 
   {% if errors.get('__all__') %}
   <div class="dk-alert dk-alert-danger" role="alert">

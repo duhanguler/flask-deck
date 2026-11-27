@@ -7,6 +7,7 @@ import enum
 import hashlib
 import hmac
 import json
+import math
 import re
 import time
 import uuid
@@ -31,6 +32,13 @@ _TELEMETRY_G_KEY = "_flask_deck_sql_telemetry"
 _INSTRUMENTED_ENGINES: weakref.WeakSet[Engine] = weakref.WeakSet()
 
 _JSON_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){0,4}$")
+_INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
+
+
+def _mysql_json_path(clean_path: str) -> str:
+    """Format a validated dotted JSON path with MySQL double-quoted segments (handles hyphens)."""
+    return "$." + ".".join(f'"{seg}"' for seg in clean_path.split("."))
 
 PaginationMode = Literal["offset", "cursor"]
 CountMode = Literal["exact", "estimated", "none"]
@@ -296,19 +304,24 @@ def _coerce_filter_value(
         return None
     if fmeta.field_type == "integer":
         try:
-            return int(raw)
+            iv = int(raw)
         except (TypeError, ValueError):
             return None
+        if iv < _INT64_MIN or iv > _INT64_MAX:
+            return None
+        return iv
     if fmeta.field_type == "float":
         try:
-            return float(raw)
+            fv = float(raw)
         except (TypeError, ValueError):
             return None
+        return fv if math.isfinite(fv) else None
     if fmeta.field_type == "decimal":
         try:
-            return Decimal(str(raw))
+            dv = Decimal(str(raw))
         except (InvalidOperation, ValueError):
             return None
+        return dv if dv.is_finite() else None
     if fmeta.field_type == "uuid":
         try:
             return raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
@@ -391,7 +404,7 @@ def _build_json_path_condition(
         expr: sa.ColumnElement[bool] = accessor == target
         return expr
     # SQLite / MySQL / generic JSON extract
-    json_path = f"$.{clean_path}"
+    json_path = _mysql_json_path(clean_path) if dialect_name in {"mysql", "mariadb"} else f"$.{clean_path}"
     extracted = sa.func.json_extract(col, json_path)
     if dialect_name in {"mysql", "mariadb"}:
         mysql_expr: sa.ColumnElement[bool] = sa.func.json_unquote(extracted) == target
@@ -419,11 +432,14 @@ def _build_json_has_key_condition(
         return pg_expr
     if dialect_name == "postgresql":
         parts = clean_key.split(".")
-        accessor = _pg_json_text_accessor(col, parts)
-        pg_null_expr: sa.ColumnElement[bool] = accessor.is_not(None)
+        indexed = col[parts] if len(parts) > 1 else col[parts[0]]
+        typeof_fn = sa.func.jsonb_typeof if fmeta.is_jsonb else sa.func.json_typeof
+        pg_null_expr: sa.ColumnElement[bool] = typeof_fn(indexed).is_not(None)
         return pg_null_expr
     if dialect_name in {"mysql", "mariadb"}:
-        mysql_expr: sa.ColumnElement[bool] = sa.func.json_contains_path(col, "one", f"$.{clean_key}") == 1
+        mysql_expr: sa.ColumnElement[bool] = (
+            sa.func.json_contains_path(col, "one", _mysql_json_path(clean_key)) == 1
+        )
         return mysql_expr
     # SQLite json_type returns NULL when path does not exist, non-NULL even if JSON value is null!
     sqlite_expr: sa.ColumnElement[bool] = sa.func.json_type(col, f"$.{clean_key}").is_not(None)
@@ -475,9 +491,13 @@ def _build_json_contains_condition(
         for path, v in flat_pairs:
             if v is None:
                 if dialect_name == "postgresql":
-                    has_key = _build_json_has_key_condition(col, fmeta, path, dialect_name=dialect_name)
-                    is_null = _pg_json_text_accessor(col, path.split(".")).is_(None)
-                    preds.append(sa.and_(has_key, is_null) if has_key is not None else is_null)
+                    parts = path.split(".")
+                    indexed = col[parts] if len(parts) > 1 else col[parts[0]]
+                    typeof_fn = sa.func.jsonb_typeof if fmeta.is_jsonb else sa.func.json_typeof
+                    preds.append(typeof_fn(indexed) == "null")
+                elif dialect_name in {"mysql", "mariadb"}:
+                    extracted_null = sa.func.json_extract(col, _mysql_json_path(path))
+                    preds.append(sa.func.json_type(extracted_null) == "NULL")
                 else:
                     preds.append(sa.func.json_type(col, f"$.{path}") == "null")
                 continue
@@ -607,7 +627,7 @@ def build_filter_condition(
         if coerced is None:
             return None
         if op == "lte" and fmeta.field_type == "datetime" and isinstance(raw_value, str) and len(raw_value) <= 10:
-            coerced = coerced + timedelta(days=1) - timedelta(microseconds=1)
+            coerced = coerced.replace(hour=23, minute=59, second=59, microsecond=999999)
         if op == "gt":
             gt_expr: sa.ColumnElement[bool] = col > coerced
             return gt_expr
@@ -831,6 +851,8 @@ def _build_scalar_search_pred(
         try:
             int_val = int(token)
         except ValueError:
+            return None
+        if int_val < _INT64_MIN or int_val > _INT64_MAX:
             return None
         eq_int: sa.ColumnElement[bool] = col == int_val
         return eq_int
@@ -1087,13 +1109,24 @@ def soft_delete_predicate(
 
 def build_pg_reltuples_statement(table_name: str, *, schema: str | None = None) -> sa.TextClause:
     """Build parameterized O(1) PostgreSQL catalog row-estimate statement (schema-aware)."""
+    if schema:
+        return sa.text(
+            "SELECT CAST(c.reltuples AS BIGINT) "
+            "FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = :tbl AND n.nspname = :sch "
+            "LIMIT 1"
+        ).bindparams(
+            sa.bindparam("tbl", value=table_name, type_=sa.String),
+            sa.bindparam("sch", value=schema, type_=sa.String),
+        )
     return sa.text(
         "SELECT CAST(c.reltuples AS BIGINT) "
         "FROM pg_class c "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE c.relname = :tbl AND n.nspname = COALESCE(:sch, current_schema()) "
+        "WHERE c.relname = :tbl AND n.nspname = current_schema() "
         "LIMIT 1"
-    ).bindparams(tbl=table_name, sch=schema)
+    ).bindparams(sa.bindparam("tbl", value=table_name, type_=sa.String))
 
 
 def estimate_table_rows(session: Session, meta: ModelMeta) -> int | None:
@@ -1805,12 +1838,17 @@ def execute_list_query(
                 stmt = stmt.outerjoin(rel_attr)
             if clauses:
                 stmt = stmt.where(*clauses)
-            # Explicit NULL placement guarantees SQLite & PostgreSQL match _build_keyset_predicate
-            order_clauses: list[Any] = [
-                sort_col.desc().nulls_last()
-                if direction == "desc"
-                else sort_col.asc().nulls_first()
-            ]
+            # Explicit NULL placement guarantees SQLite & PostgreSQL match _build_keyset_predicate.
+            # MySQL/MariaDB reject NULLS LAST/FIRST syntax and already sort NULLs smallest natively.
+            if dialect_name in {"mysql", "mariadb"}:
+                primary_order: Any = sort_col.desc() if direction == "desc" else sort_col.asc()
+            else:
+                primary_order = (
+                    sort_col.desc().nulls_last()
+                    if direction == "desc"
+                    else sort_col.asc().nulls_first()
+                )
+            order_clauses: list[Any] = [primary_order]
             if chosen_sort != pk_field.name:
                 order_clauses.append(pk_col.desc() if direction == "desc" else pk_col.asc())
             stmt = stmt.order_by(*order_clauses)

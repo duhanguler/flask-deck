@@ -10,6 +10,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 PASSKEY_REG_CHALLENGE_KEY = "_deck_pk_reg_challenge"
@@ -83,6 +84,8 @@ class InMemoryPasskeyStore:
         now = cred.created_at or datetime.now(timezone.utc)
         stored = replace(cred, created_at=now)
         with self._lock:
+            if stored.credential_id in self._creds:
+                raise ValueError("Passkey credential is already registered.")
             self._creds[stored.credential_id] = stored
         return replace(stored)
 
@@ -158,22 +161,23 @@ class SQLAlchemyPasskeyStore:
     def add(self, cred: PasskeyCredential) -> PasskeyCredential:
         now = cred.created_at or datetime.now(timezone.utc)
         with Session(self._engine) as sess:
-            sess.execute(
-                self._table.delete().where(self._table.c.credential_id == cred.credential_id)
-            )
-            sess.execute(
-                self._table.insert().values(
-                    credential_id=cred.credential_id,
-                    user_id=cred.user_id,
-                    label=cred.label[:128],
-                    public_key_b64=cred.public_key_b64,
-                    sign_count=int(cred.sign_count),
-                    transports_json=json.dumps(list(cred.transports)),
-                    created_at=now,
-                    last_used_at=cred.last_used_at,
+            try:
+                sess.execute(
+                    self._table.insert().values(
+                        credential_id=cred.credential_id,
+                        user_id=cred.user_id,
+                        label=cred.label[:128],
+                        public_key_b64=cred.public_key_b64,
+                        sign_count=int(cred.sign_count),
+                        transports_json=json.dumps(list(cred.transports)),
+                        created_at=now,
+                        last_used_at=cred.last_used_at,
+                    )
                 )
-            )
-            sess.commit()
+                sess.commit()
+            except IntegrityError as exc:
+                sess.rollback()
+                raise ValueError("Passkey credential is already registered.") from exc
         return replace(cred, created_at=now)
 
     def get(self, credential_id: str) -> PasskeyCredential | None:
@@ -222,12 +226,23 @@ def begin_passkey_registration(
 ) -> tuple[dict[str, Any], str]:
     """Generate WebAuthn registration options JSON and base64url challenge."""
     wa = _import_webauthn()
+    descriptors: list[Any] = []
+    structs = getattr(getattr(wa, "helpers", None), "structs", None)
+    desc_cls = getattr(structs, "PublicKeyCredentialDescriptor", None)
+    if desc_cls is not None:
+        for existing in exclude_credentials:
+            try:
+                pad = "=" * (-len(existing.credential_id) % 4)
+                raw_id = base64.urlsafe_b64decode(existing.credential_id + pad)
+                descriptors.append(desc_cls(id=raw_id))
+            except Exception:
+                continue
     opts = wa.generate_registration_options(
         rp_id=rp_id,
         rp_name=rp_name,
         user_id=user_id.encode("utf-8"),
         user_name=user_name,
-        exclude_credentials=[],
+        exclude_credentials=descriptors,
     )
     opts_json = json.loads(wa.options_to_json(opts))
     challenge_b64 = str(opts_json["challenge"])
@@ -252,6 +267,7 @@ def complete_passkey_registration(
         expected_challenge=raw_challenge,
         expected_origin=expected_origin,
         expected_rp_id=expected_rp_id,
+        require_user_verification=True,
     )
     cred_id_b64 = base64.urlsafe_b64encode(verification.credential_id).decode("ascii").rstrip("=")
     pub_b64 = (
@@ -274,7 +290,12 @@ def begin_passkey_authentication(
 ) -> tuple[dict[str, Any], str]:
     """Generate WebAuthn authentication options JSON and base64url challenge."""
     wa = _import_webauthn()
-    opts = wa.generate_authentication_options(rp_id=rp_id)
+    structs = getattr(getattr(wa, "helpers", None), "structs", None)
+    uv_enum = getattr(structs, "UserVerificationRequirement", None)
+    kwargs: dict[str, Any] = {"rp_id": rp_id}
+    if uv_enum is not None and hasattr(uv_enum, "REQUIRED"):
+        kwargs["user_verification"] = uv_enum.REQUIRED
+    opts = wa.generate_authentication_options(**kwargs)
     opts_json = json.loads(wa.options_to_json(opts))
     challenge_b64 = str(opts_json["challenge"])
     return opts_json, challenge_b64
@@ -288,7 +309,7 @@ def complete_passkey_authentication(
     expected_rp_id: str,
     stored: PasskeyCredential,
 ) -> int:
-    """Verify WebAuthn assertion and return updated sign_count."""
+    """Verify WebAuthn assertion (requiring User Verification for MFA equivalence) and return updated sign_count."""
     wa = _import_webauthn()
     c_pad = "=" * (-len(expected_challenge_b64) % 4)
     p_pad = "=" * (-len(stored.public_key_b64) % 4)
@@ -301,5 +322,6 @@ def complete_passkey_authentication(
         expected_rp_id=expected_rp_id,
         credential_public_key=raw_pub,
         credential_current_sign_count=stored.sign_count,
+        require_user_verification=True,
     )
     return int(getattr(verification, "new_sign_count", stored.sign_count + 1))

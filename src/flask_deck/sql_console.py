@@ -28,7 +28,7 @@ _FORBIDDEN_KEYWORDS_RE = re.compile(
     r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|MERGE|UPSERT|"
     r"GRANT|REVOKE|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|COPY|CALL|EXEC|EXECUTE|"
     r"COMMIT|ROLLBACK|BEGIN|SAVEPOINT|RELEASE|SET|RESET|"
-    r"LOAD_EXTENSION|INTO\s+OUTFILE|INTO\s+DUMPFILE|"
+    r"LOAD_EXTENSION|LOAD_FILE|SLEEP|BENCHMARK|INTO\s+OUTFILE|INTO\s+DUMPFILE|"
     r"PG_READ_FILE|PG_READ_BINARY_FILE|PG_WRITE_FILE|PG_LS_DIR|PG_STAT_FILE|"
     r"PG_SLEEP|PG_TERMINATE_BACKEND|PG_CANCEL_BACKEND|PG_RELOAD_CONF|"
     r"SET_CONFIG|DBLINK|DBLINK_EXEC|QUERY_TO_XML|"
@@ -42,7 +42,7 @@ _FORBIDDEN_TABLES_RE = re.compile(
     r"_flask_deck_users|_flask_deck_password_resets|_flask_deck_user_groups|"
     r"_flask_deck_user_permissions|_flask_deck_groups|"
     r"_flask_deck_import_previews|_flask_deck_webhook_deliveries|deck_api_keys|"
-    r"pg_authid|pg_shadow|pg_roles|mysql\.user|sqlite_temp_master)\b",
+    r"pg_authid|pg_shadow|pg_roles|mysql\s*\.\s*user|sqlite_temp_master)\b",
     re.IGNORECASE,
 )
 
@@ -78,7 +78,10 @@ def _strip_sql_comments_and_literals(
     quoted_idents: list[str] = []
     n = len(sql)
     i = 0
-    is_mysql = dialect_name.lower().startswith(("mysql", "mariadb"))
+    low_dialect = dialect_name.lower()
+    is_mysql = low_dialect.startswith(("mysql", "mariadb"))
+    is_pg = low_dialect.startswith("postgres")
+    is_sqlite = low_dialect.startswith("sqlite")
 
     while i < n:
         ch = sql[i]
@@ -123,6 +126,19 @@ def _strip_sql_comments_and_literals(
         if ch in {"e", "E"} and nxt == "'" and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_")):
             raise ValueError("Escape-string literals (E'...') are not permitted in the read-only console.")
 
+        # Reject PostgreSQL Unicode escape strings/identifiers (U&'...' / U&"...") to prevent
+        # encoded table/column names bypassing denylist or sensitive-column redaction.
+        if (
+            ch in {"u", "U"}
+            and nxt == "&"
+            and i + 2 < n
+            and sql[i + 2] in {"'", '"'}
+            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] == "_"))
+        ):
+            raise ValueError(
+                "Unicode escape strings/identifiers (U&'...' / U&\"...\") are not permitted in the read-only console."
+            )
+
         # Single-quoted string literal ('...' with standard SQL '' escape only)
         if ch == "'":
             i += 1
@@ -145,19 +161,44 @@ def _strip_sql_comments_and_literals(
             out.append(" '' ")
             continue
 
-        # PostgreSQL dollar-quoted string literal ($tag$...$tag$)
-        if ch == "$":
+        # PostgreSQL-only dollar-quoted string literal ($tag$...$tag$)
+        # Valid only when not mid-identifier and tag is empty ($$) or starts with letter/underscore.
+        if (
+            is_pg
+            and ch == "$"
+            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in {"_", "$"}))
+        ):
             tag_end = i + 1
-            while tag_end < n and (sql[tag_end].isalnum() or sql[tag_end] == "_"):
-                tag_end += 1
-            if tag_end < n and sql[tag_end] == "$":
-                tag = sql[i : tag_end + 1]
-                close_pos = sql.find(tag, tag_end + 1)
-                if close_pos == -1:
-                    raise ValueError("Unterminated dollar-quoted string in SQL query.")
-                i = close_pos + len(tag)
-                out.append(" '' ")
-                continue
+            if tag_end < n and (sql[tag_end] == "$" or sql[tag_end].isalpha() or sql[tag_end] == "_"):
+                while tag_end < n and (sql[tag_end].isalnum() or sql[tag_end] == "_"):
+                    tag_end += 1
+                if tag_end < n and sql[tag_end] == "$":
+                    tag = sql[i : tag_end + 1]
+                    close_pos = sql.find(tag, tag_end + 1)
+                    if close_pos == -1:
+                        raise ValueError("Unterminated dollar-quoted string in SQL query.")
+                    i = close_pos + len(tag)
+                    out.append(" '' ")
+                    continue
+
+        # SQLite bracket-quoted identifier ([...]) — keep identifier text inspectable
+        if is_sqlite and ch == "[":
+            i += 1
+            buf_sq: list[str] = []
+            closed = False
+            while i < n:
+                if sql[i] == "]":
+                    i += 1
+                    closed = True
+                    break
+                buf_sq.append(sql[i])
+                i += 1
+            if not closed:
+                raise ValueError("Unterminated bracket-quoted identifier in SQL query.")
+            ident_sq = "".join(buf_sq)
+            quoted_idents.append(ident_sq)
+            out.append(f" {ident_sq} ")
+            continue
 
         # Double-quoted or backtick-quoted identifier — keep identifier text inspectable
         if ch in {'"', "`"}:
@@ -166,6 +207,10 @@ def _strip_sql_comments_and_literals(
             buf: list[str] = []
             closed = False
             while i < n:
+                if is_mysql and quote_ch == '"' and sql[i] == "\\":
+                    raise ValueError(
+                        "Backslash escapes in double-quoted strings are not permitted; use '' instead."
+                    )
                 if sql[i] == quote_ch:
                     if i + 1 < n and sql[i + 1] == quote_ch:
                         buf.append(quote_ch)
@@ -231,7 +276,7 @@ def _split_top_level_select_items(normalized_sql: str) -> list[str]:
                 items.append(normalized_sql[start:i].strip())
                 start = i + 1
             elif upper[i:].startswith("FROM") and (
-                (i == 0 or not upper[i - 1].isalnum())
+                (i == 0 or not (upper[i - 1].isalnum() or upper[i - 1] == "_"))
                 and (i + 4 >= n or not (upper[i + 4].isalnum() or upper[i + 4] == "_"))
             ):
                 items.append(normalized_sql[start:i].strip())

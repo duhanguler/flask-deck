@@ -4,18 +4,172 @@
   const D = window.__deck;
   if (!D) return;
 
-  document.querySelectorAll("[data-deck-slider]").forEach((wrap) => {
-    const inp = wrap.querySelector("[data-slider-input]");
-    const out = wrap.querySelector("[data-slider-val]");
-    const suffix = wrap.hasAttribute("data-slider-suffix") ? (wrap.getAttribute("data-slider-suffix") || "") : "%";
-    if (inp && out) inp.addEventListener("input", () => { out.textContent = inp.value + suffix; });
-  });
+  function initDynamicWidgets(rootEl) {
+    const scope = rootEl || document;
+    scope.querySelectorAll("[data-deck-slider]").forEach((wrap) => {
+      if (wrap.hasAttribute("data-dk-init")) return;
+      wrap.setAttribute("data-dk-init", "1");
+      const inp = wrap.querySelector("[data-slider-input]");
+      const out = wrap.querySelector("[data-slider-val]");
+      const suffix = wrap.hasAttribute("data-slider-suffix") ? (wrap.getAttribute("data-slider-suffix") || "") : "%";
+      if (inp && out) inp.addEventListener("input", () => { out.textContent = inp.value + suffix; });
+    });
 
-  document.querySelectorAll("[data-color-widget]").forEach((wrap) => {
-    const inp = wrap.querySelector("[data-color-input]");
-    const lbl = wrap.querySelector("[data-color-label]");
-    if (inp && lbl) inp.addEventListener("input", () => { lbl.textContent = inp.value; });
-  });
+    scope.querySelectorAll("[data-color-widget]").forEach((wrap) => {
+      if (wrap.hasAttribute("data-dk-init")) return;
+      wrap.setAttribute("data-dk-init", "1");
+      const inp = wrap.querySelector("[data-color-input]");
+      const lbl = wrap.querySelector("[data-color-label]");
+      if (inp && lbl) inp.addEventListener("input", () => { lbl.textContent = inp.value; });
+    });
+
+    scope.querySelectorAll("[data-deck-json-kv]").forEach((ed) => {
+      if (ed.hasAttribute("data-dk-init")) return;
+      ed.setAttribute("data-dk-init", "1");
+      const rowsHost = ed.querySelector("[data-kv-rows]");
+      const rawTa = ed.querySelector("[data-kv-raw]");
+      const addBtn = ed.querySelector("[data-kv-add]");
+      if (!rowsHost || !rawTa) return;
+      const isRo = rawTa.readOnly || rawTa.disabled;
+      if (isRo && addBtn) addBtn.hidden = true;
+      let kvDirty = false;
+      let kvSupported = true;
+
+      function syncToRaw() {
+        if (isRo || (!kvSupported && !kvDirty)) return;
+        const obj = {};
+        rowsHost.querySelectorAll(".dk-kv-row-ed").forEach((r) => {
+          const k = r.querySelector("[data-kv-k]").value.trim();
+          const vStr = r.querySelector("[data-kv-v]").value;
+          if (!k) return;
+          const vt = vStr.trim();
+          let parsed = vStr;
+          if (vt === "true") parsed = true;
+          else if (vt === "false") parsed = false;
+          else if (vt === "null") parsed = null;
+          else if (vt !== "" && !Number.isNaN(Number(vt))) parsed = Number(vt);
+          else if ((vt.startsWith("{") && vt.endsWith("}")) || (vt.startsWith("[") && vt.endsWith("]"))) {
+            try { parsed = JSON.parse(vt); } catch (_) {}
+          }
+          obj[k] = parsed;
+        });
+        rawTa.value = JSON.stringify(obj, null, 2);
+      }
+
+      function addRow(k, v) {
+        const r = document.createElement("div");
+        r.className = "dk-kv-row-ed";
+        const ki = document.createElement("input");
+        ki.type = "text"; ki.className = "dk-input dk-mono"; ki.placeholder = "key"; ki.value = k || ""; ki.readOnly = isRo; ki.setAttribute("data-kv-k", "");
+        const vi = document.createElement("input");
+        vi.type = "text"; vi.className = "dk-input dk-mono"; vi.placeholder = "value"; vi.value = v !== undefined ? String(v) : ""; vi.readOnly = isRo; vi.setAttribute("data-kv-v", "");
+        r.appendChild(ki); r.appendChild(vi);
+        if (!isRo) {
+          const rm = document.createElement("button");
+          rm.type = "button"; rm.className = "dk-btn dk-btn-ghost dk-btn-icon"; rm.textContent = "×";
+          ki.addEventListener("input", () => { kvDirty = true; syncToRaw(); });
+          vi.addEventListener("input", () => { kvDirty = true; syncToRaw(); });
+          rm.addEventListener("click", () => { kvDirty = true; r.remove(); syncToRaw(); });
+          r.appendChild(rm);
+        }
+        rowsHost.appendChild(r);
+      }
+
+      function loadFromRaw() {
+        rowsHost.replaceChildren();
+        kvDirty = false;
+        try {
+          const data = JSON.parse(rawTa.value || "{}");
+          if (data && typeof data === "object" && !Array.isArray(data)) {
+            kvSupported = true;
+            const entries = Object.entries(data);
+            if (!entries.length && !isRo) addRow("", "");
+            else entries.forEach(([k, v]) => addRow(k, v === null ? "null" : (typeof v === "object" ? JSON.stringify(v) : v)));
+            return;
+          }
+        } catch (_) {}
+        kvSupported = false;
+        addRow("", "");
+      }
+      loadFromRaw();
+
+      if (addBtn && !isRo) addBtn.addEventListener("click", () => { kvDirty = true; addRow("", ""); });
+      ed.querySelectorAll("[data-kv-mode]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const mode = btn.getAttribute("data-kv-mode");
+          ed.querySelectorAll("[data-kv-mode]").forEach((b) => b.classList.toggle("is-active", b === btn));
+          if (mode === "raw") { if (kvDirty) syncToRaw(); rowsHost.hidden = true; rawTa.hidden = false; }
+          else { loadFromRaw(); rowsHost.hidden = false; rawTa.hidden = true; }
+        });
+      });
+    });
+
+    scope.querySelectorAll("[data-deck-md]").forEach((wrap) => {
+      if (wrap.hasAttribute("data-dk-init")) return;
+      wrap.setAttribute("data-dk-init", "1");
+      const ta = wrap.querySelector("[data-md-input]");
+      const prev = wrap.querySelector("[data-md-preview]");
+      if (!ta || !prev) return;
+      wrap.querySelectorAll("[data-md-mode]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const mode = btn.getAttribute("data-md-mode");
+          wrap.querySelectorAll("[data-md-mode]").forEach((b) => b.classList.toggle("is-active", b === btn));
+          if (mode === "preview") { D.renderSafeMarkdown(ta.value, prev); ta.hidden = true; prev.hidden = false; }
+          else { ta.hidden = false; prev.hidden = true; }
+        });
+      });
+    });
+
+    scope.querySelectorAll("[data-deck-tags]").forEach((wrap) => {
+      if (wrap.hasAttribute("data-dk-init")) return;
+      wrap.setAttribute("data-dk-init", "1");
+      const hid = wrap.querySelector("[data-tags-hidden]");
+      const host = wrap.querySelector("[data-tags-chips]");
+      const inp = wrap.querySelector("[data-tags-input]");
+      if (!hid || !host) return;
+      const isRo = !inp || inp.readOnly || inp.disabled;
+      let items = [];
+      try { const p = JSON.parse(hid.value || "[]"); if (Array.isArray(p)) items = p.map(String); } catch (_) {}
+      function sync() {
+        hid.value = JSON.stringify(items);
+        host.replaceChildren();
+        items.forEach((val, idx) => {
+          const pill = document.createElement("span");
+          pill.className = "dk-filter-chip dk-mono";
+          const sp = document.createElement("span"); sp.textContent = val;
+          pill.appendChild(sp);
+          if (!isRo) {
+            const rm = document.createElement("button"); rm.type = "button"; rm.className = "dk-subtle"; rm.textContent = "×";
+            rm.setAttribute("aria-label", "Remove tag");
+            rm.addEventListener("click", () => { items.splice(idx, 1); sync(); });
+            pill.appendChild(rm);
+          }
+          host.appendChild(pill);
+        });
+      }
+      function commitInput() {
+        if (isRo || !inp.value.trim()) return;
+        let changed = false;
+        inp.value.split(",").forEach((part) => {
+          const v = part.trim();
+          if (v && !items.includes(v)) { items.push(v); changed = true; }
+        });
+        inp.value = "";
+        if (changed) sync();
+      }
+      if (!isRo) {
+        inp.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commitInput(); }
+          else if (e.key === "Backspace" && !inp.value && items.length) { items.pop(); sync(); }
+        });
+        inp.addEventListener("blur", commitInput);
+        const pf = wrap.closest("form");
+        if (pf) pf.addEventListener("submit", commitInput);
+      }
+      sync();
+    });
+  }
+  initDynamicWidgets(document);
 
   document.querySelectorAll("[data-deck-m2m]").forEach((wrap) => {
     const flt = wrap.querySelector("[data-m2m-filter]");
@@ -30,99 +184,6 @@
     }
     wrap.addEventListener("change", () => {
       if (cnt) cnt.textContent = wrap.querySelectorAll("[data-m2m-check]:checked").length + " selected";
-    });
-  });
-
-  document.querySelectorAll("[data-deck-json-kv]").forEach((ed) => {
-    const rowsHost = ed.querySelector("[data-kv-rows]");
-    const rawTa = ed.querySelector("[data-kv-raw]");
-    const addBtn = ed.querySelector("[data-kv-add]");
-    if (!rowsHost || !rawTa) return;
-    const isRo = rawTa.readOnly || rawTa.disabled;
-    if (isRo && addBtn) addBtn.hidden = true;
-    let kvDirty = false;
-    let kvSupported = true;
-
-    function syncToRaw() {
-      if (isRo || (!kvSupported && !kvDirty)) return;
-      const obj = {};
-      rowsHost.querySelectorAll(".dk-kv-row-ed").forEach((r) => {
-        const k = r.querySelector("[data-kv-k]").value.trim();
-        const vStr = r.querySelector("[data-kv-v]").value;
-        if (!k) return;
-        const vt = vStr.trim();
-        let parsed = vStr;
-        if (vt === "true") parsed = true;
-        else if (vt === "false") parsed = false;
-        else if (vt === "null") parsed = null;
-        else if (vt !== "" && !Number.isNaN(Number(vt))) parsed = Number(vt);
-        else if ((vt.startsWith("{") && vt.endsWith("}")) || (vt.startsWith("[") && vt.endsWith("]"))) {
-          try { parsed = JSON.parse(vt); } catch (_) {}
-        }
-        obj[k] = parsed;
-      });
-      rawTa.value = JSON.stringify(obj, null, 2);
-    }
-
-    function addRow(k, v) {
-      const r = document.createElement("div");
-      r.className = "dk-kv-row-ed";
-      const ki = document.createElement("input");
-      ki.type = "text"; ki.className = "dk-input dk-mono"; ki.placeholder = "key"; ki.value = k || ""; ki.readOnly = isRo; ki.setAttribute("data-kv-k", "");
-      const vi = document.createElement("input");
-      vi.type = "text"; vi.className = "dk-input dk-mono"; vi.placeholder = "value"; vi.value = v !== undefined ? String(v) : ""; vi.readOnly = isRo; vi.setAttribute("data-kv-v", "");
-      r.appendChild(ki); r.appendChild(vi);
-      if (!isRo) {
-        const rm = document.createElement("button");
-        rm.type = "button"; rm.className = "dk-btn dk-btn-ghost dk-btn-icon"; rm.textContent = "×";
-        ki.addEventListener("input", () => { kvDirty = true; syncToRaw(); });
-        vi.addEventListener("input", () => { kvDirty = true; syncToRaw(); });
-        rm.addEventListener("click", () => { kvDirty = true; r.remove(); syncToRaw(); });
-        r.appendChild(rm);
-      }
-      rowsHost.appendChild(r);
-    }
-
-    function loadFromRaw() {
-      rowsHost.replaceChildren();
-      kvDirty = false;
-      try {
-        const data = JSON.parse(rawTa.value || "{}");
-        if (data && typeof data === "object" && !Array.isArray(data)) {
-          kvSupported = true;
-          const entries = Object.entries(data);
-          if (!entries.length && !isRo) addRow("", "");
-          else entries.forEach(([k, v]) => addRow(k, v === null ? "null" : (typeof v === "object" ? JSON.stringify(v) : v)));
-          return;
-        }
-      } catch (_) {}
-      kvSupported = false;
-      addRow("", "");
-    }
-    loadFromRaw();
-
-    if (addBtn && !isRo) addBtn.addEventListener("click", () => { kvDirty = true; addRow("", ""); });
-    ed.querySelectorAll("[data-kv-mode]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const mode = btn.getAttribute("data-kv-mode");
-        ed.querySelectorAll("[data-kv-mode]").forEach((b) => b.classList.toggle("is-active", b === btn));
-        if (mode === "raw") { if (kvDirty) syncToRaw(); rowsHost.hidden = true; rawTa.hidden = false; }
-        else { loadFromRaw(); rowsHost.hidden = false; rawTa.hidden = true; }
-      });
-    });
-  });
-
-  document.querySelectorAll("[data-deck-md]").forEach((wrap) => {
-    const ta = wrap.querySelector("[data-md-input]");
-    const prev = wrap.querySelector("[data-md-preview]");
-    if (!ta || !prev) return;
-    wrap.querySelectorAll("[data-md-mode]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const mode = btn.getAttribute("data-md-mode");
-        wrap.querySelectorAll("[data-md-mode]").forEach((b) => b.classList.toggle("is-active", b === btn));
-        if (mode === "preview") { D.renderSafeMarkdown(ta.value, prev); ta.hidden = true; prev.hidden = false; }
-        else { ta.hidden = false; prev.hidden = true; }
-      });
     });
   });
 
@@ -447,53 +508,6 @@
     });
   });
 
-  document.querySelectorAll("[data-deck-tags]").forEach((wrap) => {
-    const hid = wrap.querySelector("[data-tags-hidden]");
-    const host = wrap.querySelector("[data-tags-chips]");
-    const inp = wrap.querySelector("[data-tags-input]");
-    if (!hid || !host) return;
-    const isRo = !inp || inp.readOnly || inp.disabled;
-    let items = [];
-    try { const p = JSON.parse(hid.value || "[]"); if (Array.isArray(p)) items = p.map(String); } catch (_) {}
-    function sync() {
-      hid.value = JSON.stringify(items);
-      host.replaceChildren();
-      items.forEach((val, idx) => {
-        const pill = document.createElement("span");
-        pill.className = "dk-filter-chip dk-mono";
-        const sp = document.createElement("span"); sp.textContent = val;
-        pill.appendChild(sp);
-        if (!isRo) {
-          const rm = document.createElement("button"); rm.type = "button"; rm.className = "dk-subtle"; rm.textContent = "×";
-          rm.setAttribute("aria-label", "Remove tag");
-          rm.addEventListener("click", () => { items.splice(idx, 1); sync(); });
-          pill.appendChild(rm);
-        }
-        host.appendChild(pill);
-      });
-    }
-    function commitInput() {
-      if (isRo || !inp.value.trim()) return;
-      let changed = false;
-      inp.value.split(",").forEach((part) => {
-        const v = part.trim();
-        if (v && !items.includes(v)) { items.push(v); changed = true; }
-      });
-      inp.value = "";
-      if (changed) sync();
-    }
-    if (!isRo) {
-      inp.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commitInput(); }
-        else if (e.key === "Backspace" && !inp.value && items.length) { items.pop(); sync(); }
-      });
-      inp.addEventListener("blur", commitInput);
-      const pf = wrap.closest("form");
-      if (pf) pf.addEventListener("submit", commitInput);
-    }
-    sync();
-  });
-
   function toSlug(raw) {
     const trMap = { "ğ": "g", "Ğ": "g", "ş": "s", "Ş": "s", "ı": "i", "İ": "i", "ö": "o", "Ö": "o", "ü": "u", "Ü": "u", "ç": "c", "Ç": "c" };
     return String(raw || "")
@@ -551,12 +565,13 @@
         try { rule = JSON.parse(fld.getAttribute("data-show-when") || "null"); } catch (_) {}
         if (!rule || !rule.field) return;
         const cur = getFieldVal(rule.field);
+        const isTruthy = (v) => Boolean(v) && !["false", "0"].includes(String(v).trim().toLowerCase());
         let ok = true;
         if (rule.op === "eq") ok = String(cur) === String(rule.value);
         else if (rule.op === "neq") ok = String(cur) !== String(rule.value);
         else if (rule.op === "in" && Array.isArray(rule.value)) ok = rule.value.map(String).includes(String(cur));
-        else if (rule.op === "truthy") ok = Boolean(cur);
-        else if (rule.op === "falsy") ok = !cur;
+        else if (rule.op === "truthy") ok = isTruthy(cur);
+        else if (rule.op === "falsy") ok = !isTruthy(cur);
         fld.hidden = !ok;
         fld.querySelectorAll("input, select, textarea").forEach((ctrl) => {
           if (ctrl.required && !ctrl.hasAttribute("data-deck-was-required")) {
@@ -921,9 +936,11 @@
         const frag = tpl.content.cloneNode(true);
         frag.querySelectorAll("[name]").forEach((el) => el.setAttribute("name", el.getAttribute("name").replace("__INDEX__", String(nextIdx))));
         frag.querySelectorAll("[id]").forEach((el) => el.setAttribute("id", el.getAttribute("id").replace("__INDEX__", String(nextIdx))));
+        frag.querySelectorAll("[for]").forEach((el) => el.setAttribute("for", el.getAttribute("for").replace("__INDEX__", String(nextIdx))));
         frag.querySelectorAll("[data-rel-target]").forEach((el) => el.setAttribute("data-rel-target", el.getAttribute("data-rel-target").replace("__INDEX__", String(nextIdx))));
         host.appendChild(frag);
         initFkWidgets(host);
+        initDynamicWidgets(host);
         host.dispatchEvent(new Event("change", { bubbles: true }));
       }
       return;

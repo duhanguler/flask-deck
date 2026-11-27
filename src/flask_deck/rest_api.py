@@ -819,10 +819,13 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
         perm = spec.permission or f"{slug}:action:{action_name}"
         deck._require_perm(perm, model_slug=slug)
 
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
         if not isinstance(payload, Mapping):
             return jsonify({"error": "Expected JSON object body."}), 400
-        raw_pks = [str(p) for p in payload.get("pks", [])]
+        raw_pks_input = payload.get("pks")
+        if not isinstance(raw_pks_input, list):
+            return jsonify({"error": "'pks' must be a non-empty list of primary keys."}), 422
+        raw_pks = [str(p) for p in raw_pks_input]
         if not raw_pks:
             return jsonify({"error": "No target 'pks' provided."}), 422
         decoded = [decode_pk(p, view.meta) for p in raw_pks]
@@ -856,7 +859,11 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
 
         if deck.approval_store is not None and (
             spec.require_approval
-            or view.requires_approval(user, "action", payload={"action_name": action_name, "pks": raw_pks, **raw_params})
+            or view.requires_approval(
+                user,
+                "action",
+                payload={**raw_params, "action_name": action_name, "pks": raw_pks},
+            )
         ):
             sess.rollback()
             req = make_approval_request(
@@ -924,6 +931,7 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
         status_f = request.args.get("status", "").strip() or None
         model_f = request.args.get("model", "").strip() or None
         reqs = deck.approval_store.list_requests(status=status_f, model_slug=model_f, limit=100)
+        excluded_models = deck._excluded_audit_models(user)
         return (
             jsonify(
                 {
@@ -941,11 +949,13 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
                             "reviewer_id": r.reviewer_id,
                             "reviewer_name": r.reviewer_name,
                             "review_note": r.review_note,
-                            "diff": r.diff,
+                            "diff": deck._sanitize_approval_diff(r.model_slug, r.diff, user),
                             "created_at": r.created_at.isoformat(),
                             "reviewed_at": r.reviewed_at.isoformat() if r.reviewed_at else None,
                         }
                         for r in reqs
+                        if r.model_slug not in excluded_models
+                        or (user is not None and r.requester_id == user.id)
                     ]
                 }
             ),
@@ -982,7 +992,7 @@ def register_rest_api_routes(bp: Blueprint, deck: Deck) -> None:
                     "reviewer_id": req.reviewer_id,
                     "reviewer_name": req.reviewer_name,
                     "review_note": req.review_note,
-                    "diff": req.diff,
+                    "diff": deck._sanitize_approval_diff(req.model_slug, req.diff, user),
                     "created_at": req.created_at.isoformat(),
                     "reviewed_at": req.reviewed_at.isoformat() if req.reviewed_at else None,
                 }

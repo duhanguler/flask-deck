@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import threading
 import time
@@ -135,9 +136,12 @@ def _verify_jwk_signature(
     for jwk in candidates:
         kty = str(jwk.get("kty") or "")
         if kty == "RSA" and alg in rsa_hashes:
-            n = int.from_bytes(_b64url_decode(str(jwk["n"])), "big")
-            e = int.from_bytes(_b64url_decode(str(jwk["e"])), "big")
-            pub = rsa.RSAPublicNumbers(e, n).public_key()
+            try:
+                n = int.from_bytes(_b64url_decode(str(jwk["n"])), "big")
+                e = int.from_bytes(_b64url_decode(str(jwk["e"])), "big")
+                pub = rsa.RSAPublicNumbers(e, n).public_key()
+            except (KeyError, TypeError, ValueError):
+                continue
             try:
                 pub.verify(signature, signing_input, padding.PKCS1v15(), rsa_hashes[alg]())
                 return
@@ -153,12 +157,15 @@ def _verify_jwk_signature(
             curve = crv_map.get(str(jwk.get("crv") or ""))
             if curve is None or len(signature) != coord_len * 2:
                 continue
-            x = int.from_bytes(_b64url_decode(str(jwk["x"])), "big")
-            y = int.from_bytes(_b64url_decode(str(jwk["y"])), "big")
-            ec_pub = ec.EllipticCurvePublicNumbers(x, y, curve).public_key()
-            r = int.from_bytes(signature[:coord_len], "big")
-            s = int.from_bytes(signature[coord_len:], "big")
-            der_sig = utils.encode_dss_signature(r, s)
+            try:
+                x = int.from_bytes(_b64url_decode(str(jwk["x"])), "big")
+                y = int.from_bytes(_b64url_decode(str(jwk["y"])), "big")
+                ec_pub = ec.EllipticCurvePublicNumbers(x, y, curve).public_key()
+                r = int.from_bytes(signature[:coord_len], "big")
+                s = int.from_bytes(signature[coord_len:], "big")
+                der_sig = utils.encode_dss_signature(r, s)
+            except (KeyError, TypeError, ValueError):
+                continue
             try:
                 ec_pub.verify(der_sig, signing_input, ec.ECDSA(hash_cls()))
                 return
@@ -443,8 +450,13 @@ class OIDCAuthProvider(RBACAuthProvider):
 
         if "exp" in claims:
             try:
-                exp_ts = int(claims["exp"])
-            except (TypeError, ValueError) as exc:
+                raw_exp = claims["exp"]
+                if isinstance(raw_exp, bool) or (
+                    isinstance(raw_exp, float) and not math.isfinite(raw_exp)
+                ):
+                    raise ValueError("non-finite exp")
+                exp_ts = int(raw_exp)
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise PermissionError("OIDC id_token has invalid exp claim.") from exc
             if exp_ts < int(time.time()) - 60:
                 raise PermissionError("OIDC id_token has expired.")
@@ -579,6 +591,10 @@ class OIDCAuthProvider(RBACAuthProvider):
         )
         if u_status >= 400:
             raise PermissionError("SSO userinfo lookup failed.")
+        id_sub = str(id_claims.get("sub") or "")
+        ui_sub = str(userinfo_profile.get("sub") or "")
+        if id_sub and ui_sub and not hmac.compare_digest(id_sub, ui_sub):
+            raise PermissionError("SSO userinfo subject does not match verified id_token subject.")
         profile: dict[str, Any] = {**id_claims, **userinfo_profile}
 
         email = str(profile.get("email") or "").strip().lower()
@@ -633,6 +649,8 @@ class OIDCAuthProvider(RBACAuthProvider):
                 "email": user.email,
                 "roles": list(user.roles),
                 "is_superuser": user.is_superuser,
+                "tenant_id": user.tenant_id,
+                "metadata": dict(user.metadata),
             }
 
     def get_current_user(
@@ -650,6 +668,7 @@ class OIDCAuthProvider(RBACAuthProvider):
         if user_id.startswith("sso:"):
             raw = session.get(SSO_USER_SESSION_KEY)
             if isinstance(raw, Mapping) and str(raw.get("id")) == user_id:
+                raw_meta = raw.get("metadata")
                 return DeckUser(
                     id=user_id,
                     username=str(raw.get("username", user_id)),
@@ -657,6 +676,8 @@ class OIDCAuthProvider(RBACAuthProvider):
                     email=str(raw.get("email", "")),
                     roles=tuple(str(r) for r in raw.get("roles", ())),
                     is_superuser=bool(raw.get("is_superuser", False)),
+                    tenant_id=raw.get("tenant_id"),
+                    metadata=dict(raw_meta) if isinstance(raw_meta, Mapping) else {},
                 )
             return None
         acc = self._accounts_by_id.get(user_id)
