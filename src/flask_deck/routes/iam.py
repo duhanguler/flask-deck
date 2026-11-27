@@ -63,6 +63,17 @@ def _has_privileged_permission(perms: Sequence[str] | frozenset[str]) -> bool:
     return any(_is_privileged_permission(p) for p in perms)
 
 
+def _is_privileged_user(auth: SQLAlchemyAuthProvider, rec: Any) -> bool:
+    """Return True if an IAM user is a superuser or holds wildcard/IAM-admin permissions."""
+    if rec.is_superuser or _has_privileged_permission(rec.direct_permissions):
+        return True
+    for gid in rec.group_ids:
+        grec = auth.get_group_record(gid)
+        if grec is not None and _has_privileged_permission(grec.permissions):
+            return True
+    return False
+
+
 def _parse_direct_permissions(form: Any) -> list[str]:
     perms: list[str] = [p.strip() for p in form.getlist("direct_perm") if p.strip()]
     raw = str(form.get("direct_permissions", ""))
@@ -122,6 +133,10 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
     def _require_iam_admin() -> tuple[SQLAlchemyAuthProvider, DeckUser]:
         if not isinstance(deck.auth, SQLAlchemyAuthProvider):
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "IAM users and groups cannot be managed while impersonating another user."
+            )
         user = deck._current_user()
         if user is None or not (
             user.is_superuser or deck.auth.has_permission(user, "iam:manage")
@@ -139,6 +154,11 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         if deck.audit_store is not None and deck.config.auto_audit:
+            meta = dict(metadata or {})
+            real = getattr(g, "_deck_real_user", None)
+            if real is not None and getattr(real, "id", None) != actor.id:
+                meta["impersonated_by"] = real.id
+                meta["impersonated_by_name"] = real.label
             deck.audit_store.record(
                 make_audit_entry(
                     actor_id=actor.id,
@@ -150,7 +170,7 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
                     record_pk=record_pk,
                     record_repr=record_repr,
                     changes=changes or {},
-                    metadata=metadata or {},
+                    metadata=meta,
                 )
             )
 
@@ -317,8 +337,10 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         existing = auth.get_user_record(user_id)
         if existing is None:
             abort(404)
-        if existing.is_superuser and not actor.is_superuser:
-            raise PermissionDeniedError("Only a superuser may modify another superuser account.")
+        if _is_privileged_user(auth, existing) and not actor.is_superuser:
+            raise PermissionDeniedError(
+                "Only a superuser may modify a superuser or privileged IAM account."
+            )
         display_name = request.form.get("display_name", "").strip()
         email = request.form.get("email", "").strip()
         tenant_id = request.form.get("tenant_id", "")
@@ -392,8 +414,10 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         if not actor.is_superuser:
             for uid in selected_ids:
                 target = auth.get_user_record(uid)
-                if target is not None and target.is_superuser:
-                    raise PermissionDeniedError("Only a superuser may modify superuser accounts.")
+                if target is not None and _is_privileged_user(auth, target):
+                    raise PermissionDeniedError(
+                        "Only a superuser may modify superuser or privileged IAM accounts."
+                    )
         target_active = act == "activate"
         try:
             updated_ids = auth.bulk_set_active(selected_ids, is_active=target_active)
@@ -420,8 +444,10 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         existing = auth.get_user_record(user_id)
         if existing is None:
             abort(404)
-        if existing.is_superuser and not actor.is_superuser:
-            raise PermissionDeniedError("Only a superuser may reset a superuser password.")
+        if _is_privileged_user(auth, existing) and not actor.is_superuser:
+            raise PermissionDeniedError(
+                "Only a superuser may reset a superuser or privileged IAM account password."
+            )
         new_pwd = request.form.get("new_password", "")
         try:
             auth.admin_reset_password(user_id, new_pwd)
@@ -448,8 +474,10 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
         existing = auth.get_user_record(user_id)
         if existing is None:
             abort(404)
-        if existing.is_superuser and not actor.is_superuser:
-            raise PermissionDeniedError("Only a superuser may delete a superuser account.")
+        if _is_privileged_user(auth, existing) and not actor.is_superuser:
+            raise PermissionDeniedError(
+                "Only a superuser may delete a superuser or privileged IAM account."
+            )
         try:
             auth.delete_user(user_id)
         except ValueError as exc:
@@ -458,6 +486,9 @@ def register_iam_routes(bp: Blueprint, deck: Deck) -> None:
 
         if deck.session_store is not None:
             deck.session_store.revoke_others(user_id, keep_session_id=None)
+        if deck.api_key_store is not None:
+            for key_rec in deck.api_key_store.list_keys(owner_id=user_id, limit=500):
+                deck.api_key_store.revoke(key_rec.id, owner_id=user_id)
 
         _audit(
             actor,

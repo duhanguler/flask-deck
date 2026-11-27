@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TextIO
-from urllib.parse import urlsplit
 
 import sqlalchemy as sa
 from flask import Blueprint, Response, jsonify, request
@@ -17,13 +17,14 @@ from flask_deck.adapters.sqlalchemy import decode_pk, encode_pk, extract_pk
 from flask_deck.approvals import make_approval_request
 from flask_deck.audit import compute_diff
 from flask_deck.auth import DeckUser
-from flask_deck.exceptions import PermissionDeniedError, ValidationError
+from flask_deck.exceptions import InvalidPKError, PermissionDeniedError, ValidationError
 from flask_deck.query import execute_list_query, soft_delete_predicate
 from flask_deck.rest_api import (
     apply_json_mutation,
     build_multidict_from_json,
     serialize_record_for_api,
 )
+from flask_deck.security import check_origin_headers
 from flask_deck.sql_console import execute_readonly_sql
 
 if TYPE_CHECKING:
@@ -265,6 +266,8 @@ class DeckMCPServer:
         if name == "describe_model":
             slug = str(args.get("slug", "")).strip()
             view = self._get_view_checked(slug)
+            if not view.can_view:
+                raise PermissionDeniedError(f"Viewing is disabled on model '{slug}'.")
             self._require(user, api_key, f"{slug}:view", model_slug=slug)
             hidden = deck.auth.hidden_fields_for(user, slug)
             return {
@@ -295,6 +298,8 @@ class DeckMCPServer:
         if name == "query_records":
             slug = str(args.get("slug", "")).strip()
             view = self._get_view_checked(slug)
+            if not view.can_view:
+                raise PermissionDeniedError(f"Viewing is disabled on model '{slug}'.")
             self._require(user, api_key, f"{slug}:view", model_slug=slug)
             visible_cols = view.visible_list_columns(deck.auth, user)
             allowed_s, allowed_f, allowed_sort = deck._allowed_query_fields(view, user)
@@ -304,8 +309,15 @@ class DeckMCPServer:
                 for k, v in (raw_filters.items() if isinstance(raw_filters, Mapping) else ())
                 if str(v).strip()
             ]
-            page = max(1, int(args.get("page", 1)))
-            page_size = min(100, max(1, int(args.get("page_size", 25))))
+            raw_page = args.get("page", 1)
+            raw_ps = args.get("page_size", 25)
+            if isinstance(raw_page, bool) or isinstance(raw_ps, bool):
+                raise ValueError("'page' and 'page_size' must be integers.")
+            try:
+                page = max(1, min(10_000, int(1 if raw_page is None else raw_page)))
+                page_size = min(100, max(1, int(25 if raw_ps is None else raw_ps)))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("'page' and 'page_size' must be integers.") from exc
             res = execute_list_query(
                 deck.get_session(view.bind_key),
                 view.meta,
@@ -332,7 +344,11 @@ class DeckMCPServer:
                 trashed=False,
             )
             return {
-                "items": [serialize_record_for_api(deck, view, it, user) for it in res.items],
+                "items": [
+                    serialize_record_for_api(deck, view, it, user)
+                    for it in res.items
+                    if view.can_view_record(it, user)
+                ],
                 "total": res.total,
                 "page": res.page,
                 "pages": res.pages,
@@ -342,22 +358,33 @@ class DeckMCPServer:
             slug = str(args.get("slug", "")).strip()
             pk_raw = str(args.get("pk", "")).strip()
             view = self._get_view_checked(slug)
+            if not view.can_view:
+                raise PermissionDeniedError(f"Viewing is disabled on model '{slug}'.")
             self._require(user, api_key, f"{slug}:view", model_slug=slug)
             obj, _ = self._fetch_record(view, pk_raw, user)
             self._require(user, api_key, f"{slug}:view", model_slug=slug, obj=obj)
+            if not view.can_view_record(obj, user):
+                raise PermissionDeniedError(f"Not authorized to view this {view.label}.")
             return {"record": serialize_record_for_api(deck, view, obj, user)}
 
         if name == "get_audit_log":
             if deck.audit_store is None:
                 return {"entries": []}
             self._require(user, api_key, "audit:view")
+            raw_limit = args.get("limit", 25)
+            if isinstance(raw_limit, bool):
+                raise ValueError("'limit' must be an integer.")
+            try:
+                limit_val = min(100, max(1, int(25 if raw_limit is None else raw_limit)))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("'limit' must be an integer.") from exc
             excluded = deck._excluded_audit_models(user)
             entries, total = deck.audit_store.list_entries(
                 model_slug=str(args.get("model_slug", "")).strip() or None,
                 action=str(args.get("action", "")).strip() or None,
                 excluded_models=excluded,
                 search_changes=not deck._user_has_field_restrictions(user),
-                limit=min(100, max(1, int(args.get("limit", 25)))),
+                limit=limit_val,
             )
             safe = [deck._sanitize_audit_entry(e, user) for e in entries]
             return {
@@ -429,7 +456,7 @@ class DeckMCPServer:
                 "requester_id": req.requester_id,
                 "reviewer_name": req.reviewer_name,
                 "review_note": req.review_note,
-                "diff": req.diff,
+                "diff": deck._sanitize_approval_diff(req.model_slug, req.diff, user),
             }
 
         if name in {"propose_create", "propose_update", "propose_delete", "propose_action"}:
@@ -527,7 +554,7 @@ class DeckMCPServer:
                     "status": "pending_approval",
                     "approval_id": saved.id,
                     "actor_type": "mcp_agent",
-                    "diff": saved.diff,
+                    "diff": deck._sanitize_approval_diff(slug, saved.diff, user),
                 }
 
             sess.commit()
@@ -635,7 +662,7 @@ class DeckMCPServer:
                     "status": "pending_approval",
                     "approval_id": saved.id,
                     "actor_type": "mcp_agent",
-                    "diff": saved.diff,
+                    "diff": deck._sanitize_approval_diff(slug, saved.diff, user),
                 }
 
             sess.commit()
@@ -715,24 +742,60 @@ class DeckMCPServer:
                     "status": "pending_approval",
                     "approval_id": saved.id,
                     "actor_type": "mcp_agent",
-                    "diff": saved.diff,
+                    "diff": deck._sanitize_approval_diff(slug, saved.diff, user),
                 }
             if view.soft_delete_column and not force:
                 fmeta = view.meta.fields_by_name.get(view.soft_delete_column)
                 if fmeta is not None:
-                    view.on_model_delete(obj, user=user)
-                    setattr(
-                        obj,
-                        view.soft_delete_column,
-                        True if fmeta.field_type == "boolean" else datetime.now(timezone.utc),
+                    try:
+                        view.on_model_delete(obj, user=user)
+                        setattr(
+                            obj,
+                            view.soft_delete_column,
+                            True if fmeta.field_type == "boolean" else datetime.now(timezone.utc),
+                        )
+                        sess.commit()
+                    except (ValidationError, SQLAlchemyError) as exc:
+                        sess.rollback()
+                        raise ValueError(f"Delete failed: {exc}") from exc
+                    deck._record_audit(
+                        action_name="soft_delete",
+                        view=view,
+                        record_pk=pk_str,
+                        record_repr=safe_repr,
+                        changes=compute_diff(
+                            before_snap,
+                            view.extract_snapshot(obj),
+                            sensitive_fields=view.meta.sensitive_fields,
+                            extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+                        ),
+                        metadata={"source": "mcp", "actor_type": "mcp_agent"},
+                        actor=user,
                     )
-                    sess.commit()
                     return {"status": "executed", "deleted": pk_str, "soft": True}
             orphans = deck._collect_orphan_files(view, obj)
-            view.on_model_delete(obj, user=user)
-            sess.delete(obj)
-            sess.commit()
+            try:
+                view.on_model_delete(obj, user=user)
+                sess.delete(obj)
+                sess.commit()
+            except (ValidationError, SQLAlchemyError) as exc:
+                sess.rollback()
+                raise ValueError(f"Delete failed: {exc}") from exc
             deck._delete_orphan_files_best_effort(orphans)
+            deck._record_audit(
+                action_name="delete",
+                view=view,
+                record_pk=pk_str,
+                record_repr=safe_repr,
+                changes=compute_diff(
+                    before_snap,
+                    {},
+                    sensitive_fields=view.meta.sensitive_fields,
+                    extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+                ),
+                metadata={"source": "mcp", "actor_type": "mcp_agent"},
+                actor=user,
+            )
             return {"status": "executed", "deleted": pk_str, "soft": False}
 
         # propose_action
@@ -743,9 +806,10 @@ class DeckMCPServer:
         spec, handler = resolved_act
         perm = spec.permission or f"{slug}:action:{action_name}"
         self._require(user, api_key, perm, model_slug=slug)
-        raw_pks = [str(p) for p in (args.get("pks") or [])]
-        if not raw_pks:
-            raise ValueError("Action requires at least one primary key in 'pks'.")
+        raw_pks_input = args.get("pks")
+        if not isinstance(raw_pks_input, list) or not raw_pks_input:
+            raise ValueError("Action requires a non-empty list of primary keys in 'pks'.")
+        raw_pks = [str(p) for p in raw_pks_input]
         decoded = [decode_pk(p, view.meta) for p in raw_pks]
         stmt = view.scope_query(sa.select(view.model), user)
         sd_pred = soft_delete_predicate(view.meta, view.soft_delete_column, trashed=False)
@@ -764,15 +828,18 @@ class DeckMCPServer:
             self._require(user, api_key, perm, model_slug=slug, obj=rec)
 
         raw_params = args.get("params") or {}
-        form_md = MultiDict(
-            [(str(k), str(v)) for k, v in (raw_params.items() if isinstance(raw_params, Mapping) else ())]
-        )
+        params_map = dict(raw_params) if isinstance(raw_params, Mapping) else {}
+        form_md = MultiDict([(str(k), str(v)) for k, v in params_map.items()])
         for af in spec.fields:
             rv = form_md.get(af.name, "").strip()
             if af.required and not rv:
                 raise ValueError(f"Action '{spec.label}' requires '{af.display_label}'.")
 
-        if _need_approval("action", payload={"action_name": action_name, "pks": raw_pks}, spec_req=spec.require_approval):
+        if _need_approval(
+            "action",
+            payload={**params_map, "action_name": action_name, "pks": raw_pks},
+            spec_req=spec.require_approval,
+        ):
             sess.rollback()
             assert deck.approval_store is not None
             saved = deck.approval_store.create(
@@ -806,12 +873,24 @@ class DeckMCPServer:
                 "status": "pending_approval",
                 "approval_id": saved.id,
                 "actor_type": "mcp_agent",
-                "diff": saved.diff,
+                "diff": deck._sanitize_approval_diff(slug, saved.diff, user),
             }
 
-        msg = handler(records, form_md, user)
-        sess.commit()
+        try:
+            msg = handler(records, form_md, user)
+            sess.commit()
+        except (ValueError, ValidationError, SQLAlchemyError) as exc:
+            sess.rollback()
+            raise ValueError(f"Action failed: {exc}") from exc
         msg_str = "Done" if isinstance(msg, Response) else str(msg or "Done")
+        deck._record_audit(
+            action_name="bulk_action",
+            view=view,
+            record_pk=",".join(raw_pks[:10]),
+            record_repr=msg_str,
+            metadata={"source": "mcp", "actor_type": "mcp_agent", "action": action_name, "count": len(records)},
+            actor=user,
+        )
         return {"status": "executed", "message": msg_str, "count": len(records)}
 
     def handle_message(
@@ -896,7 +975,15 @@ class DeckMCPServer:
                         "isError": False,
                     }
                 )
-            except (PermissionDeniedError, LookupError, ValueError) as exc:
+            except (
+                PermissionDeniedError,
+                LookupError,
+                ValueError,
+                TypeError,
+                InvalidPKError,
+                ValidationError,
+                SQLAlchemyError,
+            ) as exc:
                 err_out = {"error": str(exc)}
                 return _ok(
                     {
@@ -917,6 +1004,7 @@ def run_mcp_stdio(
 ) -> int:
     """Run JSON-RPC 2.0 MCP server over newline-delimited stdio."""
     from flask_deck.api_keys import api_key_to_user
+    from flask_deck.iam import SQLAlchemyAuthProvider
 
     in_stream = stdin or sys.stdin
     out_stream = stdout or sys.stdout
@@ -927,6 +1015,26 @@ def run_mcp_stdio(
         if key_rec is None:
             raise PermissionDeniedError("Invalid, expired, or revoked API key.")
         user = api_key_to_user(key_rec)
+        if isinstance(deck.auth, SQLAlchemyAuthProvider):
+            owner_rec = deck.auth.get_user_record(key_rec.owner_id)
+            if owner_rec is None or not owner_rec.is_active:
+                raise PermissionDeniedError("API key owner account is missing or deactivated.")
+            capped_super = bool(user.is_superuser and owner_rec.is_superuser)
+            capped_roles = (
+                user.roles
+                if owner_rec.is_superuser
+                else tuple(r for r in user.roles if r in set(owner_rec.role_names))
+            )
+            user = replace(
+                user,
+                is_superuser=capped_super,
+                roles=capped_roles,
+                tenant_id=owner_rec.tenant_id,
+            )
+        else:
+            owner_u = deck.auth.get_user_by_id(key_rec.owner_id)
+            if owner_u is not None and owner_u.tenant_id is not None:
+                user = replace(user, tenant_id=owner_u.tenant_id)
     elif deck.config.allow_insecure_open:
         user = deck.auth.get_current_user()
 
@@ -965,10 +1073,8 @@ def register_mcp_routes(bp: Blueprint, deck: Deck) -> None:
     @bp.route("/_mcp", methods=["POST"])
     def mcp_endpoint() -> tuple[Response, int] | Response:
         origin = (request.headers.get("Origin") or "").strip()
-        if origin:
-            parsed = urlsplit(origin)
-            if parsed.netloc and parsed.netloc != request.host:
-                return jsonify({"error": "Cross-origin MCP request rejected (DNS rebinding guard)."}), 403
+        if origin and not check_origin_headers(request):
+            return jsonify({"error": "Cross-origin MCP request rejected (DNS rebinding guard)."}), 403
         payload = request.get_json(silent=True)
         if not isinstance(payload, Mapping):
             return (

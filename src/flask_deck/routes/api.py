@@ -131,7 +131,7 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         owner_field = request.args.get("field_name", "").strip()
         is_m2m = request.args.get("is_m2m", "").strip() == "1"
         try:
-            page = max(1, int(request.args.get("page", "1")))
+            page = max(1, min(10_000, int(request.args.get("page", "1"))))
         except ValueError:
             page = 1
         try:
@@ -195,11 +195,31 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         fetched = list(sess.scalars(stmt).unique().all())
         has_more = len(fetched) > page_size
         items = fetched[:page_size]
+        ref_col_name: str | None = None
+        if not is_m2m:
+            if owner_slug and owner_field and owner_slug in deck.views:
+                ow_fm = deck.views[owner_slug].meta.fields_by_name.get(owner_field)
+                if ow_fm is not None and getattr(ow_fm, "fk_target_column", None):
+                    ref_col_name = ow_fm.fk_target_column
+            if not ref_col_name and len(view.meta.primary_keys) == 1:
+                ref_col_name = view.meta.primary_keys[0].name
+
+        def _item_val_id(it: Any) -> str:
+            if is_m2m or not ref_col_name:
+                return encode_pk(extract_pk(it, view.meta))
+            raw_v = getattr(it, ref_col_name, None)
+            if raw_v is None:
+                return ""
+            if hasattr(raw_v, "value"):
+                return str(raw_v.value)
+            return str(raw_v)
+
         return jsonify(
             {
                 "items": [
                     {
-                        "id": encode_pk(extract_pk(it, view.meta)),
+                        "id": _item_val_id(it),
+                        "pk": encode_pk(extract_pk(it, view.meta)),
                         "label": view.format_record_repr(it, auth=deck.auth, user=user),
                     }
                     for it in items
@@ -225,7 +245,7 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         owner_field = request.args.get("field_name", "").strip()
         target_field = request.args.get("target_field", "").strip()
         try:
-            page = max(1, int(request.args.get("page", "1")))
+            page = max(1, min(10_000, int(request.args.get("page", "1"))))
         except ValueError:
             page = 1
         page_size = 15
@@ -285,9 +305,27 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         items = fetched[:page_size]
         media_builder = deck._media_url_builder(view)
         rel_url_builder = deck._rel_url_builder(user)
+        ref_col_lookup: str | None = None
+        if owner_slug and owner_field and owner_slug in deck.views:
+            ow_fm = deck.views[owner_slug].meta.fields_by_name.get(owner_field)
+            if ow_fm is not None and getattr(ow_fm, "fk_target_column", None):
+                ref_col_lookup = ow_fm.fk_target_column
+        if not ref_col_lookup and len(view.meta.primary_keys) == 1:
+            ref_col_lookup = view.meta.primary_keys[0].name
+
+        def _lookup_val(it: Any) -> str:
+            if not ref_col_lookup:
+                return encode_pk(extract_pk(it, view.meta))
+            raw_v = getattr(it, ref_col_lookup, None)
+            if raw_v is None:
+                return ""
+            if hasattr(raw_v, "value"):
+                return str(raw_v.value)
+            return str(raw_v)
+
         rows = [
             {
-                "pk": encode_pk(extract_pk(it, view.meta)),
+                "pk": _lookup_val(it),
                 "label": view.format_record_repr(it, auth=deck.auth, user=user),
                 "cells": [
                     view.format_cell(
@@ -370,12 +408,44 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
         for rel in view.meta.relationships:
             if rel.name in hidden:
                 continue
+            t_view = deck._views_by_model.get(rel.target_model)
+            if t_view is not None and (
+                not t_view.can_view
+                or not deck.auth.has_permission(
+                    user, f"{t_view.meta.slug}:view", model_slug=t_view.meta.slug
+                )
+            ):
+                continue
             val = getattr(obj, rel.name, None)
-            rel_items = (
+            raw_rel_items = (
                 list(val)
                 if (rel.uselist and val is not None)
                 else ([val] if val is not None else [])
             )
+            if t_view is not None and raw_rel_items:
+                t_pk_cols = [getattr(t_view.model, pk.name) for pk in t_view.meta.primary_keys]
+                loaded_pks = [extract_pk(it, t_view.meta) for it in raw_rel_items]
+                t_stmt = t_view.scope_query(sa.select(*t_pk_cols), user)
+                t_sd = soft_delete_predicate(t_view.meta, t_view.soft_delete_column, trashed=False)
+                if t_sd is not None:
+                    t_stmt = t_stmt.where(t_sd)
+                if len(t_pk_cols) == 1:
+                    t_stmt = t_stmt.where(t_pk_cols[0].in_([pk[0] for pk in loaded_pks]))
+                else:
+                    t_stmt = t_stmt.where(sa.tuple_(*t_pk_cols).in_(loaded_pks))
+                t_sess = deck.get_session(t_view.bind_key)
+                allowed_pks = {tuple(r) for r in t_sess.execute(t_stmt).all()}
+                rel_items = [
+                    it
+                    for it, pk_t in zip(raw_rel_items, loaded_pks, strict=True)
+                    if pk_t in allowed_pks
+                    and deck.auth.has_permission(
+                        user, f"{t_view.meta.slug}:view", model_slug=t_view.meta.slug, obj=it
+                    )
+                    and t_view.can_view_record(it, user)
+                ]
+            else:
+                rel_items = raw_rel_items
             relations_display.append(
                 {
                     "name": rel.name,
@@ -614,7 +684,10 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 400,
             )
         user = deck._current_user()
-        if deck.approval_store is not None and view.requires_approval(user, "create"):
+        qc_payload = dict(request.form) if request.method == "POST" else None
+        if deck.approval_store is not None and view.requires_approval(
+            user, "create", payload=qc_payload
+        ):
             return (
                 jsonify(
                     {
@@ -717,7 +790,10 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 jsonify({"error": "Models with file uploads must use the full edit form."}),
                 400,
             )
-        if deck.approval_store is not None and view.requires_approval(user, "edit", obj=obj):
+        qe_payload = dict(request.form) if request.method == "POST" else None
+        if deck.approval_store is not None and view.requires_approval(
+            user, "edit", obj=obj, payload=qe_payload
+        ):
             return (
                 jsonify(
                     {
@@ -728,10 +804,21 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             )
 
         pk_str = encode_pk(pk_vals)
+        current_ver = view.compute_version_token(obj, auth=deck.auth, user=user)
         errors: dict[str, list[str]] = {}
         submitted: Mapping[str, Any] | None = None
         if request.method == "POST":
             submitted = request.form
+            submitted_ver = str(request.form.get("_deck_version", "")).strip()
+            if submitted_ver and submitted_ver != current_ver:
+                return (
+                    jsonify(
+                        {
+                            "error": "Record was modified concurrently. Refresh and retry."
+                        }
+                    ),
+                    409,
+                )
             sess = deck.get_session(view.bind_key)
             before_snap = view.extract_snapshot(obj)
 
@@ -852,6 +939,10 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                         True if fmeta.field_type == "boolean" else datetime.now(timezone.utc),
                     )
                     sess.commit()
+                except ValidationError as exc:
+                    sess.rollback()
+                    first_msgs = next(iter(exc.errors.values()), ["Validation failed."])
+                    return jsonify({"error": "; ".join(first_msgs)}), 422
                 except SQLAlchemyError as exc:
                     sess.rollback()
                     return jsonify({"error": f"Database error: {exc.__class__.__name__}"}), 400
@@ -881,6 +972,10 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             view.on_model_delete(obj, user=user)
             sess.delete(obj)
             sess.commit()
+        except ValidationError as exc:
+            sess.rollback()
+            first_msgs = next(iter(exc.errors.values()), ["Validation failed."])
+            return jsonify({"error": "; ".join(first_msgs)}), 422
         except IntegrityError:
             sess.rollback()
             return (
@@ -1036,7 +1131,7 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
             scoped_stmt, _ = deck._build_filtered_pk_statement(
                 view, eff_items, user=user, trashed_override=trashed_flag
             )
-            target_pk_select = scoped_stmt.with_only_columns(pk_col.label("_pk"))
+            target_pk_select = scoped_stmt.with_only_columns(pk_col.label("_pk")).distinct()
             target_count = int(
                 sess.execute(
                     sa.select(sa.func.count()).select_from(target_pk_select.subquery())
@@ -1078,8 +1173,10 @@ def register_api_routes(bp: Blueprint, deck: Deck) -> None:
                 deck._require_perm(f"{slug}:delete", model_slug=slug, obj=rec)
                 if force:
                     deck._require_perm(f"{slug}:force_delete", model_slug=slug, obj=rec)
+                if not view.can_delete_record(rec, user):
+                    return jsonify({"error": f"Not authorized to delete this {view.label}."}), 403
             target_count = len(recs)
-            target_pk_select = scoped_stmt.with_only_columns(pk_col.label("_pk"))
+            target_pk_select = scoped_stmt.with_only_columns(pk_col.label("_pk")).distinct()
 
         report = analyze_delete_impact(
             sess,

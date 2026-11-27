@@ -22,7 +22,7 @@ from flask_deck.charts import (
     render_stat_bars,
 )
 from flask_deck.formatters import normalize_tone
-from flask_deck.query import soft_delete_predicate
+from flask_deck.query import apply_base_stmt_extras, soft_delete_predicate
 from flask_deck.security import is_safe_display_url
 
 if TYPE_CHECKING:
@@ -332,11 +332,22 @@ def build_default_dashboard(deck: Deck, ctx: DashboardContext) -> list[Widget]:
         trend: Literal["up", "down", "flat"] = "flat"
         if ts_field is not None:
             ts_col = getattr(view.model, ts_field.name)
-            date_bucket = sa.func.date(ts_col)
+            bind_eng = view_sess.get_bind()
+            d_name = bind_eng.dialect.name if bind_eng is not None else "sqlite"
+            date_bucket: Any = (
+                sa.func.date(ts_col) if d_name == "sqlite" else sa.cast(ts_col, sa.Date)
+            )
+            grp_stmt = apply_base_stmt_extras(
+                sa.select(date_bucket.label("d_key"), sa.func.count().label("cnt")).select_from(
+                    view.model
+                ),
+                base,
+            )
+            base_where = getattr(base, "_where_criteria", ())
+            if base_where:
+                grp_stmt = grp_stmt.where(*base_where)
             grp_stmt = (
-                sa.select(date_bucket.label("d_key"), sa.func.count().label("cnt"))
-                .where(ts_col >= window_start)
-                .where(*base._where_criteria)
+                grp_stmt.where(ts_col >= window_start)
                 .group_by(date_bucket)
                 .order_by(date_bucket)
             )

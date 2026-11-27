@@ -13,6 +13,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from flask import Response, stream_with_context
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Session
 
 from flask_deck.adapters.sqlalchemy import extract_pk
@@ -32,14 +33,16 @@ from flask_deck.security import is_sensitive_field, sanitize_csv_cell
 _XLSX_INVALID_TITLE_RE = re.compile(r"[/\\?*\[\]:]")
 
 
-def _serialize_export_value(value: Any) -> Any:
+def _serialize_export_value(value: Any, *, preserve_decimal: bool = False) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if isinstance(value, Decimal):
+        return value if preserve_decimal else str(value)
     if isinstance(value, enum.Enum):
         return value.value
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
-    if isinstance(value, (Decimal, UUID)):
+    if isinstance(value, UUID):
         return str(value)
     if isinstance(value, (dict, list)):
         return value
@@ -217,21 +220,38 @@ def iter_export_chunks(
 
     def _iter_objects() -> Iterator[Any]:
         last_pk: tuple[Any, ...] | None = None
-        for obj in session.scalars(stmt).yield_per(chunk_size):
-            if has_joins:
-                pk = extract_pk(obj, view.meta)
-                if pk == last_pk:
-                    continue
-                last_pk = pk
-            yield obj
+        view_perm = f"{view.meta.slug}:view"
+        export_perm = f"{view.meta.slug}:export"
 
-    def _row_dict(obj: Any) -> dict[str, Any]:
+        def _row_allowed(obj: Any) -> bool:
+            if not view.can_view_record(obj, user):
+                return False
+            return user is None or (
+                auth.has_permission(user, export_perm, model_slug=view.meta.slug, obj=obj)
+                or auth.has_permission(user, view_perm, model_slug=view.meta.slug, obj=obj)
+            )
+
+        try:
+            for obj in session.scalars(stmt).yield_per(chunk_size):
+                if has_joins:
+                    pk = extract_pk(obj, view.meta)
+                    if pk == last_pk:
+                        continue
+                    last_pk = pk
+                if _row_allowed(obj):
+                    yield obj
+        except InvalidRequestError:
+            for obj in session.scalars(stmt).unique():
+                if _row_allowed(obj):
+                    yield obj
+
+    def _row_dict(obj: Any, *, preserve_decimal: bool = False) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for col in cols:
             val = getattr(obj, col, None)
             if col in masked:
                 val = auth.mask_field_value(user, view.meta.slug, col, val)
-            out[col] = _serialize_export_value(val)
+            out[col] = _serialize_export_value(val, preserve_decimal=preserve_decimal)
         return out
 
     fmt_clean = fmt.lower()
@@ -250,7 +270,7 @@ def iter_export_chunks(
                 ws = wb.create_sheet(title=safe_title)
                 ws.append([sanitize_csv_cell(c, enabled=sanitize_csv) for c in cols])
                 for obj in _iter_objects():
-                    row_data = _row_dict(obj)
+                    row_data = _row_dict(obj, preserve_decimal=True)
                     ws.append(
                         [
                             sanitize_csv_cell(
@@ -281,13 +301,13 @@ def iter_export_chunks(
         def _gen_csv() -> Iterator[str]:
             buf = io.StringIO()
             writer = csv.writer(buf)
-            writer.writerow(cols)
+            writer.writerow([sanitize_csv_cell(c, enabled=sanitize_csv) for c in cols])
             yield buf.getvalue()
             buf.seek(0)
             buf.truncate(0)
 
             for obj in _iter_objects():
-                row_data = _row_dict(obj)
+                row_data = _row_dict(obj, preserve_decimal=True)
                 cells = [
                     sanitize_csv_cell(
                         json.dumps(row_data[c], separators=(",", ":"))

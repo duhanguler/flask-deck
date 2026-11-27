@@ -428,6 +428,8 @@
 <div class="dk-ro-val">{{ row.ro_html[col.name] if (row and row.ro_html and col.name in row.ro_html) else '—' }}</div>
 {% elif row and row.widget_html and col.name in row.widget_html %}
 {{ row.widget_html[col.name] }}
+{% elif not row and col.template_widget_html %}
+{{ col.template_widget_html }}
 {% elif col.kind == 'file' %}
 <div class="dk-inline-file-wrap">
   {% set im_url = row.media_urls.get(col.name) if (row and row.media_urls) else None %}
@@ -521,6 +523,9 @@
 
   {{ render_slot('form_above') }}
 
+  {% set use_tabs = (view.form_layout == 'tabs' and fieldsets | length > 1) %}
+  {% set use_wizard = (view.form_layout == 'wizard' and fieldsets | length > 1) %}
+
   {% if save_on_top and not use_wizard %}
   <div class="dk-form-top-bar">
     <span class="dk-subtle dk-mono">{{ "Create " ~ view.label if mode == 'create' else "Edit " ~ view.label }}</span>
@@ -591,8 +596,6 @@
   </div>
   {% endif %}
 
-  {% set use_tabs = (view.form_layout == 'tabs' and fieldsets | length > 1) %}
-  {% set use_wizard = (view.form_layout == 'wizard' and fieldsets | length > 1) %}
   {% if use_tabs %}
   <div class="dk-panel">
     <div class="dk-tabs" role="tablist">
@@ -725,7 +728,7 @@
     <div class="dk-panel-body dk-inline-stack" data-inline-body="{{ inline.slug }}" data-next-index="{{ inline.rows | length }}" data-max-rows="{{ inline.max_rows }}">
       {% for row in inline.rows %}
       {% set idx = loop.index0 %}
-      <div class="dk-inline-card{% if row.deleted %} is-deleted{% endif %}" data-inline-row>
+      <div class="dk-inline-card{% if row.deleted %} dk-inline-deleted{% endif %}" data-inline-row>
         <div class="dk-inline-card-head">
           <span class="dk-mono dk-subtle">{{ inline.label }} #{{ loop.index }}{% if row.pk %} · PK {{ row.pk }}{% endif %}</span>
           <div class="dk-row-actions">
@@ -776,7 +779,7 @@
         <tbody data-inline-body="{{ inline.slug }}" data-next-index="{{ inline.rows | length }}" data-max-rows="{{ inline.max_rows }}">
           {% for row in inline.rows %}
           {% set idx = loop.index0 %}
-          <tr data-inline-row{% if row.deleted %} class="is-deleted"{% endif %}>
+          <tr data-inline-row{% if row.deleted %} class="dk-inline-deleted"{% endif %}>
             {% for col in inline.columns %}
             <td>
               {% if loop.first %}

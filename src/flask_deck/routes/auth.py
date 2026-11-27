@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from flask import (
     Blueprint,
@@ -86,8 +87,11 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
             )
 
     def _rp_id_and_origin() -> tuple[str, str]:
-        host = request.host.split(":")[0] or "localhost"
         origin = request.host_url.rstrip("/")
+        try:
+            host = urlsplit(origin).hostname or "localhost"
+        except ValueError:
+            host = "localhost"
         return host, origin
 
     @bp.route("/login", methods=["GET", "POST"])
@@ -195,6 +199,7 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
                 session.pop(MFA_PENDING_AT_KEY, None)
                 target_user: DeckUser | None = None
                 if isinstance(pending_sso, Mapping) and str(pending_sso.get("id")) == pending_uid:
+                    raw_meta = pending_sso.get("metadata")
                     target_user = DeckUser(
                         id=pending_uid,
                         username=str(pending_sso.get("username", pending_uid)),
@@ -202,6 +207,8 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
                         email=str(pending_sso.get("email", "")),
                         roles=tuple(str(r) for r in pending_sso.get("roles", ())),
                         is_superuser=bool(pending_sso.get("is_superuser", False)),
+                        tenant_id=pending_sso.get("tenant_id"),
+                        metadata=dict(raw_meta) if isinstance(raw_meta, Mapping) else {},
                     )
                 else:
                     target_user = deck.auth.get_user_by_id(pending_uid)
@@ -442,6 +449,8 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
                     "email": sso_user.email,
                     "roles": list(sso_user.roles),
                     "is_superuser": sso_user.is_superuser,
+                    "tenant_id": sso_user.tenant_id,
+                    "metadata": dict(sso_user.metadata),
                 }
                 rotate_csrf_token()
                 return redirect(url_for(f"{bp_name}.login_mfa"))
@@ -484,77 +493,88 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
                 if mfa_required_for_user:
                     error_msg = "MFA cannot be disabled while superuser MFA enforcement is active."
                 elif enrollment is not None and enrollment.enabled:
-                    verify_code = request.form.get("code", "").strip()
-                    if not verify_code or not deck.mfa_store.verify_and_record(user.id, verify_code):
-                        error_msg = "Enter a valid current 6-digit TOTP or recovery code to disable 2FA."
+                    ip = _client_ip()
+                    rl_user = f"mfa:{user.id}"
+                    locked, retry_after = deck._rate_limiter.is_locked(ip, rl_user)
+                    if locked:
+                        error_msg = f"Too many failed MFA attempts. Retry in {retry_after}s."
                     else:
-                        deck.mfa_store.delete(user.id)
-                        session.pop(MFA_SETUP_SECRET_KEY, None)
-                        session.pop(MFA_VERIFIED_KEY, None)
-                        if deck.session_store is not None:
-                            deck.session_store.revoke_others(
-                                user.id,
-                                keep_session_id=session.get(DECK_SID_SESSION_KEY),
-                            )
-                        enrollment = None
-                        if deck.audit_store is not None and deck.config.auto_audit:
-                            deck.audit_store.record(
-                                make_audit_entry(
-                                    actor_id=user.id,
-                                    actor_name=user.label,
-                                    actor_ip=_client_ip(),
-                                    action="mfa_disabled",
-                                    model_slug="_auth",
-                                    model_label="MFA Security",
-                                    record_pk=user.id,
-                                    record_repr=user.label,
+                        verify_code = request.form.get("code", "").strip()
+                        if not verify_code or not deck.mfa_store.verify_and_record(user.id, verify_code):
+                            deck._rate_limiter.record_failure(ip, rl_user)
+                            error_msg = "Enter a valid current 6-digit TOTP or recovery code to disable 2FA."
+                        else:
+                            deck._rate_limiter.record_success(ip, rl_user)
+                            deck.mfa_store.delete(user.id)
+                            session.pop(MFA_SETUP_SECRET_KEY, None)
+                            session.pop(MFA_VERIFIED_KEY, None)
+                            if deck.session_store is not None:
+                                deck.session_store.revoke_others(
+                                    user.id,
+                                    keep_session_id=session.get(DECK_SID_SESSION_KEY),
                                 )
-                            )
-                        deck._emit_event("mfa.disabled", record_pk=user.id)
-                        flash("Two-factor authentication disabled.", "warn")
+                            enrollment = None
+                            if deck.audit_store is not None and deck.config.auto_audit:
+                                deck.audit_store.record(
+                                    make_audit_entry(
+                                        actor_id=user.id,
+                                        actor_name=user.label,
+                                        actor_ip=ip,
+                                        action="mfa_disabled",
+                                        model_slug="_auth",
+                                        model_label="MFA Security",
+                                        record_pk=user.id,
+                                        record_repr=user.label,
+                                    )
+                                )
+                            deck._emit_event("mfa.disabled", record_pk=user.id)
+                            flash("Two-factor authentication disabled.", "warn")
             elif act == "enable":
-                secret = str(session.get(MFA_SETUP_SECRET_KEY, ""))
-                code = request.form.get("code", "").strip()
-                if not secret:
-                    error_msg = "Setup session expired. Refresh to generate a new secret."
+                if enrollment is not None and enrollment.enabled:
+                    error_msg = "Two-factor authentication is already enabled. Disable it first to re-enroll."
                 else:
-                    step = verify_totp(secret, code)
-                    if step is None:
-                        error_msg = "Invalid 6-digit code. Check your authenticator clock and retry."
+                    secret = str(session.get(MFA_SETUP_SECRET_KEY, ""))
+                    code = request.form.get("code", "").strip()
+                    if not secret:
+                        error_msg = "Setup session expired. Refresh to generate a new secret."
                     else:
-                        plain_codes, hashed_codes = generate_recovery_codes(8)
-                        enrollment = MFAEnrollment(
-                            user_id=user.id,
-                            secret=secret,
-                            enabled=True,
-                            last_step=step,
-                            recovery_hashes=hashed_codes,
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        deck.mfa_store.save(enrollment)
-                        session.pop(MFA_SETUP_SECRET_KEY, None)
-                        session[MFA_VERIFIED_KEY] = True
-                        if deck.session_store is not None:
-                            deck.session_store.revoke_others(
-                                user.id,
-                                keep_session_id=session.get(DECK_SID_SESSION_KEY),
+                        step = verify_totp(secret, code)
+                        if step is None:
+                            error_msg = "Invalid 6-digit code. Check your authenticator clock and retry."
+                        else:
+                            plain_codes, hashed_codes = generate_recovery_codes(8)
+                            enrollment = MFAEnrollment(
+                                user_id=user.id,
+                                secret=secret,
+                                enabled=True,
+                                last_step=step,
+                                recovery_hashes=hashed_codes,
+                                created_at=datetime.now(timezone.utc),
                             )
-                        recovery_once = plain_codes
-                        if deck.audit_store is not None and deck.config.auto_audit:
-                            deck.audit_store.record(
-                                make_audit_entry(
-                                    actor_id=user.id,
-                                    actor_name=user.label,
-                                    actor_ip=_client_ip(),
-                                    action="mfa_enabled",
-                                    model_slug="_auth",
-                                    model_label="MFA Security",
-                                    record_pk=user.id,
-                                    record_repr=user.label,
+                            deck.mfa_store.save(enrollment)
+                            session.pop(MFA_SETUP_SECRET_KEY, None)
+                            session[MFA_VERIFIED_KEY] = True
+                            if deck.session_store is not None:
+                                deck.session_store.revoke_others(
+                                    user.id,
+                                    keep_session_id=session.get(DECK_SID_SESSION_KEY),
                                 )
-                            )
-                        deck._emit_event("mfa.enabled", record_pk=user.id)
-                        flash("Two-factor authentication enabled. Save your recovery codes now.", "ok")
+                            recovery_once = plain_codes
+                            if deck.audit_store is not None and deck.config.auto_audit:
+                                deck.audit_store.record(
+                                    make_audit_entry(
+                                        actor_id=user.id,
+                                        actor_name=user.label,
+                                        actor_ip=_client_ip(),
+                                        action="mfa_enabled",
+                                        model_slug="_auth",
+                                        model_label="MFA Security",
+                                        record_pk=user.id,
+                                        record_repr=user.label,
+                                    )
+                                )
+                            deck._emit_event("mfa.enabled", record_pk=user.id)
+                            flash("Two-factor authentication enabled. Save your recovery codes now.", "ok")
 
         setup_secret = ""
         qr_svg = Markup("")
@@ -750,7 +770,9 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
         challenge = session.pop(PASSKEY_REG_CHALLENGE_KEY, None)
         if not isinstance(challenge, str) or not challenge:
             return jsonify({"error": "Missing or expired registration challenge."}), 400
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, Mapping):
+            return jsonify({"error": "Invalid JSON object payload."}), 400
         cred_json = payload.get("credential")
         if cred_json is None:
             return jsonify({"error": "Missing credential payload."}), 400
@@ -769,7 +791,12 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
             return jsonify({"error": str(exc)}), 501
         except Exception as exc:
             return jsonify({"error": f"Passkey verification failed: {exc}"}), 400
-        deck.passkey_store.add(cred)
+        if deck.passkey_store.get(cred.credential_id) is not None:
+            return jsonify({"error": "This passkey credential is already registered."}), 409
+        try:
+            deck.passkey_store.add(cred)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 409
         if deck.audit_store is not None and deck.config.auto_audit:
             deck.audit_store.record(
                 make_audit_entry(
@@ -832,16 +859,27 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def passkey_login_verify() -> Any:
         if deck.passkey_store is None or not deck.auth.supports_login_form:
             abort(404)
+        ip = _client_ip()
+        rl_key = f"passkey:{ip}"
+        locked, retry_after = deck._rate_limiter.is_locked(ip, rl_key)
+        if locked:
+            resp = jsonify({"error": f"Too many failed passkey attempts. Retry in {retry_after}s."})
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(retry_after)
+            return resp
         challenge = session.pop(PASSKEY_AUTH_CHALLENGE_KEY, None)
         if not isinstance(challenge, str) or not challenge:
             return jsonify({"error": "Missing or expired passkey challenge."}), 400
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, Mapping):
+            return jsonify({"error": "Invalid JSON object payload."}), 400
         cred_json = payload.get("credential")
         if not isinstance(cred_json, Mapping):
             return jsonify({"error": "Missing credential payload."}), 400
         cred_id = str(cred_json.get("id") or cred_json.get("rawId") or "").strip()
         stored = deck.passkey_store.get(cred_id) if cred_id else None
         if stored is None:
+            deck._rate_limiter.record_failure(ip, rl_key)
             return jsonify({"error": "Unknown passkey credential."}), 404
         rp_id, origin = _rp_id_and_origin()
         try:
@@ -855,11 +893,14 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 501
         except Exception as exc:
+            deck._rate_limiter.record_failure(ip, rl_key)
             deck._emit_event("login.failed", payload={"method": "passkey", "error": str(exc)})
             return jsonify({"error": f"Passkey sign-in failed: {exc}"}), 403
         target_user = deck.auth.get_user_by_id(stored.user_id)
         if target_user is None:
+            deck._rate_limiter.record_failure(ip, rl_key)
             return jsonify({"error": "Account no longer exists."}), 403
+        deck._rate_limiter.record_success(ip, rl_key)
         deck.passkey_store.update_sign_count(stored.credential_id, new_count)
         deck.auth.login_user(target_user)
         session[MFA_VERIFIED_KEY] = True
@@ -963,6 +1004,10 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
     def security_api_keys() -> str:
         if deck.api_key_store is None:
             abort(404)
+        if getattr(g, "_deck_real_user", None) is not None:
+            raise PermissionDeniedError(
+                "API keys cannot be managed while impersonating another user."
+            )
         user = deck._current_user()
         if user is None or not (
             user.is_superuser or deck.auth.has_permission(user, "api_keys:manage")
@@ -1012,16 +1057,23 @@ def register_auth_routes(bp: Blueprint, deck: Deck) -> None:
             grant_super = request.form.get("is_superuser") in {"1", "true", "on"}
         else:
             allowed_role_set = set(user.roles)
-            roles = [r for r in requested_roles if r in allowed_role_set] or list(user.roles) or ["viewer"]
+            roles = [r for r in requested_roles if r in allowed_role_set] or list(user.roles)
             grant_super = False
 
         raw_ips = request.form.get("allowed_ips", "")
         allowed_ips = [ip.strip() for ip in raw_ips.replace("\n", ",").split(",") if ip.strip()]
         ttl_raw = request.form.get("ttl_days", "").strip()
-        try:
-            ttl_days = int(ttl_raw) if ttl_raw else None
-        except ValueError:
-            ttl_days = None
+        ttl_days: int | None = None
+        if ttl_raw:
+            try:
+                parsed_ttl = int(ttl_raw)
+            except ValueError:
+                flash("TTL days must be an integer between 1 and 3650.", "danger")
+                return redirect(url_for(f"{bp_name}.security_api_keys"))
+            if parsed_ttl < 1 or parsed_ttl > 3650:
+                flash("TTL days must be between 1 and 3650.", "danger")
+                return redirect(url_for(f"{bp_name}.security_api_keys"))
+            ttl_days = parsed_ttl
 
         plaintext, rec = build_api_key_record(
             name=name,

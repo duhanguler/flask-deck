@@ -127,9 +127,15 @@ def build_api_key_record(
     """Build a fresh APIKeyRecord and return ``(plaintext_token, record)``."""
     plaintext, prefix, digest = generate_api_key()
     now = datetime.now(timezone.utc)
-    expires_at = (now + timedelta(days=int(ttl_days))) if ttl_days and ttl_days > 0 else None
+    expires_at: datetime | None = None
+    if ttl_days is not None:
+        days_int = int(ttl_days)
+        if days_int > 3650:
+            raise ValueError("ttl_days must not exceed 3650 days.")
+        if days_int > 0:
+            expires_at = now + timedelta(days=days_int)
     clean_scopes = tuple(s.strip() for s in scopes if s and s.strip()) or ("*:view",)
-    clean_roles = tuple(r.strip() for r in roles if r and r.strip()) or ("viewer",)
+    clean_roles = tuple(r.strip() for r in roles if r and r.strip())
     clean_ips = tuple(ip.strip() for ip in allowed_ips if ip and ip.strip())
     rec = APIKeyRecord(
         id=uuid.uuid4().hex[:16],

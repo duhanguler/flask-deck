@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import sqlalchemy as sa
 from flask import Request, Response, session
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 CSRF_SESSION_KEY = "_deck_csrf_token"
@@ -53,7 +54,10 @@ def is_valid_csp_img_source(token: str) -> bool:
         return False
     if clean in {"blob:", "mediastream:"}:
         return True
-    parsed = urlsplit(clean)
+    try:
+        parsed = urlsplit(clean)
+    except ValueError:
+        return False
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return False
     return bool(_CSP_IMG_SOURCE_RE.fullmatch(clean))
@@ -133,7 +137,10 @@ def rotate_csrf_token() -> str:
 
 
 def _origin_tuple(url: str) -> tuple[str, str, int] | None:
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
     scheme = parsed.scheme.lower()
     host = (parsed.hostname or "").lower()
     if not scheme or not host:
@@ -211,7 +218,10 @@ def is_safe_redirect_url(target: str | None) -> bool:
         return False
     if not target.startswith("/") or target.startswith("//"):
         return False
-    parsed = urlsplit(target)
+    try:
+        parsed = urlsplit(target)
+    except ValueError:
+        return False
     return parsed.scheme == "" and parsed.netloc == ""
 
 
@@ -226,7 +236,10 @@ def is_safe_display_url(url: str | None) -> bool:
         return False
     if stripped.startswith("/") and not stripped.startswith("//"):
         return True
-    parsed = urlsplit(stripped)
+    try:
+        parsed = urlsplit(stripped)
+    except ValueError:
+        return False
     return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
 
 
@@ -454,39 +467,109 @@ class SQLAlchemyRateLimitStore:
     def record_failure(self, ip: str, username: str = "") -> None:
         now = time.time()
         cutoff = now - self._window_seconds
-        with self._lock, self._engine.begin() as conn:
+        use_for_update = self._engine.dialect.name != "sqlite"
+        with self._lock:
             for key in _bucket_keys(ip, username):
                 limit = _bucket_limit(key, self._max_attempts)
-                row = conn.execute(
-                    sa.select(self._table.c.attempts_json).where(self._table.c.bucket_key == key)
-                ).first()
-                try:
-                    ts_raw = json.loads(row[0]) if row and row[0] else []
-                except Exception:
-                    ts_raw = []
-                timestamps = [float(t) for t in ts_raw if float(t) >= cutoff]
-                timestamps.append(now)
-                locked_until = (now + self._lockout_seconds) if len(timestamps) >= limit else None
-                payload = json.dumps(timestamps)
-                if row is None:
-                    conn.execute(
-                        self._table.insert().values(
-                            bucket_key=key,
-                            attempts_json=payload,
-                            locked_until=locked_until,
-                        )
-                    )
-                else:
-                    conn.execute(
-                        self._table.update()
-                        .where(self._table.c.bucket_key == key)
-                        .values(attempts_json=payload, locked_until=locked_until)
-                    )
+                for attempt in range(3):
+                    try:
+                        with self._engine.begin() as conn:
+                            sel = sa.select(
+                                self._table.c.attempts_json,
+                                self._table.c.locked_until,
+                            ).where(self._table.c.bucket_key == key)
+                            if use_for_update:
+                                sel = sel.with_for_update()
+                            row = conn.execute(sel).first()
+                            try:
+                                ts_raw = json.loads(row[0]) if row and row[0] else []
+                            except Exception:
+                                ts_raw = []
+                            timestamps = [float(t) for t in ts_raw if float(t) >= cutoff]
+                            timestamps.append(now)
+                            prev_lock = row[1] if row is not None else None
+                            existing_lock = (
+                                float(prev_lock)
+                                if prev_lock is not None and float(prev_lock) > now
+                                else None
+                            )
+                            if len(timestamps) >= limit:
+                                new_lock = now + self._lockout_seconds
+                                locked_until: float | None = (
+                                    max(existing_lock, new_lock)
+                                    if existing_lock is not None
+                                    else new_lock
+                                )
+                            else:
+                                locked_until = existing_lock
+                            payload = json.dumps(timestamps)
+                            if row is None:
+                                conn.execute(
+                                    self._table.insert().values(
+                                        bucket_key=key,
+                                        attempts_json=payload,
+                                        locked_until=locked_until,
+                                    )
+                                )
+                            else:
+                                conn.execute(
+                                    self._table.update()
+                                    .where(self._table.c.bucket_key == key)
+                                    .values(attempts_json=payload, locked_until=locked_until)
+                                )
+                        break
+                    except IntegrityError:
+                        if attempt == 2:
+                            raise
 
     def record_success(self, ip: str, username: str = "") -> None:
         keys = _bucket_keys(ip, username)[1:]
         with self._engine.begin() as conn:
             conn.execute(self._table.delete().where(self._table.c.bucket_key.in_(keys)))
+
+
+_LUA_RECORD_FAILURE = """
+local raw = redis.call('GET', KEYS[1])
+local now = tonumber(ARGV[1])
+local cutoff = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local lockout = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+local attempts = {}
+local existing_lock = nil
+if raw then
+    local ok, data = pcall(cjson.decode, raw)
+    if ok and type(data) == 'table' then
+        if type(data['attempts']) == 'table' then
+            for _, t in ipairs(data['attempts']) do
+                local num = tonumber(t)
+                if num and num >= cutoff then
+                    attempts[#attempts + 1] = num
+                end
+            end
+        end
+        local prev_lock = tonumber(data['locked_until'])
+        if prev_lock and prev_lock > now then
+            existing_lock = prev_lock
+        end
+    end
+end
+attempts[#attempts + 1] = now
+local locked_until = cjson.null
+if #attempts >= limit then
+    local new_lock = now + lockout
+    if existing_lock and existing_lock > new_lock then
+        locked_until = existing_lock
+    else
+        locked_until = new_lock
+    end
+elseif existing_lock then
+    locked_until = existing_lock
+end
+local payload = cjson.encode({ attempts = attempts, locked_until = locked_until })
+redis.call('SET', KEYS[1], payload, 'EX', ttl)
+return #attempts
+"""
 
 
 class RedisRateLimitStore:
@@ -505,9 +588,10 @@ class RedisRateLimitStore:
         self._window_seconds = max(1, int(window_seconds))
         self._lockout_seconds = max(1, int(lockout_seconds))
         self._prefix = key_prefix
+        self._owns_client = isinstance(redis_url_or_client, str)
         if isinstance(redis_url_or_client, str):
             try:
-                import redis as redis_lib  # type: ignore[import-not-found]
+                import redis as redis_lib
             except ImportError as exc:
                 raise RuntimeError(
                     "redis is required for RedisRateLimitStore. Install with: pip install 'flask-deck[redis]'"
@@ -515,6 +599,10 @@ class RedisRateLimitStore:
             self._client: Any = redis_lib.Redis.from_url(redis_url_or_client, decode_responses=True)
         else:
             self._client = redis_url_or_client
+
+    def close(self) -> None:
+        if self._owns_client and hasattr(self._client, "close"):
+            self._client.close()
 
     def _rkey(self, bucket: str) -> str:
         return f"{self._prefix}{bucket}"
@@ -540,9 +628,22 @@ class RedisRateLimitStore:
         now = time.time()
         cutoff = now - self._window_seconds
         ttl = max(self._window_seconds, self._lockout_seconds) + 10
+        use_lua = hasattr(self._client, "eval")
         for key in _bucket_keys(ip, username):
             rkey = self._rkey(key)
             limit = _bucket_limit(key, self._max_attempts)
+            if use_lua:
+                self._client.eval(
+                    _LUA_RECORD_FAILURE,
+                    1,
+                    rkey,
+                    str(now),
+                    str(cutoff),
+                    str(limit),
+                    str(self._lockout_seconds),
+                    str(ttl),
+                )
+                continue
             raw = self._client.get(rkey)
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
@@ -552,7 +653,19 @@ class RedisRateLimitStore:
                 data = {}
             timestamps = [float(t) for t in data.get("attempts", []) if float(t) >= cutoff]
             timestamps.append(now)
-            locked_until = (now + self._lockout_seconds) if len(timestamps) >= limit else None
+            prev_lock = data.get("locked_until")
+            existing_lock = (
+                float(prev_lock)
+                if prev_lock is not None and float(prev_lock) > now
+                else None
+            )
+            if len(timestamps) >= limit:
+                new_lock = now + self._lockout_seconds
+                locked_until: float | None = (
+                    max(existing_lock, new_lock) if existing_lock is not None else new_lock
+                )
+            else:
+                locked_until = existing_lock
             self._client.set(
                 rkey,
                 json.dumps({"attempts": timestamps, "locked_until": locked_until}),

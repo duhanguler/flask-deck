@@ -123,8 +123,10 @@ def _build_reverse_fk_index(root_model: type[Any]) -> dict[str, list[_IncomingEd
 
             if ondelete == "CASCADE" or has_orm_cascade:
                 edge_action: Literal["blocked", "cascade", "set_null"] = "cascade"
-            elif (ondelete in {"SET NULL", "SET DEFAULT"} and bool(fk.parent.nullable)) or (
-                has_orm_set_null and ondelete not in {"RESTRICT", "NO ACTION"}
+            elif (
+                (ondelete == "SET NULL" and bool(fk.parent.nullable))
+                or ondelete == "SET DEFAULT"
+                or (has_orm_set_null and ondelete not in {"RESTRICT", "NO ACTION"})
             ):
                 edge_action = "set_null"
             else:
@@ -193,10 +195,19 @@ def analyze_delete_impact(
     while queue:
         parent_cls, parent_pk_col_expr, depth, path_classes = queue.popleft()
         p_mapper = sa.inspect(parent_cls)
-        if p_mapper.local_table is None:
+        p_tables = list(p_mapper.tables) if getattr(p_mapper, "tables", None) else (
+            [p_mapper.local_table] if p_mapper.local_table is not None else []
+        )
+        if not p_tables:
             continue
-        p_table_name = p_mapper.local_table.name
-        edges = reverse_index.get(p_table_name, [])
+        edges: list[_IncomingEdge] = []
+        seen_edge_sigs: set[tuple[type[Any], str, str]] = set()
+        for tbl in p_tables:
+            for e in reverse_index.get(tbl.name, []):
+                esig = (e.child_cls, e.child_table_name, e.child_fk_col_name)
+                if esig not in seen_edge_sigs:
+                    seen_edge_sigs.add(esig)
+                    edges.append(e)
         pk_in_select = sa.select(parent_pk_col_expr)
         p_pk_cols = list(p_mapper.primary_key)
         p_pk_col_name = p_pk_cols[0].name if len(p_pk_cols) == 1 else None
@@ -207,8 +218,6 @@ def analyze_delete_impact(
         for edge in edges:
             edge_key = (edge.child_cls, edge.child_fk_col_name)
             visits = edge_visits.get(edge_key, 0)
-            if edge.child_cls is not parent_cls and edge.child_cls in path_classes:
-                continue
             if visits >= max_depth:
                 continue
             edge_visits[edge_key] = visits + 1
@@ -220,7 +229,11 @@ def analyze_delete_impact(
             # Resolve non-PK unique FK targets cleanly (e.g. User.country_code -> Country.code)
             match_in_select: Any = pk_in_select
             if p_pk_col_name and edge.target_col_name != p_pk_col_name and p_pk_attr:
-                target_sql_col = p_mapper.local_table.c.get(edge.target_col_name)
+                target_sql_col = None
+                for tbl in p_tables:
+                    target_sql_col = tbl.c.get(edge.target_col_name)
+                    if target_sql_col is not None:
+                        break
                 if target_sql_col is None:
                     continue
                 try:
@@ -238,7 +251,7 @@ def analyze_delete_impact(
             base_conds: list[Any] = [fk_col.in_(match_in_select)]
             child_view = deck._views_by_model.get(edge.child_cls)
             child_meta = child_view.meta if child_view is not None else introspect_model(edge.child_cls)
-            if edge.child_cls is parent_cls and len(child_meta.primary_keys) == 1:
+            if len(child_meta.primary_keys) == 1:
                 already_seen = seen_pks_by_model.get(edge.child_cls)
                 if already_seen:
                     c_pk_orm = getattr(edge.child_cls, child_meta.primary_keys[0].name)
@@ -308,7 +321,7 @@ def analyze_delete_impact(
                 and len(child_meta.primary_keys) == 1
             ):
                 child_pk_col = getattr(edge.child_cls, child_meta.primary_keys[0].name)
-                if edge.child_cls is parent_cls:
+                if edge.child_cls is parent_cls or edge.child_cls in path_classes or cnt <= 500:
                     new_pks = list(session.scalars(sa.select(child_pk_col).where(*base_conds)).all())
                     if not new_pks:
                         continue

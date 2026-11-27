@@ -410,6 +410,21 @@ class SQLAlchemyPreviewStore:
             return deserialize_dry_run_report(str(raw))
 
 
+_LUA_CONSUME_PREVIEW = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then return nil end
+local ok, env = pcall(cjson.decode, raw)
+if not ok or type(env) ~= 'table' then return nil end
+if tostring(env['user_id'] or '') ~= ARGV[1]
+   or tostring(env['session_token'] or '') ~= ARGV[2]
+   or tostring(env['model_slug'] or '') ~= ARGV[3] then
+    return nil
+end
+redis.call('DEL', KEYS[1])
+return raw
+"""
+
+
 class RedisPreviewStore:
     """Optional Redis multi-worker preview store (requires optional `redis` package or client)."""
 
@@ -422,9 +437,10 @@ class RedisPreviewStore:
     ) -> None:
         self._ttl = max(60, int(ttl_seconds))
         self._prefix = key_prefix
+        self._owns_client = isinstance(redis_url_or_client, str)
         if isinstance(redis_url_or_client, str):
             try:
-                import redis as redis_lib  # type: ignore[import-not-found]
+                import redis as redis_lib
             except ImportError as exc:
                 raise RuntimeError(
                     "redis is required for RedisPreviewStore. Install with: pip install 'flask-deck[redis]'"
@@ -432,6 +448,10 @@ class RedisPreviewStore:
             self._client: Any = redis_lib.Redis.from_url(redis_url_or_client, decode_responses=True)
         else:
             self._client = redis_url_or_client
+
+    def close(self) -> None:
+        if self._owns_client and hasattr(self._client, "close"):
+            self._client.close()
 
     def put(self, report: DryRunReport, *, user_id: str, session_token: str) -> None:
         envelope = json.dumps(
@@ -478,7 +498,12 @@ class RedisPreviewStore:
         model_slug: str,
     ) -> DryRunReport | None:
         key = f"{self._prefix}{token}"
-        raw = self._client.getdel(key) if hasattr(self._client, "getdel") else self._client.get(key)
+        used_lua = False
+        if hasattr(self._client, "eval"):
+            raw = self._client.eval(_LUA_CONSUME_PREVIEW, 1, key, user_id, session_token, model_slug)
+            used_lua = True
+        else:
+            raw = self._client.get(key)
         if not raw:
             return None
         if isinstance(raw, bytes):
@@ -493,7 +518,7 @@ class RedisPreviewStore:
             or env.get("model_slug") != model_slug
         ):
             return None
-        if not hasattr(self._client, "getdel") and int(self._client.delete(key) or 0) != 1:
+        if not used_lua and int(self._client.delete(key) or 0) != 1:
             return None
         return deserialize_dry_run_report(str(env["report"]))
 
@@ -721,8 +746,11 @@ def run_dry_run_import(
     max_rows: int = 5000,
     max_columns: int = 100,
     max_json_depth: int = 12,
+    views_by_model: Mapping[type[Any], ModelView] | None = None,
 ) -> DryRunReport:
     """Validate and diff an import inside a guaranteed-rollback SQLAlchemy SAVEPOINT."""
+    from flask_deck.introspection import introspect_model
+
     fmt, headers, raw_rows = parse_import_payload(
         raw_bytes,
         filename=filename,
@@ -735,6 +763,7 @@ def run_dry_run_import(
     hidden = auth.hidden_fields_for(user, view.meta.slug)
     readonly = auth.readonly_fields_for(user, view.meta.slug)
     masked = auth.masked_fields_for(user, view.meta.slug)
+    create_dyn_ro = set(view.get_readonly_fields(user, None))
     writable_fields = tuple(
         c
         for c in view.resolved_import_columns
@@ -754,11 +783,39 @@ def run_dry_run_import(
     else:
         upsert_key = None
 
-    create_writable = set(writable_fields)
+    create_writable = set(writable_fields) - create_dyn_ro
     if upsert_key:
         uf = view.meta.fields_by_name[upsert_key]
-        if not uf.autoincrement:
+        if not uf.autoincrement and upsert_key not in create_dyn_ro:
             create_writable.add(upsert_key)
+
+    def _validate_fk_scope(row_vals: Mapping[str, Any], allowed_set: set[str], obj_ctx: Any | None) -> list[str]:
+        fk_errs: list[str] = []
+        for fname, val in row_vals.items():
+            if fname not in allowed_set or val is None:
+                continue
+            fm = view.meta.fields_by_name.get(fname)
+            if fm is None or fm.fk_target_model is None:
+                continue
+            t_view = views_by_model.get(fm.fk_target_model) if views_by_model is not None else None
+            t_meta = t_view.meta if t_view is not None else introspect_model(fm.fk_target_model)
+            ref_col_name = getattr(fm, "fk_target_column", None) or (
+                t_meta.primary_keys[0].name if len(t_meta.primary_keys) == 1 else None
+            )
+            if not ref_col_name or not hasattr(fm.fk_target_model, ref_col_name):
+                continue
+            fk_stmt = sa.select(fm.fk_target_model).where(
+                getattr(fm.fk_target_model, ref_col_name) == val
+            )
+            if t_view is not None:
+                fk_stmt = t_view.scope_query(fk_stmt, user)
+                t_sd = soft_delete_predicate(t_view.meta, t_view.soft_delete_column, trashed=False)
+                if t_sd is not None:
+                    fk_stmt = fk_stmt.where(t_sd)
+            fk_stmt = view.formfield_for_foreignkey(fname, fk_stmt, user, obj=obj_ctx)
+            if session.scalars(fk_stmt).first() is None:
+                fk_errs.append(f"{fname}: referenced record not found or outside your scope.")
+        return fk_errs
 
     mapped = auto_map_headers(headers, all_importable, overrides=column_overrides)
     if not mapped:
@@ -815,10 +872,24 @@ def run_dry_run_import(
             existing_obj = existing_map.get(key_val) if (upsert_key and key_val is not None) else None
 
             if existing_obj is not None:
+                if not view.can_edit_record(existing_obj, user):
+                    error_count += 1
+                    diffs.append(
+                        RowDiff(
+                            row_number=row_num,
+                            status="error",
+                            key_display=key_display,
+                            errors=(f"Not authorized to edit this {view.label}.",),
+                            raw_row=dict(orig_raw),
+                        )
+                    )
+                    continue
+                dyn_ro_update = set(view.get_readonly_fields(user, existing_obj))
+                update_writable = set(writable_fields) - dyn_ro_update
                 # Compute field-level diff against existing record.
                 changes: dict[str, tuple[Any, Any]] = {}
                 for fname, new_val in row_data.items():
-                    if fname not in writable_fields:
+                    if fname not in update_writable:
                         continue
                     old_val = getattr(existing_obj, fname, None)
                     if serialize_audit_value(old_val) != serialize_audit_value(new_val):
@@ -827,13 +898,14 @@ def run_dry_run_import(
                             serialize_audit_value(new_val),
                         )
 
+                fk_errs = _validate_fk_scope(row_data, update_writable, existing_obj)
                 custom_errs = dict(view.validate(row_data, obj=existing_obj))
                 if validator_fn is not None:
                     merged_payload = {**view.extract_snapshot(existing_obj), **row_data}
                     for fk, fmsgs in validator_fn(merged_payload, existing_obj, False).items():
                         custom_errs.setdefault(fk, []).extend(fmsgs)
-                if custom_errs:
-                    flat = tuple(f"{f}: {', '.join(m)}" for f, m in custom_errs.items())
+                if fk_errs or custom_errs:
+                    flat = tuple(fk_errs) + tuple(f"{f}: {', '.join(m)}" for f, m in custom_errs.items())
                     error_count += 1
                     diffs.append(
                         RowDiff(
@@ -914,12 +986,13 @@ def run_dry_run_import(
                 )
                 continue
 
+            fk_errs_c = _validate_fk_scope(row_data, create_writable, None)
             custom_errs = dict(view.validate(row_data, obj=None))
             if validator_fn is not None:
                 for fk, fmsgs in validator_fn(row_data, None, True).items():
                     custom_errs.setdefault(fk, []).extend(fmsgs)
-            if custom_errs:
-                flat = tuple(f"{f}: {', '.join(m)}" for f, m in custom_errs.items())
+            if fk_errs_c or custom_errs:
+                flat = tuple(fk_errs_c) + tuple(f"{f}: {', '.join(m)}" for f, m in custom_errs.items())
                 error_count += 1
                 diffs.append(
                     RowDiff(
@@ -1017,12 +1090,41 @@ def commit_dry_run_import(
     user: DeckUser | None,
     skip_errors: bool = False,
     row_audit_cb: Callable[[str, str, str, dict[str, dict[str, Any]]], None] | None = None,
+    views_by_model: Mapping[type[Any], ModelView] | None = None,
 ) -> tuple[int, int]:
     """Atomically apply a previously validated DryRunReport to the database."""
+    from flask_deck.introspection import introspect_model
+
     if report.errors > 0 and not skip_errors:
         raise ImportLimitError(
             f"Import contains {report.errors} errored row(s). Fix errors or enable 'Skip errored rows'."
         )
+
+    def _assert_fk_scope_commit(values: Mapping[str, Any], obj_ctx: Any | None) -> None:
+        for fname, val in values.items():
+            if val is None:
+                continue
+            fm = view.meta.fields_by_name.get(fname)
+            if fm is None or fm.fk_target_model is None:
+                continue
+            t_view = views_by_model.get(fm.fk_target_model) if views_by_model is not None else None
+            t_meta = t_view.meta if t_view is not None else introspect_model(fm.fk_target_model)
+            ref_col_name = getattr(fm, "fk_target_column", None) or (
+                t_meta.primary_keys[0].name if len(t_meta.primary_keys) == 1 else None
+            )
+            if not ref_col_name or not hasattr(fm.fk_target_model, ref_col_name):
+                continue
+            fk_stmt = sa.select(fm.fk_target_model).where(
+                getattr(fm.fk_target_model, ref_col_name) == val
+            )
+            if t_view is not None:
+                fk_stmt = t_view.scope_query(fk_stmt, user)
+                t_sd = soft_delete_predicate(t_view.meta, t_view.soft_delete_column, trashed=False)
+                if t_sd is not None:
+                    fk_stmt = fk_stmt.where(t_sd)
+            fk_stmt = view.formfield_for_foreignkey(fname, fk_stmt, user, obj=obj_ctx)
+            if session.scalars(fk_stmt).first() is None:
+                raise ImportLimitError(f"{fname}: referenced record not found or outside your scope.")
 
     def _normalize_pk_tuple(raw_pk: Any) -> tuple[Any, ...]:
         raw_t = raw_pk if isinstance(raw_pk, tuple) else (raw_pk,)
@@ -1055,16 +1157,20 @@ def commit_dry_run_import(
             else:
                 coerced[fname] = val
         if row.status == "create":
+            create_ro = set(view.get_readonly_fields(user, None))
+            applied_create = {k: v for k, v in coerced.items() if k not in create_ro}
+            _assert_fk_scope_commit(applied_create, None)
             obj = view.model()
-            for fname, val in coerced.items():
+            for fname, val in applied_create.items():
                 setattr(obj, fname, val)
-            view.on_model_change(obj, is_created=True, user=user)
+            view.invoke_on_model_change(obj, is_created=True, user=user)
             session.add(obj)
             created += 1
             if row_audit_cb is not None:
                 diff = {
                     fname: {"old": old_v, "new": new_v}
                     for fname, (old_v, new_v) in row.changes.items()
+                    if fname in applied_create
                 }
                 pending_audits.append(("create", obj, diff))
         elif row.status == "update" and row.existing_pk is not None:
@@ -1074,9 +1180,11 @@ def commit_dry_run_import(
                 if not view.can_edit_record(obj, user):
                     continue
                 dyn_ro = set(view.get_readonly_fields(user, obj))
-                for fname, val in coerced.items():
-                    if fname in dyn_ro:
-                        continue
+                applied_update = {k: v for k, v in coerced.items() if k not in dyn_ro}
+                if not applied_update:
+                    continue
+                _assert_fk_scope_commit(applied_update, obj)
+                for fname, val in applied_update.items():
                     setattr(obj, fname, val)
                 if view.version_column:
                     vf = view.meta.fields_by_name.get(view.version_column)
@@ -1086,14 +1194,16 @@ def commit_dry_run_import(
                             view.version_column,
                             int(getattr(obj, view.version_column, 0) or 0) + 1,
                         )
-                view.on_model_change(obj, is_created=False, user=user)
+                view.invoke_on_model_change(obj, is_created=False, user=user)
                 updated += 1
-                if row_audit_cb is not None and row.changes:
+                if row_audit_cb is not None:
                     diff = {
                         fname: {"old": old_v, "new": new_v}
                         for fname, (old_v, new_v) in row.changes.items()
+                        if fname in applied_update
                     }
-                    pending_audits.append(("update", obj, diff))
+                    if diff:
+                        pending_audits.append(("update", obj, diff))
 
     session.flush()
     resolved_audits: list[tuple[str, str, str, dict[str, dict[str, Any]]]] = []

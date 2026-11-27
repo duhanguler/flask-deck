@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode
 
 import sqlalchemy as sa
 from flask import (
@@ -125,6 +125,7 @@ from flask_deck.jobs import (
 )
 from flask_deck.mfa import (
     MFA_PENDING_AT_KEY,
+    MFA_PENDING_SSO_KEY,
     MFA_PENDING_USER_KEY,
     MFA_VERIFIED_KEY,
     InMemoryMFAStore,
@@ -414,6 +415,9 @@ class Deck:
             self._preview_store,
             self._rate_limiter,
         ):
+            close_fn = getattr(store, "close", None)
+            if callable(close_fn) and store is not self.job_backend:
+                close_fn()
             eng = getattr(store, "_engine", None)
             if isinstance(eng, Engine):
                 eng.dispose()
@@ -1540,7 +1544,58 @@ class Deck:
         """Execute a previously validated ApprovalRequest and write dual-actor audit."""
         view = self.get_view(req.model_slug)
         sess = self.get_session(view.bind_key)
-        requester = self.auth.get_user_by_id(req.requester_id)
+        requester: DeckUser | None = None
+        if req.actor_type in {"api_key", "mcp_agent"} and req.requester_id.startswith("apikey:"):
+            from flask_deck.iam import SQLAlchemyAuthProvider
+
+            key_id = req.requester_id[len("apikey:") :]
+            key_rec = self.api_key_store.get(key_id) if self.api_key_store is not None else None
+            if key_rec is not None:
+                now_utc = datetime.now(timezone.utc)
+                if key_rec.revoked_at is not None or (
+                    key_rec.expires_at is not None and key_rec.expires_at <= now_utc
+                ):
+                    raise PermissionDeniedError(
+                        "API key that queued this approval request is revoked or expired."
+                    )
+                requester = api_key_to_user(key_rec)
+                if isinstance(self.auth, SQLAlchemyAuthProvider):
+                    owner_rec = self.auth.get_user_record(key_rec.owner_id)
+                    if owner_rec is None or not owner_rec.is_active:
+                        raise PermissionDeniedError(
+                            "API key owner account is missing or deactivated."
+                        )
+                    capped_super = bool(requester.is_superuser and owner_rec.is_superuser)
+                    capped_roles = (
+                        requester.roles
+                        if owner_rec.is_superuser
+                        else tuple(r for r in requester.roles if r in set(owner_rec.role_names))
+                    )
+                    requester = replace(
+                        requester,
+                        is_superuser=capped_super,
+                        roles=capped_roles,
+                        tenant_id=owner_rec.tenant_id,
+                    )
+                else:
+                    owner_u = self.auth.get_user_by_id(key_rec.owner_id)
+                    if owner_u is not None and owner_u.tenant_id is not None:
+                        requester = replace(requester, tenant_id=owner_u.tenant_id)
+            elif self.api_key_store is not None and self.api_key_store.list_keys(limit=1):
+                raise PermissionDeniedError("API key that queued this approval request no longer exists.")
+        else:
+            requester = self.auth.get_user_by_id(req.requester_id)
+            if requester is None:
+                from flask_deck.iam import SQLAlchemyAuthProvider
+
+                if req.actor_type == "human" and (
+                    isinstance(self.auth, SQLAlchemyAuthProvider)
+                    or not req.requester_id.startswith(("sso:", "demo-"))
+                ):
+                    raise PermissionDeniedError(
+                        "Requester account is no longer active; approval cannot be executed."
+                    )
+
         if requester is None:
             raw_roles = req.payload.get("_actor_roles") or ()
             requester = DeckUser(
@@ -1549,7 +1604,14 @@ class Deck:
                 display_name=req.requester_name or req.requester_id,
                 roles=tuple(str(r) for r in raw_roles),
                 is_superuser=bool(req.payload.get("_actor_superuser", False)),
+                tenant_id=req.payload.get("_actor_tenant_id"),
             )
+
+        def _check_req_perm(perm: str, obj: Any | None = None) -> None:
+            if not self.auth.has_permission(requester, perm, model_slug=req.model_slug, obj=obj):
+                raise PermissionDeniedError(
+                    f"Requester '{requester.label}' no longer holds permission '{perm}'."
+                )
 
         dual_meta: dict[str, Any] = {
             "approval_id": req.id,
@@ -1565,6 +1627,7 @@ class Deck:
             return tv.scope_query(s, requester) if tv is not None else s
 
         if req.operation == "create":
+            _check_req_perm(f"{req.model_slug}:create")
             raw_items = req.payload.get("form_items")
             utc_pt = bool(req.payload.get("utc_passthrough", False))
             if raw_items is not None:
@@ -1650,8 +1713,13 @@ class Deck:
             for pk_f, val in zip(view.meta.primary_keys, pk_vals, strict=True):
                 stmt = stmt.where(getattr(view.model, pk_f.name) == val)
             obj = sess.scalars(stmt).unique().first()
-            if obj is None:
-                raise ValueError(f"Record {req.record_pk} no longer exists.")
+            if obj is None or self._is_soft_deleted(view, obj):
+                raise ValueError(f"Record {req.record_pk} no longer exists or is in Trash.")
+            _check_req_perm(f"{req.model_slug}:edit", obj=obj)
+            if not view.can_edit_record(obj, requester):
+                raise PermissionDeniedError(
+                    f"Requester is not authorized to edit {view.label} #{req.record_pk}."
+                )
             before_snap = view.extract_snapshot(obj)
             expected_ver = str(req.payload.get("expected_version", "")).strip()
             if expected_ver:
@@ -1756,6 +1824,13 @@ class Deck:
             if obj is None:
                 raise ValueError(f"Record {req.record_pk} no longer exists.")
             force = bool(req.payload.get("force", False))
+            _check_req_perm(f"{req.model_slug}:delete", obj=obj)
+            if view.soft_delete_column and force:
+                _check_req_perm(f"{req.model_slug}:force_delete", obj=obj)
+            if not view.can_delete_record(obj, requester):
+                raise PermissionDeniedError(
+                    f"Requester is not authorized to delete {view.label} #{req.record_pk}."
+                )
             before_snap = view.extract_snapshot(obj)
             safe_repr = view.format_record_repr(obj, auth=self.auth, user=requester)
             if view.soft_delete_column and not force:
@@ -1905,6 +1980,38 @@ class Deck:
         if not can_sql_audit:
             excluded.add("_sql")
         return frozenset(excluded)
+
+    def _sanitize_approval_diff(
+        self,
+        model_slug: str,
+        diff: Mapping[str, Any],
+        user: DeckUser | None,
+    ) -> dict[str, Any]:
+        """Strip RBAC-hidden fields and mask PII fields from an ApprovalRequest diff."""
+        hidden = self.auth.hidden_fields_for(user, model_slug)
+        masked = self.auth.masked_fields_for(user, model_slug)
+        out: dict[str, Any] = {}
+        for field_name, change in diff.items():
+            if field_name in hidden:
+                continue
+            if field_name in masked and isinstance(change, Mapping):
+                old_v = change.get("old")
+                new_v = change.get("new")
+                out[field_name] = {
+                    "old": (
+                        self.auth.mask_field_value(user, model_slug, field_name, old_v)
+                        if old_v is not None
+                        else None
+                    ),
+                    "new": (
+                        self.auth.mask_field_value(user, model_slug, field_name, new_v)
+                        if new_v is not None
+                        else None
+                    ),
+                }
+            else:
+                out[field_name] = change
+        return out
 
     def _user_has_field_restrictions(self, user: DeckUser | None) -> bool:
         """Return True if viewer has hidden/masked field rules on any model (blocks raw changes_json search)."""
@@ -2242,37 +2349,69 @@ class Deck:
         sess = self.get_session(bind_key)
         stmt = stmt.order_by(getattr(target_model, meta.primary_keys[0].name).asc()).limit(limit)
         items = list(sess.scalars(stmt).all())
+
+        ref_col_name: str | None = None
+        if not is_m2m:
+            if owner_view is not None and field_name:
+                ow_fm = owner_view.meta.fields_by_name.get(field_name)
+                if ow_fm is not None and getattr(ow_fm, "fk_target_column", None):
+                    ref_col_name = ow_fm.fk_target_column
+            if not ref_col_name and len(meta.primary_keys) == 1:
+                ref_col_name = meta.primary_keys[0].name
+
+        def _opt_id(rec: Any) -> str:
+            if is_m2m or not ref_col_name:
+                return encode_pk(extract_pk(rec, meta))
+            raw_v = getattr(rec, ref_col_name, None)
+            if raw_v is None:
+                return ""
+            if hasattr(raw_v, "value"):
+                return str(raw_v.value)
+            return str(raw_v)
+
         options: list[dict[str, str]] = []
         seen_ids: set[str] = set()
         for item in items:
+            opt_val = _opt_id(item)
             pk_val = encode_pk(extract_pk(item, meta))
-            seen_ids.add(pk_val)
+            seen_ids.add(opt_val)
             label = (
                 target_view.format_record_repr(item, auth=self.auth, user=user)
                 if target_view
                 else str(item)
             )
-            options.append({"id": pk_val, "label": label})
+            options.append({"id": opt_val, "pk": pk_val, "label": label})
 
         # Ensure currently selected FK value beyond row `limit` is still loaded and labelled cleanly
-        if current_value is not None and str(current_value) not in seen_ids and len(meta.primary_keys) == 1:
+        cur_id_str = (
+            str(current_value.value)
+            if hasattr(current_value, "value")
+            else ("" if current_value is None else str(current_value))
+        )
+        if current_value is not None and cur_id_str not in seen_ids and ref_col_name:
             try:
-                cur_pk = decode_pk(str(current_value), meta)
+                cur_lookup_val: Any = current_value
+                ref_fm = meta.fields_by_name.get(ref_col_name)
+                if ref_fm is not None and isinstance(current_value, str):
+                    from flask_deck.model_view import coerce_form_value
+
+                    cur_lookup_val = coerce_form_value(current_value, ref_fm)
                 cur_stmt = sa.select(target_model).where(
-                    getattr(target_model, meta.primary_keys[0].name) == cur_pk[0]
+                    getattr(target_model, ref_col_name) == cur_lookup_val
                 )
                 if target_view is not None:
                     cur_stmt = target_view.scope_query(cur_stmt, user)
                 cur_obj = sess.scalars(cur_stmt).first()
                 if cur_obj is not None:
+                    opt_val = _opt_id(cur_obj)
                     pk_str = encode_pk(extract_pk(cur_obj, meta))
                     lbl = (
                         target_view.format_record_repr(cur_obj, auth=self.auth, user=user)
                         if target_view
                         else str(cur_obj)
                     )
-                    options.insert(0, {"id": pk_str, "label": lbl})
-            except InvalidPKError:
+                    options.insert(0, {"id": opt_val, "pk": pk_str, "label": lbl})
+            except (InvalidPKError, ValueError):
                 pass
         return options
 
@@ -2955,12 +3094,15 @@ class Deck:
         # Rich Inlines 2.0 (routed to view.bind_key, respecting get_inlines, scope_query, soft-delete, files, readonly, @display)
         inlines_ctx: list[dict[str, Any]] = []
         any_inline_has_files = False
-        parent_pk = (
-            getattr(obj, view.meta.primary_keys[0].name, None) if obj is not None else None
-        )
         active_inlines = view.get_inlines(user, obj_ctx)
         for inline in active_inlines:
             fk_col = inline.resolve_fk_column(view.meta)
+            fk_fmeta_inl = inline.meta.fields_by_name.get(fk_col)
+            parent_match_col = (
+                getattr(fk_fmeta_inl, "fk_target_column", None)
+                or view.meta.primary_keys[0].name
+            )
+            parent_pk = getattr(obj, parent_match_col, None) if obj is not None else None
             inline_target_v = self._views_by_model.get(inline.model)
             eff_child_slug = (
                 inline_target_v.meta.slug if inline_target_v is not None else inline.meta.slug
@@ -3021,6 +3163,7 @@ class Deck:
                             "file_accept": "",
                             "widget_obj": None,
                             "widget_name": "",
+                            "template_widget_html": None,
                             "required": False,
                             "help_text": inline.field_help_texts.get(col)
                             or inline.display_fields[col].description,
@@ -3043,6 +3186,18 @@ class Deck:
                 fk_t_view = self._views_by_model.get(fm.fk_target_model) if fm.fk_target_model else None
                 fk_t_slug = fk_t_view.meta.slug if fk_t_view is not None else ""
                 w_ov = inline.field_widgets.get(col)
+                tpl_widget_html = (
+                    w_ov.render(
+                        name=f"inline__{inline.meta.slug}____INDEX____{col}",
+                        field_id=f"fld_inline__{inline.meta.slug}____INDEX____{col}",
+                        value="",
+                        readonly=bool(is_inline_ro or not can_edit_inline),
+                        required=False,
+                        label=inline.get_column_label(col),
+                    )
+                    if isinstance(w_ov, FormWidget)
+                    else None
+                )
                 col_kind = (
                     "display_ro"
                     if is_inline_ro and file_cfg is None
@@ -3094,6 +3249,7 @@ class Deck:
                         else "",
                         "widget_obj": w_ov if isinstance(w_ov, FormWidget) else None,
                         "widget_name": w_ov if isinstance(w_ov, str) else "",
+                        "template_widget_html": tpl_widget_html,
                         "required": (
                             not is_inline_ro
                             and not fm.nullable
@@ -3458,13 +3614,11 @@ class Deck:
             if is_bearer_api:
                 if endpoint == f"{bp_name}.mcp_endpoint":
                     origin = (request.headers.get("Origin") or "").strip()
-                    if origin:
-                        parsed_orig = urlsplit(origin)
-                        if parsed_orig.netloc and parsed_orig.netloc != request.host:
-                            return (
-                                jsonify({"error": "Cross-origin MCP request rejected."}),
-                                403,
-                            )  # type: ignore[return-value]
+                    if origin and not check_origin_headers(request):
+                        return (
+                            jsonify({"error": "Cross-origin MCP request rejected."}),
+                            403,
+                        )  # type: ignore[return-value]
                 auth_hdr = (request.headers.get("Authorization") or "").strip()
                 if not auth_hdr.lower().startswith("bearer "):
                     return (
@@ -3490,17 +3644,30 @@ class Deck:
                     return rl_resp
                 from flask_deck.iam import SQLAlchemyAuthProvider
 
+                api_user = api_key_to_user(key_rec)
                 if isinstance(deck.auth, SQLAlchemyAuthProvider):
                     owner_rec = deck.auth.get_user_record(key_rec.owner_id)
-                    if owner_rec is not None and not owner_rec.is_active:
+                    if owner_rec is None or not owner_rec.is_active:
                         return (
-                            jsonify({"error": "API key owner account is deactivated."}),
+                            jsonify({"error": "API key owner account is missing or deactivated."}),
                             401,
                         )  # type: ignore[return-value]
-                api_user = api_key_to_user(key_rec)
-                owner_user = deck.auth.get_user_by_id(key_rec.owner_id)
-                if owner_user is not None and owner_user.tenant_id is not None:
-                    api_user = replace(api_user, tenant_id=owner_user.tenant_id)
+                    capped_super = bool(api_user.is_superuser and owner_rec.is_superuser)
+                    capped_roles = (
+                        api_user.roles
+                        if owner_rec.is_superuser
+                        else tuple(r for r in api_user.roles if r in set(owner_rec.role_names))
+                    )
+                    api_user = replace(
+                        api_user,
+                        is_superuser=capped_super,
+                        roles=capped_roles,
+                        tenant_id=owner_rec.tenant_id,
+                    )
+                else:
+                    owner_user = deck.auth.get_user_by_id(key_rec.owner_id)
+                    if owner_user is not None and owner_user.tenant_id is not None:
+                        api_user = replace(api_user, tenant_id=owner_user.tenant_id)
                 g._deck_api_key = key_rec
                 g._deck_real_user = None
                 g._deck_user = api_user
@@ -3673,6 +3840,17 @@ class Deck:
                         return jsonify({"error": "MFA verification required."}), 401  # type: ignore[return-value]
                     session[MFA_PENDING_USER_KEY] = real_user.id
                     session[MFA_PENDING_AT_KEY] = int(time.time())
+                    if real_user.id.startswith("sso:"):
+                        session[MFA_PENDING_SSO_KEY] = {
+                            "id": real_user.id,
+                            "username": real_user.username,
+                            "display_name": real_user.display_name,
+                            "email": real_user.email,
+                            "roles": list(real_user.roles),
+                            "is_superuser": real_user.is_superuser,
+                            "tenant_id": real_user.tenant_id,
+                            "metadata": dict(real_user.metadata),
+                        }
                     return redirect(url_for(f"{bp_name}.login_mfa"))  # type: ignore[return-value]
             return None
 

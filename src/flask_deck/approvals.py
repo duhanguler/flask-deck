@@ -175,6 +175,17 @@ class InMemoryApprovalStore:
             rec.reviewed_at = now
             return replace(rec)
 
+    def reopen(self, approval_id: str) -> None:
+        """Revert a transiently approved request back to pending if execution failed and rolled back."""
+        with self._lock:
+            rec = self._records.get(approval_id)
+            if rec is not None and rec.status == "approved":
+                rec.status = "pending"
+                rec.reviewer_id = None
+                rec.reviewer_name = None
+                rec.review_note = ""
+                rec.reviewed_at = None
+
 
 class SQLAlchemyApprovalStore:
     """Multi-worker SQLAlchemy Maker-Checker approval queue (`deck_approvals`)."""
@@ -356,3 +367,26 @@ class SQLAlchemyApprovalStore:
                 sa.select(self._table).where(self._table.c.id == approval_id)
             ).first()
             return self._row_to_req(row) if row is not None else None
+
+    def reopen(self, approval_id: str) -> None:
+        """Revert a transiently approved request back to pending if execution failed and rolled back."""
+        with Session(self._engine) as sess:
+            sess.execute(
+                self._table.update()
+                .where(
+                    sa.and_(
+                        self._table.c.id == approval_id,
+                        self._table.c.status == "approved",
+                    )
+                )
+                .values(
+                    status="pending",
+                    reviewer_id=None,
+                    reviewer_name=None,
+                    review_note="",
+                    reviewed_at=None,
+                )
+            )
+            sess.commit()
+        with self._lock:
+            self._pending_cache = None

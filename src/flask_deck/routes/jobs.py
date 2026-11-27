@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
@@ -137,6 +138,9 @@ def register_job_routes(bp: Blueprint, deck: Deck) -> None:
             req_max = float(request.args.get("max_seconds", "15"))
         except ValueError:
             req_max = 15.0
+        if not math.isfinite(req_max):
+            req_max = 15.0
+        req_max = max(0.25, min(30.0, req_max))
         max_ticks = max(1, min(120, int(req_max / 0.25)))
 
         def _gen() -> Iterator[str]:
@@ -278,7 +282,7 @@ def register_job_routes(bp: Blueprint, deck: Deck) -> None:
             payload={"ping": True},
         )
         try:
-            sink(test_event)
+            sink.send_test(test_event)
             if sink.async_delivery:
                 sink.flush(timeout=2.0)
             flash(f"Dispatched test webhook to {sink.url}.", "ok")

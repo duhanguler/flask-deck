@@ -197,6 +197,12 @@ def register_ops_routes(bp: Blueprint, deck: Deck) -> None:
         allowed_inlines_for_parent = view.get_inlines(user, parent_obj)
         if not any(inl.meta.slug == inline_slug for inl in allowed_inlines_for_parent):
             abort(404)
+        recheck_stmt = sa.select(inline.model)
+        for pk_f, val in zip(inline.meta.primary_keys, pk_vals, strict=True):
+            recheck_stmt = recheck_stmt.where(getattr(inline.model, pk_f.name) == val)
+        recheck_stmt = inline.scope_query(recheck_stmt, user, parent_obj)
+        if sess.scalars(recheck_stmt).unique().first() is None:
+            abort(404)
 
         key = getattr(child_obj, field_name, None)
         if not key or not isinstance(key, str):
@@ -574,16 +580,21 @@ def register_ops_routes(bp: Blueprint, deck: Deck) -> None:
         if not name or not raw_sql:
             flash("Query name and SQL text are required.", "danger")
             return redirect(url_for(f"{bp_name}.sql_console"))
+        assert deck.adapter is not None
+        engines = deck.adapter.get_engines()
+        if bind_key and bind_key not in engines:
+            bind_key = ""
+        target_eng = engines.get(bind_key) if bind_key else deck.adapter.get_engine()
+        dialect_name = target_eng.dialect.name if target_eng is not None else ""
         try:
             clean_sql = validate_readonly_sql(
-                raw_sql, extra_sensitive_patterns=deck.config.extra_sensitive_patterns
+                raw_sql,
+                extra_sensitive_patterns=deck.config.extra_sensitive_patterns,
+                dialect_name=dialect_name,
             )
         except ValueError as exc:
             flash(f"Cannot save query: {exc}", "danger")
             return redirect(url_for(f"{bp_name}.sql_console"))
-        assert deck.adapter is not None
-        if bind_key and bind_key not in deck.adapter.get_engines():
-            bind_key = ""
         user = deck._current_user()
         saved = deck.saved_query_store.create(
             SavedQueryRecord(
